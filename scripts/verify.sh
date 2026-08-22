@@ -28,7 +28,7 @@ console.log('size', bytes.length);
 " 2>&1 | head -20
 
 echo "== wasm unit =="
-node scripts/test_wasm.mjs 2>&1 | tail -20
+node tests/test_wasm.mjs 2>&1 | tail -20
 
 echo "== host integration (port $HOST_PORT) =="
 # ensure tmp dirs exist without asking rm permission via bash tool

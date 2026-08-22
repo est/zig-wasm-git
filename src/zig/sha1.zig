@@ -9,11 +9,13 @@ pub fn hash(data: []const u8) [LEN]u8 {
     return out;
 }
 
+const enc = @import("enc.zig");
+
 pub fn hashHeader(typ: []const u8, body: []const u8) [LEN]u8 {
     var h = Sha1.init(.{});
     var header_buf: [64]u8 = undefined;
-    const header = std.fmt.bufPrint(&header_buf, "{s} {d}\x00", .{ typ, body.len }) catch unreachable;
-    h.update(header);
+    const hlen = enc.objectHeader(&header_buf, typ, body.len);
+    h.update(header_buf[0..hlen]);
     h.update(body);
     var out: [LEN]u8 = undefined;
     h.final(&out);

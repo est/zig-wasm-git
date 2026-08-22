@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const WASM_PATH = join(__dirname, "../zig-out/bin/zig_wasm_git.wasm");
+const WASM_PATH = join(__dirname, "..", "zig-out", "bin", "zig_wasm_git.wasm");
 
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 

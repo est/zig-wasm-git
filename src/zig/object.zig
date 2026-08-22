@@ -28,15 +28,17 @@ pub const Object = struct {
     oid_val: oid.Oid,
 };
 
+const enc = @import("enc.zig");
+
 pub fn hashObject(allocator: std.mem.Allocator, kind: Kind, body: []const u8) !struct { oid_val: oid.Oid, loose: []u8 } {
     const typ = kindToStr(kind);
     const oid_val = sha1.hashHeader(typ, body);
     // loose = zlib("type len\0body")
     var header_buf: [64]u8 = undefined;
-    const header = try std.fmt.bufPrint(&header_buf, "{s} {d}\x00", .{ typ, body.len });
+    const hlen = enc.objectHeader(&header_buf, typ, body.len);
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(allocator);
-    try raw.appendSlice(allocator, header);
+    try raw.appendSlice(allocator, header_buf[0..hlen]);
     try raw.appendSlice(allocator, body);
     const loose = try zlib.compress(allocator, raw.items);
     return .{ .oid_val = oid_val, .loose = loose };

@@ -14,7 +14,7 @@ SIZE=$(stat -f%z "$WASM" 2>/dev/null || stat -c%s "$WASM" 2>/dev/null)
 echo "wasm size=$SIZE"
 
 echo "== wasm unit =="
-node scripts/test_wasm.mjs 2>&1 | tail -20
+node tests/test_wasm.mjs 2>&1 | tail -20
 
 echo "== host start :$PORT =="
 mkdir -p tmp data

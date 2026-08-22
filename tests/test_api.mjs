@@ -1,9 +1,12 @@
 // e2e for object-level API: get / commit (new repo + incremental + nested paths)
 import { rmSync, existsSync } from "node:fs";
 import { load } from "../src/host/api.mjs";
+import { fileURLToPath } from "node:url";
+import { dirname as _dirname, join as _join } from "node:path";
+const ROOT = _join(_dirname(fileURLToPath(import.meta.url)), "..");
 
-const WASM = "zig-out/bin/zig_wasm_git.wasm";
-const DIR = "tmp/api_repo/demo.git";
+const WASM = _join(ROOT, "zig-out/bin/zig_wasm_git.wasm");
+const DIR = _join(ROOT, "tmp/api_repo/demo.git");
 
 if (existsSync(DIR)) rmSync(DIR, { recursive: true, force: true });
 

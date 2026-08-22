@@ -1,15 +1,14 @@
-// zig-wasm-git high-level JS API
+// zig-wasm-git high-level JS API (TLV framing)
 //
-// Usage:
 //   import { load } from "./api.mjs";
 //   const repo = await load("path/to/zig_wasm_git.wasm", { dir: "data/demo.git" });
-//   const blobs = repo.get("main", ["README.md", "src/a.txt"]);   // [{path, oid, content}]
-//   const commit = repo.commit("main", "msg", { "a.txt": "hello" }); // -> commit sha (and updates ref)
-//
-// storage: loose objects on disk (objects/xx/yyyy...), refs on disk (refs/heads/main)
+//   repo.get("main", ["README.md", "src/a.txt"]);          // [{path, oid, content}|{path, error}]
+//   repo.commit("", "init", { "a.txt": "hello" });          // -> commit sha
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
+
+const ERR_NAMES = { 1: "NotFound", 2: "PathIsDir", 3: "NotATree", 4: "NotABlob", 5: "BadCommit" };
 
 export function load(wasmPath, opts = {}) {
   const bytes = readFileSync(wasmPath);
@@ -27,11 +26,10 @@ export function load(wasmPath, opts = {}) {
           const obj = store.get(hex);
           if (!obj) return -1;
           if (obj.length > outCap) {
-            // report required size so wasm can retry
             new DataView(inst.exports.memory.buffer).setUint32(outLenPtr >>> 0, obj.length, true);
-            return 1;
+            return 1; // report required size
           }
-          new Uint8Array(inst.exports.memory.buffer).set(obj, outPtr);
+          if (obj.length > 0) new Uint8Array(inst.exports.memory.buffer).set(obj, outPtr);
           new DataView(inst.exports.memory.buffer).setUint32(outLenPtr >>> 0, obj.length, true);
           return 0;
         } catch {
@@ -53,13 +51,11 @@ export function load(wasmPath, opts = {}) {
 
   const wasm = inst.exports;
   const enc = new TextEncoder();
-  const dec = new TextDecoder();
 
   function readStr(ptr, len) {
     const mem = new Uint8Array(wasm.memory.buffer);
     return Buffer.from(mem.slice(ptr, ptr + len)).toString("utf8");
   }
-
   function allocBytes(b) {
     if (b.length === 0) return { ptr: 0, len: 0 };
     const ptr = wasm.wasm_alloc(b.length);
@@ -71,17 +67,15 @@ export function load(wasmPath, opts = {}) {
     return allocBytes(enc.encode(s));
   }
 
-  // ── ref resolution (host side; WASM deals in sha1 only) ──
   function resolveRef(ref) {
     if (/^[0-9a-f]{40}$/i.test(ref)) return ref.toLowerCase();
     if (ref === "HEAD") {
-      // symref to first branch that exists
       for (const b of store.heads()) {
-        return store.getRef(`refs/heads/${b}`);
+        const v = store.getRef(`refs/heads/${b}`);
+        if (v) return v;
       }
-      throw new Error(`HEAD: no branch exists yet`);
+      throw new Error("HEAD: no branch exists yet");
     }
-    // branch/tag shorthand
     for (const p of [`refs/heads/${ref}`, `refs/tags/${ref}`, ref]) {
       const v = store.getRef(p);
       if (v) return v;
@@ -89,45 +83,67 @@ export function load(wasmPath, opts = {}) {
     throw new Error(`cannot resolve ref: ${ref}`);
   }
 
-  function reset() {
-    wasm.wasm_reset();
+  /** decode get() TLV: u16 n; per entry: u8 st, u16 plen, path, [st==0: 20B oid, u32 clen, content] */
+  function decodeGetTlv(buf) {
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    let pos = 0;
+    const n = dv.getUint16(pos, true); pos += 2;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const status = buf[pos]; pos += 1;
+      const plen = dv.getUint16(pos, true); pos += 2;
+      const path = Buffer.from(buf.subarray(pos, pos + plen)).toString("utf8"); pos += plen;
+      if (status === 0) {
+        const oidHex = Buffer.from(buf.subarray(pos, pos + 20)).toString("hex"); pos += 20;
+        const clen = dv.getUint32(pos, true); pos += 4;
+        const content = Buffer.from(buf.subarray(pos, pos + clen)); pos += clen;
+        out.push({ path, oid: oidHex, content });
+      } else {
+        out.push({ path, error: ERR_NAMES[status] ?? `Err${status}` });
+      }
+    }
+    return out;
   }
 
-  // ── public API ──
-  const api = {
-    /** read blobs at paths from commit `ref` (sha1 | branch | HEAD).
-     *  returns [{path, oid, content(Buffer)}|{path, error}] */
+  /** encode commit() entries as TLV: u16 n; per entry: u16 plen, path, u32 clen, content */
+  function encodeEntriesTlv(entries) {
+    const parts = [Buffer.alloc(2)];
+    parts[0].writeUInt16LE(entries.length, 0);
+    for (const e of entries) {
+      const ph = Buffer.alloc(2); ph.writeUInt16LE(e.path.length, 0);
+      const ch = Buffer.alloc(4); ch.writeUInt32LE(e.content.length, 0);
+      parts.push(ph, Buffer.from(e.path, "utf8"), ch, e.content);
+    }
+    return Buffer.concat(parts);
+  }
+
+  return {
     get(ref, paths) {
-      reset();
+      wasm.wasm_reset();
       const sha = resolveRef(ref);
       const oidHex = allocStr(sha);
-      const pj = allocStr(JSON.stringify(paths));
+      const pj = allocStr(paths.join("\n"));
       const outPtrAddr = wasm.wasm_alloc(4);
       const outLenAddr = wasm.wasm_alloc(4);
       const rc = wasm.wasm_get(oidHex.ptr, oidHex.len, pj.ptr, pj.len, outPtrAddr, outLenAddr);
       if (rc !== 0) throw new Error(`wasm_get rc=${rc}`);
       const dv = new DataView(wasm.memory.buffer);
-      const jsonPtr = dv.getUint32(outPtrAddr, true);
-      const jsonLen = dv.getUint32(outLenAddr, true);
+      const tlvPtr = dv.getUint32(outPtrAddr, true);
+      const tlvLen = dv.getUint32(outLenAddr, true);
       const mem = new Uint8Array(wasm.memory.buffer);
-      const json = Buffer.from(mem.slice(jsonPtr, jsonPtr + jsonLen)).toString("utf8");
-      return JSON.parse(json).map((e) =>
-        e.error ? e : { path: e.path, oid: e.oid, content: Buffer.from(e.content_b64, "base64") }
-      );
+      return decodeGetTlv(Buffer.from(mem.slice(tlvPtr, tlvPtr + tlvLen)));
     },
 
-    /** commit {path: content|string} on top of `parentRef` ("" => new repo).
-     *  returns commit sha; updates ref `updateRef` (default "refs/heads/main") when set. */
     commit(parentRef, message, entriesObj, updateRef = "refs/heads/main") {
-      reset();
+      wasm.wasm_reset();
       const parent = parentRef ? resolveRef(parentRef) : "";
       const pHex = allocStr(parent);
       const msg = allocStr(message);
       const entries = Object.entries(entriesObj).map(([path, content]) => ({
         path,
-        content_b64: Buffer.isBuffer(content) ? content.toString("base64") : Buffer.from(String(content)).toString("base64"),
+        content: Buffer.isBuffer(content) ? content : Buffer.from(String(content)),
       }));
-      const ej = allocStr(JSON.stringify(entries));
+      const ej = allocBytes(encodeEntriesTlv(entries));
       const outHex = wasm.wasm_alloc(40);
       const rc = wasm.wasm_commit(pHex.ptr, pHex.len, msg.ptr, msg.len, ej.ptr, ej.len, outHex);
       if (rc !== 0) throw new Error(`wasm_commit rc=${rc}`);
@@ -136,11 +152,9 @@ export function load(wasmPath, opts = {}) {
       return sha;
     },
 
-    /** resolve a ref to sha (exposed for convenience) */
     resolveRef,
     _wasm: wasm,
   };
-  return api;
 }
 
 // ── file-backed store (bare repo layout) ──
@@ -171,9 +185,6 @@ export function fileStore(dir) {
       writeFileSync(p, sha + "\n");
     },
     heads() {
-      // best effort: main then any single head (MVP)
-      const m = join(dir, "refs/heads/main");
-      if (existsSync(m)) return ["main"];
       try {
         return readdirSync(join(dir, "refs/heads"));
       } catch {
@@ -182,4 +193,3 @@ export function fileStore(dir) {
     },
   };
 }
-

@@ -4,12 +4,14 @@ pub const FLUSH: []const u8 = "0000";
 pub const DELIM: []const u8 = "0001";
 pub const RESPONSE_END: []const u8 = "0002";
 
+const enc = @import("enc.zig");
+
 pub fn encodeLine(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
-    // pkt-line: 4 hex digits = len(payload)+4, then payload (+ "\n" if not present by Git convention, but we preserve payload as-is)
+    // pkt-line: 4 hex digits = len(payload)+4, then payload
     const total: usize = payload.len + 4;
     if (total > 0xFFFF) return error.PktLineTooLong;
-    var out = try allocator.alloc(u8, total);
-    _ = try std.fmt.bufPrint(out[0..4], "{x:0>4}", .{total});
+    const out = try allocator.alloc(u8, total);
+    enc.hex4(out[0..4], @intCast(total));
     @memcpy(out[4..], payload);
     return out;
 }
@@ -76,9 +78,9 @@ pub fn buildRefsAdvertisement(
             }
             try line_buf.append(allocator, '\n');
         }
-        const enc = try encodeLine(allocator, line_buf.items);
-        defer allocator.free(enc);
-        try out.appendSlice(allocator, enc);
+        const line = try encodeLine(allocator, line_buf.items);
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
     }
     const flush = try encodeFlush(allocator);
     defer allocator.free(flush);
