@@ -1,3 +1,10 @@
 .zig-cache/
 zig-out/
 *.o
+tmp/
+third_party/
+data/
+.mimocode/
+.DS_Store
+*.sublime-project
+*.sublime-workspace
