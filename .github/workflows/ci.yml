@@ -10,12 +10,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+      - name: Install Zig (official tarball)
+        run: |
+          ARCH=$(uname -m)   # x86_64 / aarch64
+          URL="https://ziglang.org/download/0.16.0/zig-${ARCH}-linux-0.16.0.tar.xz"
+          echo "downloading $URL"
+          curl -fsSL "$URL" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/.zig"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/.zig" --strip-components=1
+          echo "$HOME/.zig" >> "$GITHUB_PATH"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Sanity check
+        run: zig version
       - name: Build wasm + native
         run: zig build -Doptimize=ReleaseSmall
       - name: Run tests (zig unit + wasm filter + object API e2e)
