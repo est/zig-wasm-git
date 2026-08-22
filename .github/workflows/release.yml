@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+      - name: Build wasm (ReleaseSmall)
+        run: zig build -Doptimize=ReleaseSmall
+      - name: Run tests
+        run: ./tests/run.sh
+      - name: Package + checksum
+        id: pkg
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          OUT="zig_wasm_git-v${VERSION}.wasm"
+          LATEST="zig_wasm_git-latest.wasm"
+          cp zig-out/bin/zig_wasm_git.wasm "$OUT"
+          cp zig-out/bin/zig_wasm_git.wasm "$LATEST"
+          sha256sum "$OUT" > "$OUT.sha256"
+          SIZE=$(stat -c%s "$OUT")
+          echo "name=$OUT" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          {
+            echo "### zig_wasm_git ${GITHUB_REF_NAME}"
+            echo ""
+            echo "- \`$OUT\` (${SIZE} bytes) — wasm32-freestanding, no libc"
+            echo "- Pin a version, or use \`zig_wasm_git-latest.wasm\` to always track the newest release:"
+            echo "  \`curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/$LATEST\`"
+            echo "- Verify: \`sha256sum -c $OUT.sha256\`"
+          } > body.md
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: body.md
+          files: |
+            ${{ steps.pkg.outputs.name }}
+            ${{ steps.pkg.outputs.name }}.sha256
+            zig_wasm_git-latest.wasm

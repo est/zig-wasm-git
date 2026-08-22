@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build wasm + native
+        run: zig build -Doptimize=ReleaseSmall
+      - name: Run tests (zig unit + wasm filter + object API e2e)
+        run: ./tests/run.sh
+      - name: Upload wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zig_wasm_git.wasm
+          path: zig-out/bin/zig_wasm_git.wasm

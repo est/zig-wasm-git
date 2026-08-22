@@ -3,8 +3,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+ZIG="$(command -v zig || echo ./third_party/zig/zig)"
+echo "zig: $ZIG ($($ZIG version))"
 echo "== zig unit tests =="
-./third_party/zig/zig test src/zig/root.zig --zig-lib-dir third_party/zig/lib --cache-dir .zig-cache --global-cache-dir tmp/cache
+"$ZIG" test src/zig/root.zig --zig-lib-dir third_party/zig/lib --cache-dir .zig-cache --global-cache-dir tmp/cache
 echo "== wasm filter tests =="
 node tests/test_wasm.mjs
 echo "== object API e2e =="

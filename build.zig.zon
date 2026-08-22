@@ -1,6 +1,6 @@
 .{
     .name = .zig_wasm_git,
-    .version = "0.0.1",
+    .version = "1.0.0",
     .minimum_zig_version = "0.16.0",
     .paths = .{""},
     .fingerprint = 0x5a002238d8382497,
