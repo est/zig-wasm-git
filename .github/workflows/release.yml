@@ -29,10 +29,8 @@ jobs:
         id: pkg
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          OUT="zig_wasm_git-v${VERSION}.wasm"
-          LATEST="zig_wasm_git-latest.wasm"
+          OUT="zig_wasm_git.wasm"
           cp zig-out/bin/zig_wasm_git.wasm "$OUT"
-          cp zig-out/bin/zig_wasm_git.wasm "$LATEST"
           sha256sum "$OUT" > "$OUT.sha256"
           SIZE=$(stat -c%s "$OUT")
           echo "name=$OUT" >> "$GITHUB_OUTPUT"
@@ -41,8 +39,7 @@ jobs:
             echo "### zig_wasm_git ${GITHUB_REF_NAME}"
             echo ""
             echo "- \`$OUT\` (${SIZE} bytes) — wasm32-freestanding, no libc"
-            echo "- Pin a version, or use \`zig_wasm_git-latest.wasm\` to always track the newest release:"
-            echo "  \`curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/$LATEST\`"
+            echo "- Download: \`curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/$OUT\`"
             echo "- Verify: \`sha256sum -c $OUT.sha256\`"
           } > body.md
       - name: Create GitHub Release
@@ -52,4 +49,3 @@ jobs:
           files: |
             ${{ steps.pkg.outputs.name }}
             ${{ steps.pkg.outputs.name }}.sha256
-            zig_wasm_git-latest.wasm

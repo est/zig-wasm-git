@@ -13,10 +13,10 @@ This repo is a minimal reproduction focused on `git http` read/write with `parti
 Grab the prebuilt wasm from the latest release — no toolchain needed:
 
 ```bash
-curl -LO https://github.com/est/zig-wasm-git/releases/latest/download/zig_wasm_git-latest.wasm
+curl -LO https://github.com/est/zig-wasm-git/releases/latest/download/zig_wasm_git.wasm
 ```
 
-Each release ships `zig_wasm_git-vX.Y.Z.wasm` + a `.sha256` checksum, built by CI from the tagged commit (see `.github/workflows/release.yml`).
+Each release ships a fixed-name `zig_wasm_git.wasm` + `.sha256`, built by CI from the tagged commit (pin a version via the per-tag download path).
 
 ## Features
 
@@ -32,7 +32,7 @@ Read and write git objects without touching any protocol. Caller only deals in r
 ```js
 import { load } from "./src/host/api.mjs";
 
-const repo = load("zig_wasm_git-v1.0.0.wasm", { dir: "data/demo.git" });
+const repo = load("zig_wasm_git.wasm", { dir: "data/demo.git" });
 
 // read: ref can be sha1 | branch | HEAD
 const blobs = repo.get("main", ["README.md", "src/a.txt", "missing"]);
