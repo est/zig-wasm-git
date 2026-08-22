@@ -10,11 +10,10 @@ const bytes = readFileSync(WASM_PATH);
 let inst;
 const imports = {
   env: {
-    host_emit_bytes: (ptr, len) => {
-      const mem = new Uint8Array(inst.exports.memory.buffer);
-      // collect if needed
-    },
+    host_emit_bytes: () => {},
     host_log: () => {},
+    host_get_object: () => -1,
+    host_put_object: () => -1,
   },
 };
 const mod = new WebAssembly.Module(bytes);

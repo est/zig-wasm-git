@@ -27,6 +27,8 @@ function loadWasm() {
         const mem = new Uint8Array(wasmInstance.exports.memory.buffer);
         console.log("[wasm]", Buffer.from(mem.slice(ptr, ptr + len)).toString());
       },
+      host_get_object: () => -1, // smart-HTTP host doesn't use object store
+      host_put_object: () => -1,
     },
   };
   const mod = new WebAssembly.Module(bytes);

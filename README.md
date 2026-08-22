@@ -8,7 +8,7 @@ This repo is a minimal reproduction focused on `git http` read/write with `parti
 
 ## Features
 
-- ~11KB `wasm32-freestanding ReleaseSmall`, single import `env.host_emit_bytes`
+- ~114KB `wasm32-freestanding ReleaseSmall` (object-level API included), imports `env.host_*`
 - SHA-1 / zlib / pack v2 / pkt-line / smart HTTP (`v1` + `v2 ls-refs/fetch=filter`)
 - `filter` via `wasm_should_omit`: `blob:none`, `blob:limit`, `tree:0`, `object:type`, `combine:+`
 
@@ -19,55 +19,32 @@ This repo is a minimal reproduction focused on `git http` read/write with `parti
 ./third_party/zig/zig build        # also: zig build test
 node scripts/test_wasm.mjs         # asserts filter semantics
 PORT=3002 ./scripts/e2e.sh         # clone / push / fetch / partial
+node scripts/test_api.mjs          # object-level API e2e (get/commit + git interop)
 ```
 
-## Using WASM from JS
+## Object-level API (recommended)
 
-`zig-out/bin/zig_wasm_git.wasm` exports `memory`, `wasm_alloc`, `wasm_reset`, `wasm_handle_discovery`, `wasm_parse_filter`, `wasm_should_omit`, `wasm_pktline_encode`. Host provides `host_emit_bytes(ptr,len)`.
+Read and write git objects without touching any protocol. Caller only deals in sha1/paths/bytes.
 
 ```js
-import { readFileSync } from "node:fs";
+import { load } from "./src/host/api.mjs";
 
-const bytes = readFileSync("zig-out/bin/zig_wasm_git.wasm");
-let inst;
-const mod = new WebAssembly.Module(bytes);
-inst = new WebAssembly.Instance(mod, {
-  env: {
-    host_emit_bytes(ptr, len) {
-      const mem = new Uint8Array(inst.exports.memory.buffer);
-      process.stdout.write(Buffer.from(mem.slice(ptr, ptr + len)));
-    },
-  },
-});
-const wasm = inst.exports;
+const repo = load("zig-out/bin/zig_wasm_git.wasm", { dir: "data/demo.git" });
 
-function allocStr(s) {
-  const b = Buffer.from(s);
-  const ptr = wasm.wasm_alloc(b.length);
-  new Uint8Array(wasm.memory.buffer).set(b, ptr);
-  return { ptr, len: b.length };
-}
+// read: ref can be sha1 | branch | HEAD
+const blobs = repo.get("main", ["README.md", "src/a.txt", "missing"]);
+// -> [{path, oid, content: Buffer}, {path, oid, content: Buffer}, {path, error: "NotFound"}]
 
-// 1) Filter decision
-wasm.wasm_reset();
-const filter = allocStr("blob:none");
-const kind = allocStr("blob");
-console.log(wasm.wasm_should_omit(kind.ptr, kind.len, 100, filter.ptr, filter.len)); // 1 = omit
-
-// 2) Discovery: refs pkt -> advertisement
-wasm.wasm_reset();
-const refsPkt = allocStr("00730000000000000000000000000000000000000000 capabilities^{}\0symref=HEAD:refs/heads/main\n0000");
-wasm.wasm_handle_discovery(0, refsPkt.ptr, refsPkt.len); // service 0=upload-pack, emits via host_emit_bytes
-
-// 3) Parse filter from fetch body
-wasm.wasm_reset();
-const body = allocStr("0017filter blob:none\n0032want abcdef0123456789abcdef0123456789abcdef01\n0009done\n0000");
-const outHas = new Uint32Array(wasm.memory.buffer, wasm.wasm_alloc(4), 1);
-const outPtr = new Uint32Array(wasm.memory.buffer, wasm.wasm_alloc(8), 2);
-// wasm_parse_filter(body.ptr, body.len, &has, &ptr, &len)
+// write: parent "" = new repo; {path: content}; updates refs/heads/main
+const sha = repo.commit("", "init", { "README.md": "hello", "src/main.zig": "..." });
+repo.commit("main", "v2", { "README.md": "hello v2", "src/new.zig": "new" }); // incremental + nested ok
 ```
 
-Host example: `src/host/server.mjs` delegates `ls-refs`, `fetch --filter` and discovery framing to WASM while storage stays in `data/<repo>.git`.
+Internals: `wasm_get(oid, paths[])` walks commit→tree→blob; `wasm_commit(parent, msg, entries[])` stores blobs, rebuilds affected trees (git-correct sort), writes commit. Storage via `host_get_object`/`host_put_object` (loose files in `data/<repo>.git/objects`). Verified against real `git`: `git log`/`ls-tree`/`cat-file`/`fsck --strict` all clean (see `scripts/test_api.mjs`).
+
+## Low-level WASM from JS
+
+For the smart-HTTP layer, `zig-out/bin/zig_wasm_git.wasm` also exports `wasm_alloc/reset`, `wasm_handle_discovery`, `wasm_parse_filter`, `wasm_should_omit`, `wasm_pktline_encode` (imports: `host_emit_bytes`, `host_get_object`, `host_put_object`). See `src/host/server.mjs`.
 
 ## Known limits
 
