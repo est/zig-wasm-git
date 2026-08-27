@@ -30,17 +30,21 @@ Each release ships a fixed-name `zig_wasm_git.wasm` + `.sha256`, built by CI fro
 Read and write git objects without touching any protocol. Caller only deals in refs/sha1/paths/bytes.
 
 ```js
-import { load } from "./src/host/api.mjs";
+import { load, memoryStore, fileStore } from "./src/host/api.mjs";
 
-const repo = load("zig_wasm_git.wasm", { dir: "data/demo.git" });
+// pure in-memory (default; zero FS — ideal for Workers/KV backends)
+const mem = load("zig_wasm_git.wasm");
+mem.commit("", "init", { "README.md": "hello" });
+const blobs = mem.get("main", ["README.md"]);          // [{path, oid, content: Buffer}]
+const history = mem.log("main", 5);                     // newest-first commit chain
 
-// read: ref can be sha1 | branch | HEAD
-const blobs = repo.get("main", ["README.md", "src/a.txt", "missing"]);
-// -> [{path, oid, content: Buffer}, {path, oid, content: Buffer}, {path, error: "NotFound"}]
+// on-disk bare repo (git-compatible layout)
+const disk = load("zig_wasm_git.wasm", { dir: "data/demo.git" });
+disk.commit("main", "v2", { "src/new.zig": "..." }, "refs/heads/main",
+            { author: "Alice <a@ex.com>", committer: "CI <ci@ex.com>", time: 1755859200, timezone: "+0800" });
 
-// write: parent "" = new repo; {path: content}; updates refs/heads/main
-const sha = repo.commit("", "init", { "README.md": "hello", "src/main.zig": "..." });
-repo.commit("main", "v2", { "README.md": "hello v2", "src/new.zig": "new" }); // incremental + nested ok
+// any backend via the same 6-method interface
+load("zig_wasm_git.wasm", { store: { get(hex){}, put(hex,loose){}, getRef(n){}, putRef(n,s){}, heads(){} } });
 ```
 
 Internals: `wasm_get` walks commit→tree→blob; `wasm_commit` stores blobs, rebuilds affected trees (git-correct sort), writes the commit. Storage goes through `host_get_object`/`host_put_object` callbacks (loose files in this glue; swap in SQLite/S3/etc. for your backend). Verified against real `git`: `log`/`ls-tree`/`cat-file`/`fsck --strict` all clean.

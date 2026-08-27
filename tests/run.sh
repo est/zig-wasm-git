@@ -14,4 +14,6 @@ echo "== wasm filter tests =="
 node tests/test_wasm.mjs
 echo "== object API e2e =="
 node tests/test_api.mjs
+echo "== memory store / author options =="
+node tests/test_memory_store.mjs
 echo "== ALL TESTS PASSED =="

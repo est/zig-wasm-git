@@ -522,3 +522,107 @@ export fn wasm_commit(parent_hex_ptr: usize, parent_hex_len: usize, msg_ptr: usi
     @memcpy(out_hex_ptr[0..40], &chex);
     return 0;
 }
+// Back-compat author-aware variant: extra params allow callers to set author/committer/time.
+// Pass empty strings to fall back to defaults (zig-wasm-git <...> 0 +0000).
+export fn wasm_commit2(
+    parent_hex_ptr: usize, parent_hex_len: usize,
+    msg_ptr: usize, msg_len: usize,
+    entries_ptr: usize, entries_len: usize,
+    author_ptr: usize, author_len: usize,
+    committer_ptr: usize, committer_len: usize,
+    time_ptr: usize, time_len: usize,
+    tz_ptr: usize, tz_len: usize,
+    out_hex_ptr: [*]u8,
+) i32 {
+    const alloc = gpa();
+    const parent_hex = sliceFromPtr(parent_hex_ptr, parent_hex_len);
+    const msg = sliceFromPtr(msg_ptr, msg_len);
+    const tlv = sliceFromPtr(entries_ptr, entries_len);
+    const author = sliceFromPtr(author_ptr, author_len);
+    const committer = sliceFromPtr(committer_ptr, committer_len);
+    const time_s = sliceFromPtr(time_ptr, time_len);
+    const tz = sliceFromPtr(tz_ptr, tz_len);
+
+    if (tlv.len < 2) return -2;
+    const n = std.mem.readInt(u16, tlv[0..2], .little);
+    var pos: usize = 2;
+    var changes: std.ArrayList(Change) = .empty;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (pos + 2 > tlv.len) return -3;
+        const plen = std.mem.readInt(u16, tlv[pos..][0..2], .little);
+        pos += 2;
+        if (pos + plen + 4 > tlv.len) return -3;
+        const path = tlv[pos .. pos + plen];
+        pos += plen;
+        const clen = std.mem.readInt(u32, tlv[pos..][0..4], .little);
+        pos += 4;
+        if (pos + clen > tlv.len) return -3;
+        const content = tlv[pos .. pos + clen];
+        pos += clen;
+        const r = object.hashObject(alloc, .blob, content) catch return -1;
+        var bhex: [40]u8 = undefined;
+        oidmod.toHex(r.oid_val, &bhex);
+        hostPutObject(&bhex, r.loose) catch return -8;
+        changes.append(alloc, .{ .path = path, .oid_bytes = r.oid_val }) catch return -1;
+    }
+
+    const has_parent = parent_hex_len == 40;
+    var base_tree_hex: [40]u8 = undefined;
+    if (has_parent) {
+        const pobj = loadObject(alloc, parent_hex) catch return -10;
+        if (pobj.kind != .commit) return -11;
+        base_tree_hex = commitTree(pobj.body) catch return -12;
+    } else {
+        @memcpy(&base_tree_hex, "4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+    }
+
+    const new_tree_hex = applyToTree(alloc, &base_tree_hex, changes.items) catch return -13;
+
+    const now: u64 = if (time_s.len > 0) std.fmt.parseInt(u64, time_s, 10) catch 0 else 0;
+    const tz_s: []const u8 = if (tz_len > 0) tz else "+0000";
+    const authWho: []const u8 = if (author.len > 0) author else "zig-wasm-git <zig-wasm-git@localhost>";
+    const commWho: []const u8 = if (committer.len > 0) committer else authWho;
+
+    var cbody: std.ArrayList(u8) = .empty;
+    cbody.appendSlice(alloc, "tree ") catch return -1;
+    cbody.appendSlice(alloc, &new_tree_hex) catch return -1;
+    cbody.append(alloc, '\n') catch return -1;
+    if (has_parent) {
+        cbody.appendSlice(alloc, "parent ") catch return -1;
+        cbody.appendSlice(alloc, parent_hex) catch return -1;
+        cbody.append(alloc, '\n') catch return -1;
+    }
+    // write "author <who> <time> <tz>"
+    {
+        var tmp: [32]u8 = undefined;
+        // build " N TZ\n" into tmp then append in pieces to avoid comptime overhead
+        cbody.appendSlice(alloc, "author ") catch return -1;
+        cbody.appendSlice(alloc, authWho) catch return -1;
+        cbody.append(alloc, ' ') catch return -1;
+        const ts = std.fmt.bufPrint(tmp[0..], "{d} {s}", .{ now, tz_s }) catch return -1;
+        cbody.appendSlice(alloc, ts) catch return -1;
+        cbody.append(alloc, '\n') catch return -1;
+    }
+    {
+        var tmp: [32]u8 = undefined;
+        cbody.appendSlice(alloc, "committer ") catch return -1;
+        cbody.appendSlice(alloc, commWho) catch return -1;
+        cbody.append(alloc, ' ') catch return -1;
+        const ts = std.fmt.bufPrint(tmp[0..], "{d} {s}", .{ now, tz_s }) catch return -1;
+        cbody.appendSlice(alloc, ts) catch return -1;
+        cbody.append(alloc, '\n') catch return -1;
+    }
+    cbody.append(alloc, '\n') catch return -1;
+    cbody.appendSlice(alloc, msg) catch return -1;
+    cbody.append(alloc, '\n') catch return -1;
+
+    const cr = object.hashObject(alloc, .commit, cbody.items) catch return -1;
+    var chex: [40]u8 = undefined;
+    oidmod.toHex(cr.oid_val, &chex);
+    hostPutObject(&chex, cr.loose) catch return -8;
+
+    @memcpy(out_hex_ptr[0..40], &chex);
+    return 0;
+}
+

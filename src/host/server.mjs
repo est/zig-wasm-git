@@ -175,13 +175,34 @@ function isV2(req) {
 function pktLineByte(s) { const len = Buffer.byteLength(s) + 4; return len.toString(16).padStart(4, "0") + s; }
 
 function buildV2Caps() {
-  // Minimal v2 caps: advertise ls-refs + fetch (with filter) + server-option
-  // Each capability line: "capname[=value]\n" pkt-lined, ending with flush
+  // shallow is a fetch arg, not a capability value; keep fetch=filter, but shallow works regardless if client sends deepen
   const caps = ["version 2", "ls-refs", "fetch=filter wait-for-done", "server-option", "object-format=sha1", "agent=zig-wasm-git/0.0.1"];
   let out = "";
   for (const c of caps) out += pktLine(c + "\n");
   out += pktFlush();
   return out;
+}
+
+function parseShallow(body) {
+  // pkt-line payloads: look for "deepen N" or "deepen-since <date>" or "deepen-not <ref>"
+  const s = body.toString("utf8");
+  let pos = 0, depth = 0, deepenSince = "", deepenNot = "";
+  while (pos + 4 <= s.length) {
+    const hex = s.slice(pos, pos + 4);
+    if (hex === "0000" || hex === "0001" || hex === "0002") { pos += 4; continue; }
+    const len = parseInt(hex, 16);
+    if (isNaN(len) || len < 4) break;
+    const payload = s.slice(pos + 4, pos + len);
+    pos += len;
+    const trimmed = payload.trim();
+    if (trimmed.startsWith("deepen ")) {
+      const v = parseInt(trimmed.slice(7).trim(), 10);
+      if (!isNaN(v) && v > 0) depth = v;
+    } else if (trimmed.startsWith("deepen-since ")) deepenSince = trimmed.slice(13).trim();
+    else if (trimmed.startsWith("deepen-not ")) deepenNot = trimmed.slice(11).trim();
+    else if (trimmed.startsWith("shallow ")) { /* client ack */ }
+  }
+  return { depth, deepenSince, deepenNot };
 }
 
 function gitHttpBackendDiscovery(repo, service, gitProtocol) {
@@ -343,7 +364,8 @@ function parseV2Fetch(body) {
 
 async function handleV2Fetch(repo, body, res) {
   const { wants, filter } = parseV2Fetch(body);
-  console.log(`[v2 fetch] wants=${wants.join(",")} filter=${filter || "(none)"}`);
+  const sh = parseShallow(body);
+  console.log(`[v2 fetch] wants=${wants.join(",")} filter=${filter || "(none)"} depth=${sh.depth}`);
   // For now, serve pack via git upload-pack in v2 http-backend mode if possible, else fallback to v1-pack
   // Try to use git http-backend for v2 fetch by constructing env
   const rp = repoPath(repo);
@@ -390,7 +412,37 @@ async function handleV2Fetch(repo, body, res) {
       }
     }
     let pack;
-    if (blobWants.length > 0 && commitWants.length === 0) {
+    const shallowLines = [];
+    if (sh.depth > 0 && commitWants.length > 0) {
+      // Shallow fetch: include only N commits per want; boundary = parents of deepest kept commit
+      let objs;
+      const includedPerWant = [];
+      for (const wnt of commitWants) {
+        const list = execFileSync("git", ["--git-dir", rp, "rev-list", "--max-count", String(sh.depth), wnt], { maxBuffer: 64 * 1024 * 1024 }).toString().trim().split("\n").filter(Boolean);
+        includedPerWant.push(list);
+        // record the deepest commit's parents as shallow boundaries
+        if (list.length >= sh.depth) {
+          const deepest = list[list.length - 1];
+          try {
+            const raw = execFileSync("git", ["--git-dir", rp, "rev-list", "--parents", "-n", "1", deepest], { maxBuffer: 64 * 1024 }).toString().trim().split(/\s+/).slice(1);
+            for (const par of raw) shallowLines.push(par);
+          } catch { /* root commit -> no boundary */ }
+        } else {
+          // history shorter than depth: fully unshallowed, no boundary
+        }
+      }
+      const uniqWants = [...new Set(commitWants)];
+      objs = execFileSync("git", ["--git-dir", rp, "rev-list", "--objects", "--no-walk=unsorted",
+        ...includedPerWant.flat()], { maxBuffer: 64 * 1024 * 1024 }).toString();
+      // trees/blobs under the kept commits need a walk, not --no-walk only for commits:
+      // walk with filtered depth: rev-list --objects over the included tips limited by max-count
+      objs = execFileSync("git", ["--git-dir", rp, "rev-list", "--objects", "--max-count", String(sh.depth), ...uniqWants], { maxBuffer: 64 * 1024 * 1024 }).toString();
+      if (filter) {
+        objs = execFileSync("git", ["--git-dir", rp, "rev-list", "--objects", "--max-count", String(sh.depth),
+          ...uniqWants, `--filter=${filter}`], { maxBuffer: 64 * 1024 * 1024 }).toString();
+      }
+      pack = execFileSync("git", ["--git-dir", rp, "pack-objects", "--stdout"], { input: Buffer.from(objs), maxBuffer: 64 * 1024 * 1024 });
+    } else if (blobWants.length > 0 && commitWants.length === 0) {
       // Single blob promisor fetch: use cat-file -p to get content, then hash-object to produce pack? Simpler: pack-objects with stdin containing blob oids
       const input = blobWants.join("\n") + "\n";
       // pack-objects needs rev-list style; for blobs, use `git pack-objects --stdout` with object list containing blob oids directly via stdin
@@ -407,9 +459,14 @@ async function handleV2Fetch(repo, body, res) {
       }
       pack = execFileSync("git", ["--git-dir", rp, "pack-objects", "--stdout"], { input: Buffer.from(revListOut), maxBuffer: 64 * 1024 * 1024 });
     }
-    // v2 expects sideband-64k framing: band 1 + chunk
+    // v2 expects sideband-64k framing: optional shallow section, "packfile" header, band-1 chunks, flush
     const MAX = 65516;
     const chunks = [];
+    if (sh.depth > 0) {
+      for (const s of new Set(shallowLines)) chunks.push(Buffer.from(pktLine(`shallow ${s}`), "utf8"));
+      chunks.push(Buffer.from(pktFlush(), "utf8"));
+    }
+    if (sh.depth > 0) chunks.push(Buffer.from(pktLineByte("packfile\n"), "utf8"));
     for (let off = 0; off < pack.length; off += MAX) {
       const slice = pack.subarray(off, Math.min(off + MAX, pack.length));
       const payload = Buffer.concat([Buffer.from([1]), slice]);

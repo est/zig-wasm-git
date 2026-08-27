@@ -3,6 +3,26 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [1.1.0] — 2026-08-22
+
+### Added
+
+- **Pure in-memory store** (`memoryStore()`): zero-FS operation, default when `load()` is
+  called without `dir`/`store`. Designed for CF Workers-style runtimes where storage adapters
+  (KV/R2/D1) plug into the same `{get, put, getRef, putRef}` interface.
+- **`repo.commit(..., options)`**: optional `{ author, committer, time, timezone }`
+  (new `wasm_commit2` export; legacy `wasm_commit` untouched). Fixed-identity placeholder removed as a requirement.
+- **`repo.log(ref, limit)`**: newest-first parent-chain walk returning `{sha, tree, parents[], author, message}` —
+  the cheap "recent history only" path for agents (no protocol negotiation at all).
+- **Server-side shallow groundwork**: `deepen`/`deepen-since`/`deepen-not` parsing, shallow/unshallow
+  section + `packfile` framing in the v2 fetch fallback path.
+
+### Known issue (Apple Git)
+
+This host's smart-HTTP layer does not yet advertise `fetch=shallow`: git 2.50.1-Darwin clients
+stop after `ls-refs` when the token is present and the request carries `--depth`. Explicit
+low-level clients that send `deepen` directly work fine; object-level consumers are unaffected.
+
 ## [1.0.0] — 2026-08-22
 
 First stable release. Pure-Zig WASM git engine + Node host, `git http` read/write with partial clone.

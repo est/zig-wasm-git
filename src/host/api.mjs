@@ -6,13 +6,42 @@
 //   repo.commit("", "init", { "a.txt": "hello" });          // -> commit sha
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import zlib from "node:zlib";
 import { join, dirname } from "node:path";
 
 const ERR_NAMES = { 1: "NotFound", 2: "PathIsDir", 3: "NotATree", 4: "NotABlob", 5: "BadCommit" };
 
+export function memoryStore() {
+  const objs = new Map();
+  const refs = new Map();
+  return {
+    get(hex) {
+      return objs.get(hex) ?? null;
+    },
+    put(hex, loose) {
+      objs.set(hex, Buffer.from(loose));
+    },
+    getRef(name) {
+      return refs.get(name) ?? null;
+    },
+    putRef(name, sha) {
+      refs.set(name, sha);
+    },
+    heads() {
+      const out = [];
+      for (const k of refs.keys()) if (k.startsWith("refs/heads/")) out.push(k.slice("refs/heads/".length));
+      return out;
+    },
+    dump() {
+      return { objects: objs.size, refs: refs.size };
+    },
+  };
+}
+
 export function load(wasmPath, opts = {}) {
   const bytes = readFileSync(wasmPath);
-  const store = opts.store ?? fileStore(opts.dir ?? "data/demo.git");
+  // 无 FS：直接传 store（Workers 侧零 FS）；有 FS：opts.dir 兜底
+  const store = opts.store ?? (opts.dir != null ? fileStore(opts.dir) : memoryStore());
   let inst;
 
   const mod = new WebAssembly.Module(bytes);
@@ -134,7 +163,8 @@ export function load(wasmPath, opts = {}) {
       return decodeGetTlv(Buffer.from(mem.slice(tlvPtr, tlvPtr + tlvLen)));
     },
 
-    commit(parentRef, message, entriesObj, updateRef = "refs/heads/main") {
+    /** options: { author="<name> <email>", committer, time(sec), timezone } (all optional) */
+    commit(parentRef, message, entriesObj, updateRef = "refs/heads/main", options = {}) {
       wasm.wasm_reset();
       const parent = parentRef ? resolveRef(parentRef) : "";
       const pHex = allocStr(parent);
@@ -145,11 +175,45 @@ export function load(wasmPath, opts = {}) {
       }));
       const ej = allocBytes(encodeEntriesTlv(entries));
       const outHex = wasm.wasm_alloc(40);
-      const rc = wasm.wasm_commit(pHex.ptr, pHex.len, msg.ptr, msg.len, ej.ptr, ej.len, outHex);
+      const author = options.author != null ? String(options.author) : "";
+      const committer = options.committer != null ? String(options.committer) : author;
+      const timeSec = options.time != null ? String(options.time) : "";
+      const timezone = options.timezone != null ? String(options.timezone) : "+0000";
+      const authorB = allocStr(author);
+      const committerB = allocStr(committer);
+      const timeB = allocStr(timeSec);
+      const tzB = allocStr(timezone);
+      const rc = wasm.wasm_commit2
+        ? wasm.wasm_commit2(pHex.ptr, pHex.len, msg.ptr, msg.len, ej.ptr, ej.len, authorB.ptr, authorB.len, committerB.ptr, committerB.len, timeB.ptr, timeB.len, tzB.ptr, tzB.len, outHex)
+        : wasm.wasm_commit(pHex.ptr, pHex.len, msg.ptr, msg.len, ej.ptr, ej.len, outHex);
       if (rc !== 0) throw new Error(`wasm_commit rc=${rc}`);
       const sha = readStr(outHex, 40);
       if (updateRef) store.putRef(updateRef, sha);
       return sha;
+    },
+
+    /** recent history: [{sha, tree, parents[], author, message}] — newest first, up to limit. */
+    log(ref, limit = 10) {
+      const sha0 = resolveRef(ref);
+      const out = [];
+      let cur = sha0;
+      for (let i = 0; i < limit && cur; i++) {
+        const loose = store.get(cur);
+        if (!loose) break;
+        const raw = zlib.inflateSync(loose); // "<type> <size>\0<body>"
+        const nul = raw.indexOf(0);
+        const body = raw.subarray(nul + 1).toString("utf8");
+        const lines = body.split("\n");
+        const hdrEnd = lines.indexOf("");
+        const headers = lines.slice(0, hdrEnd);
+        const message = lines.slice(hdrEnd + 1).join("\n").trim();
+        const tree = (headers.find((l) => l.startsWith("tree ")) ?? "").slice(5);
+        const parents = headers.filter((l) => l.startsWith("parent ")).map((l) => l.slice(7));
+        const authorLine = headers.find((l) => l.startsWith("author ")) ?? "";
+        out.push({ sha: cur, tree, parents, author: authorLine.slice(7), message });
+        cur = parents[0];
+      }
+      return out;
     },
 
     resolveRef,
