@@ -247,6 +247,28 @@ export function load(wasmPath, opts = {}) {
       return takeEmit();
     },
 
+    /** fetch/clone: smart HTTP v2 -> unpack(delta) -> store (无 FS/CLI,Worker 同代码) */
+    async fetch(url, ref = "main", opts = {}) {
+      const { fetchIntoStore } = await import("./fetch.mjs");
+      return fetchIntoStore(wasm, store, url, ref, {
+        fetchImpl: opts.fetchImpl ?? fetch,
+        subtle: opts.subtle ?? globalThis.crypto?.subtle,
+        filter: opts.filter ?? "",
+        setRef: opts.setRef,
+        onProgress: opts.onProgress,
+      });
+    },
+
+    /** clone 别名:fetch + 落 ref(语义同 fetch,setRef 默认 true) */
+    async clone(url, ref = "main", opts = {}) {
+      return this.fetch(url, ref, opts);
+    },
+
+    async lsRemote(url, opts = {}) {
+      const { lsRemote } = await import("./fetch.mjs");
+      return lsRemote(wasm, url, { fetchImpl: opts.fetchImpl ?? fetch });
+    },
+
     /** push(ref):discovery -> collect -> pack -> receive-pack,真 git 语义 */
     async push(url, ref = "refs/heads/main", { fetchImpl = fetch } = {}) {
       const fullRef = ref.startsWith("refs/") ? ref : `refs/heads/${ref}`;

@@ -7,6 +7,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 
 ### Added
 
+- **upload-pack v2 客户端** (`repo.fetch(url, ref, {filter})` / `repo.clone()` / `repo.lsRemote()`):
+  无 FS、无命令行,浏览器/CF Worker 同代码。协议举重在 wasm,IO 在 JS。
+  - wasm 新增 `delta.zig` (git delta 展开:copy/insert + base/result varint,4 个单测) 与
+    `fetch.zig` (v2 `ls-refs`/`fetch` 请求构造,与真 git 抓包同形,3 个单测);
+    新导出 `wasm_build_lsrefs`/`wasm_build_fetch`/`wasm_decode_pack_header`/
+    `wasm_inflate_one`(单遍拆包,精确 consumed,终结 trial-inflate)/
+    `wasm_delta_apply`。体积 63 → ~69KB(预算锁放宽至 72KiB,见 `tests/test_wasm.mjs`)。
+  - JS 新增可移植链路 (零 `node:` 导入,断言见 `tests/test_fetch.mjs`):
+    `src/host/store.mjs`(memoryStore) / `wire.mjs`(wasm 调用封装) /
+    `fetch.mjs`(discovery→ls-refs→fetch→sideband 解帧→trailer 校验→unpack:
+    ofs-delta 位置解析 + ref-delta 两段哈希解析→loose 落盘) /
+    `browser.mjs`(`loadFromBytes`:get/commit/log/fetch/clone/push 全 parity)。
+  - `codec.mjs`/`push.mjs` 从 Buffer 迁到 Uint8Array+TextDecoder (Node 照常兼容),
+    `browser.mjs` 的 push 复用同一 `collectObjects`。
+  - `tests/test_fetch.mjs`:全量 fetch→`get()` 读文件;传输中 ofs-delta 内容精确还原;
+    `--no-delta-base-offset` 真包 ref-delta 全量逐字节比对;`blob:none` promisor;
+    browser 入口 fetch/get/commit/push 真 git 验收;`git fsck` 交叉验证。
 - **receive-pack 客户端** (`repo.push(url, ref)`):协议在 wasm、IO/压缩在 JS。
   wasm 新增 `wasm_find_ref`/`wasm_list_refs`/`wasm_build_ref_update`/`wasm_pack_begin|add|end`/
   `wasm_parse_report_status` 导出;对象枚举 + `CompressionStream('deflate')` 压缩 + `fetch`
@@ -17,6 +34,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 
 ### Fixed
 
+- 服务端 v2 fetch 回退路径此前只在 shallow 时发 `packfile` 段头,非 shallow 的
+  filter 包被真 git 以 `expected 'packfile'` 拒绝;现恒发 `packfile` 头
+  (`src/host/server.mjs`),`--filter=blob:none` 真机 clone 已通 (见 `scripts/e2e.sh`)。
+- `push.zig` pkt 切分/listRefs/findRef 容忍 `0002` response-end (真 git v2
+  ls-refs 响应尾部) 与 `version ` caps 行。
 - `pack.zig buildPack` payload 纠正为 `zlib(body)`(此前 `zlib(header+body)` 必被 git 拒,
   已用真 git 对照验证);测试改为 trailer sha + inflate 往返断言,不止 `startsWith("PACK")`。
 

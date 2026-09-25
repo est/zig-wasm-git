@@ -7,7 +7,9 @@ const WASM_PATH = join(__dirname, "..", "zig-out", "bin", "zig_wasm_git.wasm");
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 
 const bytes = readFileSync(WASM_PATH);
-assert(bytes.length <= 64 * 1024, `wasm size budget blown: ${bytes.length} > 65536`);
+// 体积预算 72KiB:fetch 客户端(delta 展开 + 单遍 inflate + v2 请求构造)后 68~69KB;
+// 仍远小于 CF 参考实现 ~100KB,后续只减不增。
+assert(bytes.length <= 72 * 1024, `wasm size budget blown: ${bytes.length} > 73728`);
 let inst;
 const imports = {
   env: {

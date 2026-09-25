@@ -18,6 +18,8 @@ echo "== object API e2e =="
 node tests/test_api.mjs
 echo "== push client e2e (wasm protocol + git-verified) =="
 node tests/test_push.mjs
+echo "== fetch client e2e (worker-like, delta + filter, git-verified) =="
+node tests/test_fetch.mjs
 echo "== memory store / author options =="
 node tests/test_memory_store.mjs
 echo "== ALL TESTS PASSED =="

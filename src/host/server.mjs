@@ -467,6 +467,7 @@ async function handleV2Fetch(repo, body, res) {
       chunks.push(Buffer.from(pktFlush(), "utf8"));
     }
     if (sh.depth > 0) chunks.push(Buffer.from(pktLineByte("packfile\n"), "utf8"));
+    else chunks.push(Buffer.from(pktLineByte("packfile\n"), "utf8"));
     for (let off = 0; off < pack.length; off += MAX) {
       const slice = pack.subarray(off, Math.min(off + MAX, pack.length));
       const payload = Buffer.concat([Buffer.from([1]), slice]);

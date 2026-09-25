@@ -35,6 +35,16 @@ pub fn compress(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
 }
 
 pub fn decompress(allocator: std.mem.Allocator, zlib_data: []const u8) ![]u8 {
+    const r = try decompressOne(allocator, zlib_data);
+    return r.body;
+}
+
+/// Inflate exactly one zlib stream from the front of `zlib_data`.
+/// Returns the decompressed body plus bytes consumed from the input
+/// (2-byte header + deflate payload + 4-byte adler for stored blocks;
+/// likewise exact for flate streams). Enables single-pass pack splitting
+/// without trial-inflate: caller advances by `consumed`.
+pub fn decompressOne(allocator: std.mem.Allocator, zlib_data: []const u8) !struct { body: []u8, consumed: usize } {
     if (zlib_data.len >= 2 and zlib_data[0] == 0x78) {
         var in_reader: std.Io.Reader = .fixed(zlib_data);
         const window: []u8 = try allocator.alloc(u8, std.compress.flate.max_window_len);
@@ -54,12 +64,11 @@ pub fn decompress(allocator: std.mem.Allocator, zlib_data: []const u8) ![]u8 {
             try out.appendSlice(allocator, chunk);
             decomp.reader.toss(chunk.len);
         }
-        if (out.items.len > 0 or zlib_data.len == 6) {
-            return out.toOwnedSlice(allocator);
-        }
-        out.deinit(allocator);
+        return .{ .body = try out.toOwnedSlice(allocator), .consumed = in_reader.seek };
     }
-    return decompressStored(allocator, zlib_data);
+    const body = try decompressStored(allocator, zlib_data);
+    // stored path consumes the whole input (single object)
+    return .{ .body = body, .consumed = zlib_data.len };
 }
 
 fn decompressStored(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
@@ -113,4 +122,24 @@ test "zlib empty" {
     const d = try decompress(alloc, c);
     defer alloc.free(d);
     try std.testing.expectEqualStrings("", d);
+}
+
+test "decompressOne reports consumed (concatenated streams)" {
+    const alloc = std.testing.allocator;
+    const a = try compress(alloc, "first object\n");
+    defer alloc.free(a);
+    const b = try compress(alloc, "second\n");
+    defer alloc.free(b);
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(alloc);
+    try joined.appendSlice(alloc, a);
+    try joined.appendSlice(alloc, b);
+    const one = try decompressOne(alloc, joined.items);
+    defer alloc.free(one.body);
+    try std.testing.expectEqualStrings("first object\n", one.body);
+    try std.testing.expectEqual(a.len, one.consumed);
+    const two = try decompressOne(alloc, joined.items[one.consumed..]);
+    defer alloc.free(two.body);
+    try std.testing.expectEqualStrings("second\n", two.body);
+    try std.testing.expectEqual(b.len, two.consumed);
 }

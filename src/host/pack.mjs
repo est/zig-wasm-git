@@ -49,12 +49,14 @@ export function buildPack(objects, { deflate = nodeDeflate, sha1 = nodeSha1 } = 
   for (const o of objects) {
     const tn = PACK_TYPE_NUM[o.type];
     if (!tn) throw new Error(`unknown object type: ${o.type}`);
-    if (!Buffer.isBuffer(o.body)) throw new Error("body must be Buffer");
-    parts.push(encodeObjectHeader(tn, o.body.length));
-    parts.push(deflate(o.body));
+    const body = Buffer.isBuffer(o.body) ? o.body : Buffer.from(o.body);
+    parts.push(encodeObjectHeader(tn, body.length));
+    const z = deflate(body);
+    parts.push(Buffer.isBuffer(z) ? z : Buffer.from(z));
   }
   const body = Buffer.concat(parts);
-  return Buffer.concat([body, sha1(body)]);
+  const digest = sha1(body);
+  return Buffer.concat([body, Buffer.isBuffer(digest) ? digest : Buffer.from(digest)]);
 }
 
 /// 最小解析器(校验 trailer + 逐对象 inflate),用于测试/调试;delta 对象只返回元信息不展开

@@ -4,6 +4,8 @@ pub const sha1 = @import("sha1.zig");
 pub const zlib = @import("zlib.zig");
 pub const filter = @import("filter.zig");
 pub const pack = @import("pack.zig");
+pub const delta = @import("delta.zig");
+pub const fetch = @import("fetch.zig");
 pub const object = @import("object.zig");
 pub const partial = @import("partial.zig");
 pub const proto = @import("proto.zig");
@@ -16,6 +18,8 @@ test {
     _ = zlib;
     _ = filter;
     _ = pack;
+    _ = delta;
+    _ = fetch;
     _ = object;
     _ = partial;
     _ = proto;

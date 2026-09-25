@@ -39,10 +39,11 @@ try {
   const objects = await collectObjects(store, c1, new Set());
   console.log(`collected: ${objects.length} objects (${objects.map((o) => o.type).join(",")})`);
   const wasmPack = await local.pushPack(objects);
+  const { hexOfBytes } = await import("../src/host/codec.mjs");
   const devMap = new Map();
-  for (const o of objects) devMap.set(o.body.toString("hex"), await deflateZlib(o.body));
+  for (const o of objects) devMap.set(hexOfBytes(o.body), await deflateZlib(o.body));
   const refPack = buildPack(objects.map((o) => ({ type: o.type, body: o.body })), {
-    deflate: (b) => devMap.get(b.toString("hex")),
+    deflate: (b) => devMap.get(hexOfBytes(b)),
   });
   if (!wasmPack.equals(refPack)) throw new Error(`wasm/JS pack mismatch: ${wasmPack.length} vs ${refPack.length}`);
   console.log(`differential ok: pack=${wasmPack.length}B byte-identical`);

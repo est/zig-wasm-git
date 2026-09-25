@@ -7,6 +7,9 @@ const filter = @import("filter.zig");
 const partial = @import("partial.zig");
 const object = @import("object.zig");
 const sha1 = @import("sha1.zig");
+const delta = @import("delta.zig");
+const fetchReq = @import("fetch.zig");
+const packMod = @import("pack.zig");
 
 // ─── Host imports ───────────────────────────────────────────────────────────
 // Storage callbacks. ptr/len point into wasm linear memory.
@@ -273,6 +276,99 @@ export fn wasm_pktline_encode(payload_ptr: usize, payload_len: usize, out_ptr: *
     alloc.free(el);
     out_ptr.* = p;
     out_len.* = el.len;
+    return 0;
+}
+
+// ─── upload-pack client: ls-refs / fetch 请求构造 (wasm 侧纯协议,IO 在 JS) ───
+// wants 为 LF 分隔的 40B hex 列表 (单 want 即一行);filter 为裸 spec ("blob:none",
+// 无 "filter " 前缀),空串表示无 filter。
+
+export fn wasm_build_lsrefs(out_ptr: *usize, out_len: *usize) i32 {
+    const alloc = gpa();
+    const req = fetchReq.buildLsRefsRequest(alloc) catch return -1;
+    const p = wasm_alloc(req.len);
+    if (p == 0) return -1;
+    @memcpy(sliceFromPtrMut(p, req.len), req);
+    out_ptr.* = p;
+    out_len.* = req.len;
+    return 0;
+}
+
+export fn wasm_build_fetch(wants_ptr: usize, wants_len: usize, filter_ptr: usize, filter_len: usize, out_ptr: *usize, out_len: *usize) i32 {
+    const alloc = gpa();
+    const wants_raw = sliceFromPtr(wants_ptr, wants_len);
+    const filter_raw = sliceFromPtr(filter_ptr, filter_len);
+    var wants: std.ArrayList([40]u8) = .empty;
+    defer wants.deinit(alloc);
+    var it = std.mem.splitScalar(u8, wants_raw, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \r\n");
+        if (t.len == 0) continue;
+        if (t.len != 40) return -2;
+        var w: [40]u8 = undefined;
+        @memcpy(&w, t[0..40]);
+        for (w) |c| if (!std.ascii.isHex(c)) return -2;
+        // normalize to lowercase for git
+        for (&w) |*c| c.* = std.ascii.toLower(c.*);
+        wants.append(alloc, w) catch return -1;
+    }
+    if (wants.items.len == 0) return -2;
+    const filt: ?[]const u8 = if (filter_raw.len == 0) null else std.mem.trim(u8, filter_raw, " \r\n");
+    const req = fetchReq.buildFetchRequest(alloc, wants.items, .{ .filter = filt }) catch return -1;
+    const p = wasm_alloc(req.len);
+    if (p == 0) return -1;
+    @memcpy(sliceFromPtrMut(p, req.len), req);
+    out_ptr.* = p;
+    out_len.* = req.len;
+    return 0;
+}
+
+// wasm_decode_pack_header(buf) -> out_type u32, out_size u32/usize, out_consumed u32.
+// 纯 varint 解码,供 JS 拆 pack 时用 (与 pack.zig 同格式,经真 git 对照)。
+export fn wasm_decode_pack_header(buf_ptr: usize, buf_len: usize, out_type: *u32, out_size: *usize, out_consumed: *usize) i32 {
+    const buf = sliceFromPtr(buf_ptr, buf_len);
+    const h = packMod.parsePackHeader(buf) catch return -1;
+    out_type.* = @intFromEnum(h.ptype);
+    out_size.* = h.size;
+    out_consumed.* = h.consumed;
+    return 0;
+}
+
+// wasm_delta_apply(base, delta) -> out TLV bytes. rc: 0 ok, -1 bricolage, -2 bad base, -3 truncated/range.
+export fn wasm_delta_apply(base_ptr: usize, base_len: usize, delta_ptr: usize, delta_len: usize, out_ptr: *usize, out_len: *usize) i32 {
+    const alloc = gpa();
+    const base = sliceFromPtr(base_ptr, base_len);
+    const d = sliceFromPtr(delta_ptr, delta_len);
+    const out = delta.applyDelta(alloc, base, d) catch |e| {
+        return switch (e) {
+            error.BadBaseSize, error.BadResultSize => -2,
+            error.Truncated, error.CopyOutOfRange, error.BadDeltaOpcode, error.VarintTooLong, error.VarintOverflow => -3,
+            else => -1,
+        };
+    };
+    const p = wasm_alloc(out.len);
+    if (p == 0) return -1;
+    @memcpy(sliceFromPtrMut(p, out.len), out);
+    out_ptr.* = p;
+    out_len.* = out.len;
+    return 0;
+}
+
+// wasm_inflate_one(in) -> out bytes + consumed input len. 单次调用拆一个 pack 对象,
+// 无需 trial-inflate (DecompressionStream 遇尾部即炸,node inflate 忽略尾部,行为不统一;
+// wasm 侧单遍即得 consumed,两端通用)。
+// rc: 0 ok, -1 bad input. out_consumed = 输入消耗字节数 (zlib 头+deflate+adler)。
+export fn wasm_inflate_one(in_ptr: usize, in_len: usize, out_ptr: *usize, out_len: *usize, out_consumed: *usize) i32 {
+    const alloc = gpa();
+    const input = sliceFromPtr(in_ptr, in_len);
+    const z = @import("zlib.zig");
+    const r = z.decompressOne(alloc, input) catch return -1;
+    const p = wasm_alloc(r.body.len);
+    if (p == 0 and r.body.len != 0) return -1;
+    if (r.body.len > 0) @memcpy(sliceFromPtrMut(p, r.body.len), r.body);
+    out_ptr.* = p;
+    out_len.* = r.body.len;
+    out_consumed.* = r.consumed;
     return 0;
 }
 

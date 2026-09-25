@@ -31,7 +31,7 @@ pub fn splitLines(allocator: std.mem.Allocator, buf: []const u8) ![]AdvLine {
             pos += 4;
             continue;
         }
-        if (std.mem.eql(u8, hex, "0001")) {
+        if (std.mem.eql(u8, hex, "0001") or std.mem.eql(u8, hex, "0002")) {
             try out.append(allocator, .delim);
             pos += 4;
             continue;
@@ -50,7 +50,7 @@ pub fn findRef(advert: []const u8, refname: []const u8) ?[40]u8 {
     var pos: usize = 0;
     while (pos + 4 <= advert.len) {
         const hex = advert[pos .. pos + 4];
-        if (std.mem.eql(u8, hex, "0000") or std.mem.eql(u8, hex, "0001")) {
+        if (std.mem.eql(u8, hex, "0000") or std.mem.eql(u8, hex, "0001") or std.mem.eql(u8, hex, "0002")) {
             pos += 4;
             continue;
         }
@@ -99,7 +99,7 @@ pub fn listRefs(allocator: std.mem.Allocator, advert: []const u8) ![]AdvertRef {
     var pos: usize = 0;
     while (pos + 4 <= advert.len) {
         const hex = advert[pos .. pos + 4];
-        if (std.mem.eql(u8, hex, "0000") or std.mem.eql(u8, hex, "0001")) {
+        if (std.mem.eql(u8, hex, "0000") or std.mem.eql(u8, hex, "0001") or std.mem.eql(u8, hex, "0002")) {
             pos += 4;
             continue;
         }
@@ -108,6 +108,7 @@ pub fn listRefs(allocator: std.mem.Allocator, advert: []const u8) ![]AdvertRef {
         var line = advert[pos + 4 .. pos + len];
         pos += len;
         if (std.mem.startsWith(u8, line, "# service=")) continue;
+        if (std.mem.startsWith(u8, line, "version ")) continue; // v2 caps preface
         if (std.mem.indexOfScalar(u8, line, 0)) |nul| line = line[0..nul];
         if (line.len < 42) continue;
         const oid_hex = line[0..40];

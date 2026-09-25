@@ -1,7 +1,11 @@
 // src/host/push.mjs — receive-pack 客户端编排 (JS 侧:IO + 枚举 + 压缩;线协议在 wasm)
 // 流程: GET info/refs?service=git-receive-pack -> wasm_find_ref -> JS collect ->
 // CS deflate -> wasm pack 会话 -> wasm ref-update -> POST -> wasm status 解析
+// 可移植:无 node: 导入 (Uint8Array + TextDecoder;Buffer 调用方照常兼容)。
 import { looseBody, parseTreeEntries, commitParentsAndTree, deflateZlib } from "./codec.mjs";
+
+const _dec = new TextDecoder();
+const _utf8 = (b) => _dec.decode(b instanceof Uint8Array ? b : new Uint8Array(b));
 
 export const ZERO_OID = "0".repeat(40);
 export const TYPE_NUM = { commit: 1, tree: 2, blob: 3, tag: 4 };
@@ -24,7 +28,7 @@ async function markReachable(store, haveHexes, seen) {
       for (const p of parents) queue.push(p.toLowerCase());
       if (tree) tqueue.push(tree.toLowerCase());
     } else if (type === "tag") {
-      const m = body.toString().match(/^object ([0-9a-f]{40})/m);
+      const m = _utf8(body).match(/^object ([0-9a-f]{40})/m);
       if (m) queue.push(m[1].toLowerCase());
     } else if (type === "tree") {
       tqueue.push(hex);
@@ -60,7 +64,7 @@ export async function collectObjects(store, newOid, haves = new Set()) {
   if (first.type === "tag") {
     mark(newOid);
     tags.push({ hex: newOid, type: "tag", body: first.body });
-    const m = first.body.toString().match(/^object ([0-9a-f]{40})\ntype (\w+)/m);
+    const m = _utf8(first.body).match(/^object ([0-9a-f]{40})\ntype (\w+)/m);
     if (!m) throw new Error("bad tag");
     if (want(m[1])) {
       if (m[2] === "commit") tagCommit = m[1].toLowerCase();
@@ -123,14 +127,15 @@ export async function collectObjects(store, newOid, haves = new Set()) {
 
 /// 解 wasm_list_refs 的 TLV:u16 n, per: 40B hex, u16 name_len, name
 export function decodeRefsTlv(buf) {
-  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   let pos = 0;
   const n = dv.getUint16(pos, true); pos += 2;
   const out = [];
   for (let i = 0; i < n; i++) {
-    const oid = Buffer.from(buf.subarray(pos, pos + 40)).toString(); pos += 40;
+    const oid = _dec.decode(u8.subarray(pos, pos + 40)); pos += 40;
     const nlen = dv.getUint16(pos, true); pos += 2;
-    const name = Buffer.from(buf.subarray(pos, pos + nlen)).toString(); pos += nlen;
+    const name = _dec.decode(u8.subarray(pos, pos + nlen)); pos += nlen;
     out.push({ oid, name });
   }
   return out;
@@ -139,21 +144,22 @@ export function decodeRefsTlv(buf) {
 /// 解 wasm_parse_report_status 的 TLV:
 /// u8 unpack_ok, u16 umsg_len, umsg, u16 n, per: u8 ok, u16 ref_len, ref, [ng: u16 msg_len, msg]
 export function decodeStatusTlv(buf) {
-  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   let pos = 0;
-  const unpackOk = buf[pos++] === 1;
+  const unpackOk = u8[pos++] === 1;
   const umlen = dv.getUint16(pos, true); pos += 2;
-  const unpackMsg = Buffer.from(buf.subarray(pos, pos + umlen)).toString(); pos += umlen;
+  const unpackMsg = _dec.decode(u8.subarray(pos, pos + umlen)); pos += umlen;
   const n = dv.getUint16(pos, true); pos += 2;
   const refs = [];
   for (let i = 0; i < n; i++) {
-    const ok = buf[pos++] === 1;
+    const ok = u8[pos++] === 1;
     const rlen = dv.getUint16(pos, true); pos += 2;
-    const ref = Buffer.from(buf.subarray(pos, pos + rlen)).toString(); pos += rlen;
+    const ref = _dec.decode(u8.subarray(pos, pos + rlen)); pos += rlen;
     let msg = "";
     if (!ok) {
       const mlen = dv.getUint16(pos, true); pos += 2;
-      msg = Buffer.from(buf.subarray(pos, pos + mlen)).toString(); pos += mlen;
+      msg = _dec.decode(u8.subarray(pos, pos + mlen)); pos += mlen;
     }
     refs.push({ ref, ok, msg });
   }
