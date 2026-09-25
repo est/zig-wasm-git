@@ -15,7 +15,7 @@ const SERVER_REPO = join(ROOT, "data/fetchtest.git");
 rmSync(SERVER_REPO, { recursive: true, force: true });
 
 // ── 0. 可移植断言:客户端链路零 node: 导入 ──
-for (const f of ["store.mjs", "wire.mjs", "fetch.mjs", "browser.mjs", "codec.mjs", "push.mjs"]) {
+for (const f of ["store.mjs", "wire.mjs", "fetch.mjs", "browser.mjs", "codec.mjs", "push.mjs", "blob.mjs"]) {
   const src = readFileSync(join(ROOT, "src/host", f), "utf8");
   if (/from\s+["']node:/.test(src) || /require\s*\(/.test(src)) throw new Error(`${f} must stay portable (no node: imports)`);
   if (/child_process|execFile|readFileSync|writeFileSync/.test(src)) throw new Error(`${f} must not touch fs/child_process`);

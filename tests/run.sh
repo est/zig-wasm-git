@@ -22,4 +22,6 @@ echo "== fetch client e2e (worker-like, delta + filter, git-verified) =="
 node tests/test_fetch.mjs
 echo "== memory store / author options =="
 node tests/test_memory_store.mjs
+echo "== blob-service facade e2e =="
+node tests/test_blob.mjs
 echo "== ALL TESTS PASSED =="

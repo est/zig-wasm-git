@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 
 ### Added
 
+- **Blob-service facade** (`src/host/blob.mjs`, portable, re-exported from
+  `browser.mjs`/`api.mjs`): `createBlobService(repo, {ref, filter})` ->
+  `read`/`readText`/`readMany`/`write`/`writeText`/`pull`/`publish`/`sync`/`version`.
+  One branch == one keyspace, missing key is `null`, each write is a version,
+  publish is fast-forward-only (last-writer-wins, no merge). `sync(url, paths)`
+  pulls latest then returns keys; `filter: "blob:none"` pulls versions without
+  bytes. Covered by `tests/test_blob.mjs` (local lifecycle + server sync + fsck).
 - **upload-pack v2 客户端** (`repo.fetch(url, ref, {filter})` / `repo.clone()` / `repo.lsRemote()`):
   无 FS、无命令行,浏览器/CF Worker 同代码。协议举重在 wasm,IO 在 JS。
   - wasm 新增 `delta.zig` (git delta 展开:copy/insert + base/result varint,4 个单测) 与

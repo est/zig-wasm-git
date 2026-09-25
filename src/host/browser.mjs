@@ -14,6 +14,7 @@ import { memoryStore } from "./store.mjs";
 import { bootWasm } from "./wire.mjs";
 import * as wire from "./wire.mjs";
 import { fetchIntoStore, lsRemote } from "./fetch.mjs";
+import { createBlobService } from "./blob.mjs";
 import { collectObjects, TYPE_NUM, ZERO_OID, decodeRefsTlv, decodeStatusTlv } from "./push.mjs";
 import { deflateZlib } from "./codec.mjs";
 
@@ -22,7 +23,7 @@ const dec = new TextDecoder();
 const ERR_NAMES = { 1: "NotFound", 2: "PathIsDir", 3: "NotATree", 4: "NotABlob", 5: "BadCommit" };
 const joinUrl = (base, path) => base.replace(/\/+$/, "") + path;
 
-export { memoryStore };
+export { memoryStore, createBlobService };
 
 export function loadFromBytes(wasmBytes, opts = {}) {
   const store = opts.store ?? memoryStore();

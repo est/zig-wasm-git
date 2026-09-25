@@ -9,8 +9,11 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 
 import zlib from "node:zlib";
 import { join, dirname } from "node:path";
 import { collectObjects, decodeRefsTlv, decodeStatusTlv, TYPE_NUM, ZERO_OID, joinUrl, deflateZlib } from "./push.mjs";
+import { createBlobService } from "./blob.mjs";
 
 const ERR_NAMES = { 1: "NotFound", 2: "PathIsDir", 3: "NotATree", 4: "NotABlob", 5: "BadCommit" };
+
+export { createBlobService };
 
 export function memoryStore() {
   const objs = new Map();
