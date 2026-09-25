@@ -39,6 +39,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 - `tests/test_pack.mjs` / `tests/test_push.mjs`:pack 经 `git index-pack`/`verify-pack` 真验证;
   wasm pack 与 JS 参考实现逐字节 differential 比对;JS 客户端直推本地 host、服务端 `fsck` 验收。
 
+### Changed
+
+- **JS 去重**:`codec.mjs` 收敛 `streamAll`/`hexOfBytes`/`joinUrl` 三处重复,
+  `decodeRefsTlv` 以 `wire.mjs` 为唯一实现 (`push.mjs` 转 re-export);
+  `api.mjs` (365→131 行) 改为 Node 薄适配层,get/commit/fetch/push 全委托
+  portable `browser.mjs`,仅保留 `fileStore` + Buffer 口味 + 同步 `log()`。
+  对外契约不变 (`get→Buffer`, `pushPack→Buffer`, `log` 同步)。
+
 ### Fixed
 
 - 服务端 v2 fetch 回退路径此前只在 shallow 时发 `packfile` 段头,非 shallow 的

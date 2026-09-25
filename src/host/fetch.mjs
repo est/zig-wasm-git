@@ -10,36 +10,17 @@
 // Only platform ABIs used: fetch, CompressionStream, crypto.subtle, TextEncoder/Decoder.
 
 import { buildLsRefsReq, buildFetchReq, listRefs, decodePackHeaderJS, inflateOne, deltaApply } from "./wire.mjs";
+import { streamAll, hexOfBytes, joinUrl } from "./codec.mjs";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 export const TYPE_NAME = { 1: "commit", 2: "tree", 3: "blob", 4: "tag", 6: "ofs_delta", 7: "ref_delta" };
 
-const joinUrl = (base, path) => base.replace(/\/+$/, "") + path;
-const hexOf = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-
 function needPlatform(fetchImpl, subtle) {
   if (!fetchImpl) throw new Error("fetch unavailable on this platform (pass fetchImpl)");
   if (!subtle) throw new Error("crypto.subtle unavailable on this platform");
   if (typeof CompressionStream === "undefined") throw new Error("CompressionStream unavailable on this platform");
-}
-
-async function streamAll(stream, input) {
-  const w = stream.writable.getWriter();
-  await w.write(input);
-  await w.close();
-  const chunks = [];
-  for await (const c of stream.readable) chunks.push(new Uint8Array(c.buffer, c.byteOffset, c.byteLength));
-  let n = 0;
-  for (const c of chunks) n += c.length;
-  const out = new Uint8Array(n);
-  let o = 0;
-  for (const c of chunks) {
-    out.set(c, o);
-    o += c.length;
-  }
-  return out;
 }
 
 export const deflateRaw = (body) => streamAll(new CompressionStream("deflate"), body);
@@ -54,7 +35,7 @@ function looseBytes(type, body) {
 
 async function sha1Hex(subtle, bytes) {
   const d = await subtle.digest("SHA-1", bytes);
-  return hexOf(new Uint8Array(d));
+  return hexOfBytes(new Uint8Array(d));
 }
 
 /// Split a pkt-line stream into payloads. Returns {lines:[Uint8Array], flushSeen}.
@@ -178,7 +159,7 @@ export function unpackPack(wasm, pack) {
     } else if (h.type === 7) {
       // ref-delta: 裸 20B base oid + zlib(delta 指令)
       if (pos + 20 > end) throw new Error("ref-delta base truncated");
-      const baseHex = hexOf(pack.subarray(pos, pos + 20));
+      const baseHex = hexOfBytes(pack.subarray(pos, pos + 20));
       pos += 20;
       const { body: inflated, consumed } = inflateOne(wasm, pack, pos);
       pos += consumed;

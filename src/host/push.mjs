@@ -2,15 +2,16 @@
 // 流程: GET info/refs?service=git-receive-pack -> wasm_find_ref -> JS collect ->
 // CS deflate -> wasm pack 会话 -> wasm ref-update -> POST -> wasm status 解析
 // 可移植:无 node: 导入 (Uint8Array + TextDecoder;Buffer 调用方照常兼容)。
-import { looseBody, parseTreeEntries, commitParentsAndTree, deflateZlib } from "./codec.mjs";
+import { looseBody, parseTreeEntries, commitParentsAndTree, deflateZlib, joinUrl } from "./codec.mjs";
+import { decodeRefsTlv } from "./wire.mjs";
+
+export { decodeRefsTlv };
 
 const _dec = new TextDecoder();
 const _utf8 = (b) => _dec.decode(b instanceof Uint8Array ? b : new Uint8Array(b));
 
 export const ZERO_OID = "0".repeat(40);
 export const TYPE_NUM = { commit: 1, tree: 2, blob: 3, tag: 4 };
-
-const joinUrl = (base, path) => base.replace(/\/+$/, "") + path;
 
 /// 把 haves 可达的全部对象标进 seen(只标不发;缺失则跳过——多发不少发)
 async function markReachable(store, haveHexes, seen) {
@@ -125,22 +126,6 @@ export async function collectObjects(store, newOid, haves = new Set()) {
   return [...commits, ...tags, ...trees, ...blobs];
 }
 
-/// 解 wasm_list_refs 的 TLV:u16 n, per: 40B hex, u16 name_len, name
-export function decodeRefsTlv(buf) {
-  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-  let pos = 0;
-  const n = dv.getUint16(pos, true); pos += 2;
-  const out = [];
-  for (let i = 0; i < n; i++) {
-    const oid = _dec.decode(u8.subarray(pos, pos + 40)); pos += 40;
-    const nlen = dv.getUint16(pos, true); pos += 2;
-    const name = _dec.decode(u8.subarray(pos, pos + nlen)); pos += nlen;
-    out.push({ oid, name });
-  }
-  return out;
-}
-
 /// 解 wasm_parse_report_status 的 TLV:
 /// u8 unpack_ok, u16 umsg_len, umsg, u16 n, per: u8 ok, u16 ref_len, ref, [ng: u16 msg_len, msg]
 export function decodeStatusTlv(buf) {
@@ -165,5 +150,3 @@ export function decodeStatusTlv(buf) {
   }
   return { unpackOk, unpackMsg, refs };
 }
-
-export { deflateZlib, joinUrl };

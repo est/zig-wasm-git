@@ -11,13 +11,15 @@ export function hexOfBytes(b) {
   return s;
 }
 
+export const joinUrl = (base, path) => base.replace(/\/+$/, "") + path;
+
 function needCS() {
   if (typeof CompressionStream === "undefined" || typeof DecompressionStream === "undefined") {
     throw new Error("CompressionStream/DecompressionStream unavailable on this platform");
   }
 }
 
-async function streamAll(stream, input) {
+export async function streamAll(stream, input) {
   const w = stream.writable.getWriter();
   await w.write(input);
   await w.close();
