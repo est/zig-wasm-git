@@ -48,6 +48,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
   ls-refs 响应尾部) 与 `version ` caps 行。
 - `pack.zig buildPack` payload 纠正为 `zlib(body)`(此前 `zlib(header+body)` 必被 git 拒,
   已用真 git 对照验证);测试改为 trailer sha + inflate 往返断言,不止 `startsWith("PACK")`。
+- stock git (`http.receivepack` 默认 false,ubuntu git 2.43) 下测试服 discovery 被
+  `http-backend` 回空 body (`Service not enabled`),客户端见 0 refs 误走建分支,
+  首推碰巧过、二次 push 被拒 `reference already exists` (CI: `test_push.mjs` noop)。
+  现 `server.mjs ensureRepo` 固定写 `http.receivepack/uploadpack=true`;
+  `push.zig listRefs` 对零 pkt token 广播返回 `EmptyAdvertisement` 大声报错,
+  不再静默 0 refs (v2 空 `ls-refs` 的单个 `0000` 仍合法)。orb Ubuntu 复现+全量验证。
 
 ## [1.1.0] — 2026-08-22
 

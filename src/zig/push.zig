@@ -96,15 +96,21 @@ pub fn listRefs(allocator: std.mem.Allocator, advert: []const u8) ![]AdvertRef {
         for (out.items) |r| allocator.free(r.name);
         out.deinit(allocator);
     }
+    // stock git 未开 http.receivepack 时 http-backend 回空 body,
+    // 此前静默返回 0 refs,调用方误走建分支(create)而被拒 "reference already exists"。
+    // 合法广播至少有一个 pkt token("# service"/占位行/flush);零 token 即错。
+    var tokens: usize = 0;
     var pos: usize = 0;
     while (pos + 4 <= advert.len) {
         const hex = advert[pos .. pos + 4];
         if (std.mem.eql(u8, hex, "0000") or std.mem.eql(u8, hex, "0001") or std.mem.eql(u8, hex, "0002")) {
+            tokens += 1;
             pos += 4;
             continue;
         }
         const len = std.fmt.parseInt(usize, hex, 16) catch return error.BadPktLen;
         if (len < 4 or pos + len > advert.len) return error.BadPktLen;
+        tokens += 1;
         var line = advert[pos + 4 .. pos + len];
         pos += len;
         if (std.mem.startsWith(u8, line, "# service=")) continue;
@@ -128,6 +134,7 @@ pub fn listRefs(allocator: std.mem.Allocator, advert: []const u8) ![]AdvertRef {
         if (!ok) continue;
         try out.append(allocator, .{ .oid = oid, .name = try allocator.dupe(u8, name) });
     }
+    if (tokens == 0) return error.EmptyAdvertisement;
     return out.toOwnedSlice(allocator);
 }
 
@@ -620,7 +627,20 @@ test "listRefs multi + empty" {
     try std.testing.expectEqual(@as(usize, 0), refs2.len);
 }
 
-test "findRef empty repo placeholder" {    const a = std.testing.allocator;
+test "listRefs rejects empty advert (service-not-enabled trap)" {
+    const a = std.testing.allocator;
+    // stock git 未开 http.receivepack 时 discovery body 为空:必须 loud error,
+    // 不能静默 0 refs (调用方会误走 create，被拒 "reference already exists")。
+    try std.testing.expectError(error.EmptyAdvertisement, listRefs(a, ""));
+    try std.testing.expectError(error.EmptyAdvertisement, listRefs(a, "abc")); // <4B,零 token
+    // v2 空 ls-refs 回复是单个 flush:有 token,合法 0 refs
+    const none = try listRefs(a, "0000");
+    defer a.free(none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "findRef empty repo placeholder" {
+    const a = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
     {

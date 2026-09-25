@@ -66,6 +66,17 @@ function ensureRepo(name) {
     writeFileSync(join(rp, "HEAD"), "ref: refs/heads/main\n");
     writeFileSync(join(rp, "config"), `[core]\n\trepositoryformatversion = 0\n`);
   }
+  // stock git defaults http.receivepack=false, which makes `git http-backend`
+  // answer discovery with "Service not enabled" (empty body) instead of the
+  // ref advert — push clients then see 0 refs and retry create on every push
+  // (observed on ubuntu git 2.43; Apple Git serves it by default). Pin it.
+  const cfgPath = join(rp, "config");
+  try {
+    const cfg = existsSync(cfgPath) ? readFileSync(cfgPath, "utf8") : "";
+    if (!/receivepack/i.test(cfg)) {
+      writeFileSync(cfgPath, cfg + (cfg.endsWith("\n") || cfg.length === 0 ? "" : "\n") + `[http]\n\treceivepack = true\n\tuploadpack = true\n`);
+    }
+  } catch { /* best-effort; git CLI remains source of truth */ }
   return rp;
 }
 
