@@ -8,7 +8,7 @@ git engine without `fs` nor `git` command. WASM+JS that speaks directly to any g
 
 This repo is a minimal reproduction focused on read/write remote blobs over git http.
 
-Project Goal: **the git remote is a versioned blob store, not a dev workspace.**   
+Project Goal: **use git remote as a versioned blob store, not a dev workspace.**   
 One branch == one keyspace (`path -> bytes`), one commit == one version.   
 There is no workdir, no merge, no checkout — just `read` / `write` / `pull` / `publish`.   
 
