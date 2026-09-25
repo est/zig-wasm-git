@@ -7,6 +7,7 @@ pub const pack = @import("pack.zig");
 pub const object = @import("object.zig");
 pub const partial = @import("partial.zig");
 pub const proto = @import("proto.zig");
+pub const push = @import("push.zig");
 
 test {
     _ = oid;
@@ -18,4 +19,5 @@ test {
     _ = object;
     _ = partial;
     _ = proto;
+    _ = push;
 }

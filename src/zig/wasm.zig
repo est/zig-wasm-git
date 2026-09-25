@@ -2,6 +2,7 @@ const std = @import("std");
 const oidmod = @import("oid.zig");
 const pktline = @import("pktline.zig");
 const proto = @import("proto.zig");
+const push = @import("push.zig");
 const filter = @import("filter.zig");
 const partial = @import("partial.zig");
 const object = @import("object.zig");
@@ -49,6 +50,151 @@ fn sliceFromPtr(ptr: usize, len: usize) []const u8 {
 fn sliceFromPtrMut(ptr: usize, len: usize) []u8 {
     if (len == 0) return &.{};
     return @as([*]u8, @ptrFromInt(ptr))[0..len];
+}
+
+fn emitAll(bytes: []const u8) void {
+    if (bytes.len == 0) return;
+    host_emit_bytes(bytes.ptr, bytes.len);
+}
+
+// ─── receive-pack client: protocol in wasm, IO/compression in host JS ────────
+//
+// 对象枚举由 JS 做(store 遍历属 IO;见 src/host/push.mjs,算法 spec 见 push.collectObjects).
+// wasm 只做线协议 + 二进制组帧:
+// pack:    wasm_pack_begin(n) / wasm_pack_add(type_num, raw_size, dev_ptr, dev_len)
+//          / wasm_pack_end() — streams pack bytes via host_emit_bytes; big packs
+//          never sit in the arena. sha1 trailer hashed incrementally.
+// refs:    wasm_find_ref(advert, refname, out40) -> 0 hit / 1 miss / -1 err
+//          wasm_build_ref_update(old40, new40, ref, caps) -> emits command block
+// status:  wasm_parse_report_status(ptr,len, out_ptr*,out_len*) -> TLV:
+//          u8 unpack_ok, u16 umsg_len, umsg, u16 n, per: u8 ok, u16 ref_len, ref,
+//          [ng: u16 msg_len, msg]. rc: 0 all-ok / 1 unpack-ok-but-ng / -2 unpack-fail / -1 malformed
+
+var pack_active: bool = false;
+var pack_expect: u32 = 0;
+var pack_count: u32 = 0;
+var pack_hasher: sha1.Hasher = undefined;
+
+export fn wasm_pack_begin(n: u32) i32 {
+    const alloc = gpa();
+    _ = alloc;
+    var hdr: [12]u8 = undefined;
+    @memcpy(hdr[0..4], "PACK");
+    std.mem.writeInt(u32, hdr[4..8], 2, .big);
+    std.mem.writeInt(u32, hdr[8..12], n, .big);
+    pack_hasher = sha1.Hasher.init();
+    pack_hasher.update(hdr[0..]);
+    pack_active = true;
+    pack_expect = n;
+    pack_count = 0;
+    emitAll(hdr[0..]);
+    return 0;
+}
+
+export fn wasm_pack_add(type_num: u32, raw_size: usize, dev_ptr: usize, dev_len: usize) i32 {
+    const alloc = gpa();
+    if (!pack_active) return -1;
+    if (pack_count >= pack_expect) return -9;
+    if (type_num < 1 or type_num > 4) return -2;
+    const payload = sliceFromPtr(dev_ptr, dev_len);
+    const hdr = push.encodePackHeader(alloc, @intCast(type_num), raw_size) catch return -1;
+    pack_hasher.update(hdr);
+    pack_hasher.update(payload);
+    emitAll(hdr);
+    emitAll(payload);
+    pack_count += 1;
+    return 0;
+}
+
+export fn wasm_pack_end() i32 {
+    if (!pack_active) return -1;
+    if (pack_count != pack_expect) return -10;
+    const digest = pack_hasher.final();
+    pack_active = false;
+    emitAll(&digest);
+    return 0;
+}
+
+export fn wasm_find_ref(adv_ptr: usize, adv_len: usize, ref_ptr: usize, ref_len: usize, out40: [*]u8) i32 {
+    const adv = sliceFromPtr(adv_ptr, adv_len);
+    const ref = sliceFromPtr(ref_ptr, ref_len);
+    const hit = push.findRef(adv, ref) orelse return 1;
+    // 空仓占位行按 ref 名匹配不到真实 ref;零 oid 视为 miss,由调用方按 new-branch 处理
+    if (std.mem.eql(u8, &hit, &push.ZERO_OID_HEX)) return 1;
+    @memcpy(out40[0..40], &hit);
+    return 0;
+}
+
+// wasm_list_refs(advert) -> TLV: u16 n, per: 40B hex, u16 name_len, name
+export fn wasm_list_refs(adv_ptr: usize, adv_len: usize, out_ptr: *usize, out_len: *usize) i32 {
+    const alloc = gpa();
+    const adv = sliceFromPtr(adv_ptr, adv_len);
+    const refs = push.listRefs(alloc, adv) catch return -1;
+    defer {
+        for (refs) |r| alloc.free(r.name);
+        alloc.free(refs);
+    }
+    var w = TLVWriter{ .alloc = alloc };
+    w.putU16(@intCast(refs.len)) catch return -1;
+    for (refs) |r| {
+        w.putBytes(&r.oid) catch return -1;
+        w.putU16(@intCast(r.name.len)) catch return -1;
+        w.putBytes(r.name) catch return -1;
+    }
+    const out = w.buf.toOwnedSlice(alloc) catch return -1;
+    const p = wasm_alloc(out.len);
+    if (p == 0) return -1;
+    @memcpy(sliceFromPtrMut(p, out.len), out);
+    out_ptr.* = p;
+    out_len.* = out.len;
+    return 0;
+}
+
+export fn wasm_build_ref_update(old40_ptr: usize, old40_len: usize, new40_ptr: usize, new40_len: usize, ref_ptr: usize, ref_len: usize, caps_ptr: usize, caps_len: usize) i32 {
+    const alloc = gpa();
+    const old_s = sliceFromPtr(old40_ptr, old40_len);
+    const new_s = sliceFromPtr(new40_ptr, new40_len);
+    const ref = sliceFromPtr(ref_ptr, ref_len);
+    const caps = sliceFromPtr(caps_ptr, caps_len);
+    if (old_s.len != 40 or new_s.len != 40) return -2;
+    var old: [40]u8 = undefined;
+    var new: [40]u8 = undefined;
+    @memcpy(&old, old_s[0..40]);
+    @memcpy(&new, new_s[0..40]);
+    const ups = [_]push.RefUpdate{.{ .old = old, .new = new, .ref = ref }};
+    const blk = push.buildRefUpdate(alloc, &ups, caps) catch return -1;
+    emitAll(blk);
+    return 0;
+}
+
+export fn wasm_parse_report_status(st_ptr: usize, st_len: usize, out_ptr: *usize, out_len: *usize) i32 {
+    const alloc = gpa();
+    const buf = sliceFromPtr(st_ptr, st_len);
+    var st = push.parseReportStatus(alloc, buf) catch return -1;
+    defer st.deinit();
+    var w = TLVWriter{ .alloc = alloc };
+    w.putU8(if (st.unpack_ok) 1 else 0) catch return -1;
+    w.putU16(@intCast(st.unpack_msg.len)) catch return -1;
+    w.putBytes(st.unpack_msg) catch return -1;
+    w.putU16(@intCast(st.refs.len)) catch return -1;
+    for (st.refs) |r| {
+        w.putU8(if (r.ok) 1 else 0) catch return -1;
+        w.putU16(@intCast(r.ref.len)) catch return -1;
+        w.putBytes(r.ref) catch return -1;
+        if (!r.ok) {
+            w.putU16(@intCast(r.msg.len)) catch return -1;
+            w.putBytes(r.msg) catch return -1;
+        }
+    }
+    const out = w.buf.toOwnedSlice(alloc) catch return -1;
+    const p = wasm_alloc(out.len);
+    if (p == 0) return -1;
+    @memcpy(sliceFromPtrMut(p, out.len), out);
+    out_ptr.* = p;
+    out_len.* = out.len;
+    if (!st.unpack_ok) return -2;
+    for (st.refs) |r| if (!r.ok) return 1;
+    return 0;
 }
 
 // ─── Low-level protocol exports (smart HTTP host) ───────────────────────────
@@ -120,13 +266,13 @@ export fn wasm_should_omit(kind_ptr: usize, kind_len: usize, size: usize, filter
 export fn wasm_pktline_encode(payload_ptr: usize, payload_len: usize, out_ptr: *usize, out_len: *usize) i32 {
     const alloc = gpa();
     const payload = sliceFromPtr(payload_ptr, payload_len);
-    const enc = pktline.encodeLine(alloc, payload) catch return -1;
-    const p = wasm_alloc(enc.len);
+    const el = pktline.encodeLine(alloc, payload) catch return -1;
+    const p = wasm_alloc(el.len);
     if (p == 0) return -1;
-    @memcpy(sliceFromPtrMut(p, enc.len), enc);
-    alloc.free(enc);
+    @memcpy(sliceFromPtrMut(p, el.len), el);
+    alloc.free(el);
     out_ptr.* = p;
-    out_len.* = enc.len;
+    out_len.* = el.len;
     return 0;
 }
 

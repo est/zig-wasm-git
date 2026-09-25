@@ -3,6 +3,23 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **receive-pack 客户端** (`repo.push(url, ref)`):协议在 wasm、IO/压缩在 JS。
+  wasm 新增 `wasm_find_ref`/`wasm_list_refs`/`wasm_build_ref_update`/`wasm_pack_begin|add|end`/
+  `wasm_parse_report_status` 导出;对象枚举 + `CompressionStream('deflate')` 压缩 + `fetch`
+  收发在 `src/host/push.mjs`/`codec.mjs`。无 delta(包仍被 git 接受,gc 后服务端自行增量化)。
+  wasm 体积 51,873 → 64,494B(预算锁 64KiB,见 `tests/test_wasm.mjs`)。
+- `tests/test_pack.mjs` / `tests/test_push.mjs`:pack 经 `git index-pack`/`verify-pack` 真验证;
+  wasm pack 与 JS 参考实现逐字节 differential 比对;JS 客户端直推本地 host、服务端 `fsck` 验收。
+
+### Fixed
+
+- `pack.zig buildPack` payload 纠正为 `zlib(body)`(此前 `zlib(header+body)` 必被 git 拒,
+  已用真 git 对照验证);测试改为 trailer sha + inflate 往返断言,不止 `startsWith("PACK")`。
+
 ## [1.1.0] — 2026-08-22
 
 ### Added

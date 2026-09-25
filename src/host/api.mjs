@@ -8,6 +8,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import zlib from "node:zlib";
 import { join, dirname } from "node:path";
+import { collectObjects, decodeRefsTlv, decodeStatusTlv, TYPE_NUM, ZERO_OID, joinUrl, deflateZlib } from "./push.mjs";
 
 const ERR_NAMES = { 1: "NotFound", 2: "PathIsDir", 3: "NotATree", 4: "NotABlob", 5: "BadCommit" };
 
@@ -43,11 +44,19 @@ export function load(wasmPath, opts = {}) {
   // 无 FS：直接传 store（Workers 侧零 FS）；有 FS：opts.dir 兜底
   const store = opts.store ?? (opts.dir != null ? fileStore(opts.dir) : memoryStore());
   let inst;
+  const emitChunks = [];
+  const takeEmit = () => {
+    const out = Buffer.concat(emitChunks.splice(0));
+    return out;
+  };
 
   const mod = new WebAssembly.Module(bytes);
   inst = new WebAssembly.Instance(mod, {
     env: {
-      host_emit_bytes() {},
+      host_emit_bytes(ptr, len) {
+        const mem = new Uint8Array(inst.exports.memory.buffer);
+        emitChunks.push(Buffer.from(mem.slice(ptr, ptr + len)));
+      },
       host_log() {},
       host_get_object(oidHexPtr, outPtr, outCap, outLenPtr) {
         try {
@@ -218,6 +227,78 @@ export function load(wasmPath, opts = {}) {
 
     resolveRef,
     _wasm: wasm,
+
+    /** 低层 pack 组装:objects=[{hex, type, body}] -> pack Buffer(线协议在 wasm,压缩在 JS) */
+    async pushPack(objects) {
+      wasm.wasm_reset();
+      takeEmit();
+      const devs = [];
+      for (const o of objects) devs.push(await deflateZlib(o.body));
+      if (wasm.wasm_pack_begin(objects.length) !== 0) throw new Error("wasm_pack_begin failed");
+      for (let i = 0; i < objects.length; i++) {
+        const o = objects[i];
+        const tn = TYPE_NUM[o.type];
+        if (!tn) throw new Error(`unknown type: ${o.type}`);
+        const d = allocBytes(devs[i]);
+        const rc = wasm.wasm_pack_add(tn, o.body.length, d.ptr, d.len);
+        if (rc !== 0) throw new Error(`wasm_pack_add failed rc=${rc}`);
+      }
+      if (wasm.wasm_pack_end() !== 0) throw new Error("wasm_pack_end failed");
+      return takeEmit();
+    },
+
+    /** push(ref):discovery -> collect -> pack -> receive-pack,真 git 语义 */
+    async push(url, ref = "refs/heads/main", { fetchImpl = fetch } = {}) {
+      const fullRef = ref.startsWith("refs/") ? ref : `refs/heads/${ref}`;
+      const newOid = resolveRef(ref).toLowerCase();
+      const discRes = await fetchImpl(joinUrl(url, "/info/refs?service=git-receive-pack"));
+      if (!discRes.ok) throw new Error(`discovery http ${discRes.status}`);
+      const advert = Buffer.from(await discRes.arrayBuffer());
+      wasm.wasm_reset();
+      takeEmit();
+      const adv = allocBytes(advert);
+      const lrPtr = wasm.wasm_alloc(4);
+      const lrLen = wasm.wasm_alloc(4);
+      if (wasm.wasm_list_refs(adv.ptr, adv.len, lrPtr, lrLen) !== 0) throw new Error("wasm_list_refs failed");
+      const dv = new DataView(wasm.memory.buffer);
+      const refs = decodeRefsTlv(Buffer.from(new Uint8Array(wasm.memory.buffer).slice(dv.getUint32(lrPtr, true), dv.getUint32(lrPtr, true) + dv.getUint32(lrLen, true))));
+      const remote = refs.find((r) => r.name === fullRef);
+      const old = remote ? remote.oid.toLowerCase() : ZERO_OID;
+      if (old === newOid) return { updated: false, ref: fullRef, old, new: newOid, reason: "already-up-to-date" };
+      const haves = new Set(old === ZERO_OID ? refs.map((r) => r.oid) : [old]);
+      const objects = await collectObjects(store, newOid, haves);
+      const packBuf = await this.pushPack(objects);
+      wasm.wasm_reset();
+      takeEmit();
+      const oHex = allocStr(old);
+      const nHex = allocStr(newOid);
+      const rf = allocStr(fullRef);
+      const caps = allocStr("report-status");
+      if (wasm.wasm_build_ref_update(oHex.ptr, oHex.len, nHex.ptr, nHex.len, rf.ptr, rf.len, caps.ptr, caps.len) !== 0) {
+        throw new Error("wasm_build_ref_update failed");
+      }
+      const reqBody = Buffer.concat([takeEmit(), packBuf]);
+      const postRes = await fetchImpl(joinUrl(url, "/git-receive-pack"), {
+        method: "POST",
+        headers: { "Content-Type": "application/x-git-receive-pack-request" },
+        body: reqBody,
+      });
+      if (!postRes.ok) throw new Error(`receive-pack http ${postRes.status}`);
+      const stBuf = Buffer.from(await postRes.arrayBuffer());
+      wasm.wasm_reset();
+      const sp = allocBytes(stBuf);
+      const soPtr = wasm.wasm_alloc(4);
+      const soLen = wasm.wasm_alloc(4);
+      const rc = wasm.wasm_parse_report_status(sp.ptr, sp.len, soPtr, soLen);
+      const sdv = new DataView(wasm.memory.buffer);
+      const status = decodeStatusTlv(Buffer.from(new Uint8Array(wasm.memory.buffer).slice(sdv.getUint32(soPtr, true), sdv.getUint32(soPtr, true) + sdv.getUint32(soLen, true))));
+      if (rc === -2 || !status.unpackOk) throw new Error(`unpack failed: ${status.unpackMsg}`);
+      if (rc !== 0) {
+        const row = status.refs.find((r) => r.ref === fullRef);
+        throw new Error(`push rejected: ${row ? `${row.ref}: ${row.msg}` : `rc=${rc}`}`);
+      }
+      return { updated: true, ref: fullRef, old, new: newOid, objects: objects.length, packBytes: packBuf.length };
+    },
   };
 }
 

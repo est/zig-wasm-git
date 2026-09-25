@@ -12,8 +12,12 @@ echo "== zig unit tests =="
 "$ZIG" test src/zig/root.zig "${LIBARGS[@]}" --cache-dir .zig-cache --global-cache-dir tmp/cache
 echo "== wasm filter tests =="
 node tests/test_wasm.mjs
+echo "== pack format tests (git-verified) =="
+node tests/test_pack.mjs
 echo "== object API e2e =="
 node tests/test_api.mjs
+echo "== push client e2e (wasm protocol + git-verified) =="
+node tests/test_push.mjs
 echo "== memory store / author options =="
 node tests/test_memory_store.mjs
 echo "== ALL TESTS PASSED =="

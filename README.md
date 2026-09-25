@@ -20,9 +20,9 @@ Each release ships a fixed-name `zig_wasm_git.wasm` + `.sha256`, built by CI fro
 
 ## Features
 
-- **47KB** `wasm32-freestanding ReleaseSmall`, no libc, imports only `env.host_*`
-- Object-level API: read blobs by path / write commits from `{path: content}` maps
-- SHA-1 / zlib / pack v2 / pkt-line / smart HTTP (`v1` + `v2 ls-refs/fetch=filter`)
+- **~63KB** `wasm32-freestanding ReleaseSmall`, no libc, imports only `env.host_*`
+- Object-level API: read blobs by path / write commits from `{path: content}` maps / push to smart-HTTP remotes
+- SHA-1 / zlib / pack v2 / pkt-line / smart HTTP (`v1` + `v2 ls-refs/fetch=filter` + receive-pack client)
 - Partial clone filters: `blob:none`, `blob:limit`, `tree:0`, `object:type`, `combine:+`
 
 ## Object-level API (recommended)
@@ -45,6 +45,9 @@ disk.commit("main", "v2", { "src/new.zig": "..." }, "refs/heads/main",
 
 // any backend via the same 6-method interface
 load("zig_wasm_git.wasm", { store: { get(hex){}, put(hex,loose){}, getRef(n){}, putRef(n,s){}, heads(){} } });
+
+// push to a smart-HTTP remote (protocol in wasm, fetch/compression in JS)
+await mem.push("http://localhost:3000/demo.git", "main");  // -> {updated, ref, old, new, objects, packBytes}
 ```
 
 Internals: `wasm_get` walks commit→tree→blob; `wasm_commit` stores blobs, rebuilds affected trees (git-correct sort), writes the commit. Storage goes through `host_get_object`/`host_put_object` callbacks (loose files in this glue; swap in SQLite/S3/etc. for your backend). Verified against real `git`: `log`/`ls-tree`/`cat-file`/`fsck --strict` all clean.

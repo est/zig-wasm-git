@@ -7,6 +7,7 @@ const WASM_PATH = join(__dirname, "..", "zig-out", "bin", "zig_wasm_git.wasm");
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 
 const bytes = readFileSync(WASM_PATH);
+assert(bytes.length <= 64 * 1024, `wasm size budget blown: ${bytes.length} > 65536`);
 let inst;
 const imports = {
   env: {

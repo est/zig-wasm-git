@@ -45,25 +45,14 @@ pub fn buildPack(allocator: std.mem.Allocator, objs: []const PackObject) ![]u8 {
     for (objs) |o| {
         const ptype = kindToPackType(o.kind);
         const sz = o.body.len;
-        // object header: varint type + size
+        // object header: varint type + size (size = len(body),不含 loose 头)
         var hdr: std.ArrayList(u8) = .empty;
         defer hdr.deinit(allocator);
         try encodePackHeader(allocator, &hdr, ptype, sz);
         try out.appendSlice(allocator, hdr.items);
-        // zlib payload: compress("type len\0body") style? In pack, payload is zlib of raw body (for non-delta)
-        // Git pack stores zlib of object content without loose header? Actually object header already encodes type/size,
-        // payload is zlib of body only for blob/tree/commit/tag. We'll store body directly zlib-compressed.
-        // For loose interop, Host will need to reconcile: body is raw object body.
-        // To match git pack expectations, we store zlib of body (which is what git's pack-objects does for non-delta base objects? No, pack stores deflated object including header).
-        // Simpler: store deflated raw = header+body; parser will then produce same header+body.
-        // We'll do: payload = zlib(header+body)
-        var header_buf: [64]u8 = undefined;
-        const header = try std.fmt.bufPrint(&header_buf, "{s} {d}\x00", .{ @tagName(o.kind), o.body.len });
-        var raw: std.ArrayList(u8) = .empty;
-        defer raw.deinit(allocator);
-        try raw.appendSlice(allocator, header);
-        try raw.appendSlice(allocator, o.body);
-        const z = try @import("zlib.zig").compress(allocator, raw.items);
+        // payload = zlib(body only):与 loose 的 "type len\0body" 不同,pack 里不带头。
+        // 已用真 git 对照验证(index-pack + verify-pack):zlib(header+body) 会被拒。
+        const z = try @import("zlib.zig").compress(allocator, o.body);
         defer allocator.free(z);
         try out.appendSlice(allocator, z);
     }
@@ -123,6 +112,7 @@ test "pack header roundtrip" {
 
 test "pack build basic" {
     const alloc = std.testing.allocator;
+    const zlib = @import("zlib.zig");
     const body = try alloc.dupe(u8, "hello\n");
     defer alloc.free(body);
     const objs = [_]PackObject{.{ .kind = .blob, .body = body, .oid = [_]u8{0} ** 20 }};
@@ -131,4 +121,14 @@ test "pack build basic" {
     try std.testing.expect(std.mem.startsWith(u8, pack_bytes, "PACK"));
     // last 20 bytes are SHA1
     try std.testing.expect(pack_bytes.len > 12 + 20);
+    // trailer = sha1(前面全部)
+    try std.testing.expectEqualSlices(u8, &sha1.hash(pack_bytes[0 .. pack_bytes.len - 20]), pack_bytes[pack_bytes.len - 20 ..]);
+    // 对象头:size=body.len;payload inflate 后精确等于 body(不带 loose 头)
+    const h = try parsePackHeader(pack_bytes[12..]);
+    try std.testing.expectEqual(PackObjectType.blob, h.ptype);
+    try std.testing.expectEqual(body.len, h.size);
+    const payload = pack_bytes[12 + h.consumed .. pack_bytes.len - 20];
+    const inflated = try zlib.decompress(alloc, payload);
+    defer alloc.free(inflated);
+    try std.testing.expectEqualSlices(u8, body, inflated);
 }
