@@ -16,10 +16,10 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import zlib from "node:zlib";
 import { join, dirname } from "node:path";
-import { loadFromBytes, memoryStore as portableMemoryStore, createBlobService, withBasicAuth } from "./portable.mjs";
+import { loadFromBytes, memoryStore as portableMemoryStore, createBlobService, withBasicAuth, RemoteGit } from "./portable.mjs";
 import { parseCommit } from "./utils.mjs";
 
-export { createBlobService, loadFromBytes, withBasicAuth };
+export { createBlobService, loadFromBytes, withBasicAuth, RemoteGit };
 export const memoryStore = portableMemoryStore;
 
 export function load(wasmPath, opts = {}) {

@@ -13,7 +13,7 @@
 // Wire: git protocol weight lifting in wasm (utils.mjs); IO/compression/hash in JS;
 // remote sync (fetch/push) in sync.mjs; blob facade below in this file.
 
-import { memoryStore, toModule, deflateZlib, joinUrl, withBasicAuth, looseBody, enc, dec, hexOfBytes, concatU8, parseCommit } from "./utils.mjs";
+import { memoryStore, toModule, deflateZlib, joinUrl, withBasicAuth, looseBody, enc, dec, hexOfBytes, concatU8, parseCommit, parseTreeEntries, commitParentsAndTree } from "./utils.mjs";
 import {
   fetchIntoStore, lsRemote,
   collectObjects, TYPE_NUM, ZERO_OID, decodeRefsTlv, decodeStatusTlv,
@@ -22,6 +22,215 @@ import {
 const ERR_NAMES = { 1: "NotFound", 2: "PathIsDir", 3: "NotATree", 4: "NotABlob", 5: "BadCommit" };
 
 export { memoryStore, withBasicAuth };
+
+// ── RemoteGit: url-bound versioned blob store ──
+//
+// One branch == one keyspace. URL is bound once; reads auto-materialize
+// missing blobs, writes carry author defaults, push is fast-forward only:
+//
+//   const git = new RemoteGit(url, { wasm: wasmBytes, ref: "main" });
+//   await git.fetch();                       // optional warmup (full pull)
+//   await git.readText("README.md");          // missing blobs fetched on demand
+//   git.write({ "a.txt": "hi" }, "msg", { author: "A <a@x>" }); // -> sha
+//   await git.push();
+//
+// Read path: cache hit returns from memory; a structural hit (tree knows
+// the blob, bytes absent — e.g. after a blob:none fetch) triggers one
+// `want=<blob-oid>` roundtrip (~blob size, byte-equal to a full fetch).
+// Unknown paths return null with zero RTT. Network methods are serialized
+// internally (one shared wasm memory — never call them concurrently).
+// `user:pass@host` URLs are sent as Basic auth headers by default
+// (workerd drops URL userinfo; stripping also keeps tokens out of logs).
+//
+// Constructor takes { wasm } (bytes | precompiled Module) because workerd
+// forbids runtime compilation and constructors cannot await: browser/node
+// callers pass `new Uint8Array(await (await fetch(wasmUrl)).arrayBuffer())`,
+// workerd callers pass their CompiledWasm Module.
+//
+// Server knobs (GitHub defaults are fine; self-hosted git needs these):
+//   uploadpack.allowFilter=true              // blob:none structure bootstrap
+//   uploadpack.allowTipSHA1InWant / allowReachableSHA1InWant  // blob fetch
+
+/// Walk one commit's trees to the blob oid for path (null = no such blob).
+async function findBlobOid(store, commitSha, path) {
+  const segs = String(path).split("/").filter(Boolean);
+  if (!segs.length) return null;
+  const { body: cbody } = await looseBody(store.get(commitSha));
+  let treeHex = commitParentsAndTree(cbody).tree;
+  for (let i = 0; i < segs.length; i++) {
+    if (!treeHex) return null;
+    const loose = store.get(treeHex);
+    if (!loose) return null;
+    const { body } = await looseBody(loose);
+    const e = parseTreeEntries(body).find((x) => x.name === segs[i]);
+    if (!e) return null;
+    const last = i === segs.length - 1;
+    const isTree = e.mode === "40000" || e.mode === "040000";
+    if (last) return isTree || e.mode === "160000" ? null : e.oid;
+    if (!isTree) return null;
+    treeHex = e.oid;
+  }
+  return null;
+}
+
+export class RemoteGit {
+  constructor(url, opts = {}) {
+    if (!opts.wasm) throw new Error("RemoteGit needs { wasm }: wasm bytes or a precompiled WebAssembly.Module");
+    this.url = url;
+    this.ref = opts.ref?.startsWith("refs/") ? opts.ref : `refs/heads/${opts.ref ?? "main"}`;
+    this.filter = opts.filter ?? "";
+    this._wasm = opts.wasm;
+    this._store = opts.store ?? memoryStore();
+    this._fetchImplOpt = opts.fetchImpl ?? null;
+    this._subtleOpt = opts.subtle ?? null;
+    this._author = opts.author;
+    this._committer = opts.committer;
+    this._timezone = opts.timezone;
+    this._repo = null;
+    this._tail = Promise.resolve();
+  }
+
+  /// Lazy: `new` never touches wasm (cheap; safe before runtimes are ready).
+  _repo_() {
+    if (!this._repo) this._repo = loadFromBytes(this._wasm, { store: this._store });
+    return this._repo;
+  }
+
+  _net() {
+    return {
+      fetchImpl: this._fetchImplOpt ?? withBasicAuth(globalThis.fetch.bind(globalThis)),
+      subtle: this._subtleOpt ?? globalThis.crypto.subtle,
+    };
+  }
+
+  /// Serialize async ops (single shared wasm memory). Public async methods
+  /// never call each other — they all funnel through unlocked _inners here.
+  _seq(fn) {
+    const t = this._tail.then(fn, fn);
+    this._tail = t.catch(() => {});
+    return t;
+  }
+
+  version() {
+    try {
+      return this._repo_().resolveRef(this.ref);
+    } catch {
+      return null;
+    }
+  }
+
+  /// Local tip, else structure-only bootstrap (blob:none; falls back to a
+  /// full pull on servers without filter support). Null when unreachable.
+  async _tipInner() {
+    let tip = this.version();
+    if (!tip) {
+      try {
+        await this._repo_().fetch(this.url, this.ref, { filter: "blob:none", ...this._net() });
+      } catch {
+        try {
+          await this._repo_().fetch(this.url, this.ref, { ...this._net() });
+        } catch {
+          return null;
+        }
+      }
+      tip = this.version();
+    }
+    return tip;
+  }
+
+  /// Unlocked single-blob read: memory hit, else on-demand blob fetch,
+  /// else null (unknown path costs zero RTT; gc'd blobs also read null).
+  async _blobBytesInner(path) {
+    const tip = await this._tipInner();
+    if (!tip) return null;
+    const row = this._repo_().get(this.ref, [path]).find((r) => r.path === path);
+    if (row && !row.error) return row.content;
+    const oid = await findBlobOid(this._store, tip, path);
+    if (!oid) return null;
+    try {
+      // setRef:false — the branch must keep pointing at the commit, not the blob.
+      await this._repo_().fetch(this.url, oid, { setRef: false, ...this._net() });
+    } catch {
+      return null;
+    }
+    const back = this._repo_().get(this.ref, [path]).find((r) => r.path === path);
+    return back && !back.error ? back.content : null;
+  }
+
+  async _pullInner(opts = {}) {
+    return this._repo_().fetch(this.url, this.ref, { filter: this.filter, ...this._net(), ...opts });
+  }
+
+  read(path) {
+    return this._seq(() => this._blobBytesInner(path));
+  }
+
+  async readText(path) {
+    const b = await this._seq(() => this._blobBytesInner(path));
+    return b == null ? null : dec.decode(b);
+  }
+
+  readMany(paths) {
+    return this._seq(async () => {
+      const out = new Map();
+      for (const p of paths ?? []) {
+        const b = await this._blobBytesInner(p);
+        if (b) out.set(p, b);
+      }
+      return out;
+    });
+  }
+
+  /// Author/time plumbing: per-call options win, constructor defaults fill
+  /// the gaps. { author: "Name <mail>", committer, time (unix sec), timezone }.
+  write(files, message = "update", options = {}) {
+    const entries = {};
+    for (const [path, content] of Object.entries(files ?? {})) {
+      entries[path] = content instanceof Uint8Array ? content : toU8(content);
+    }
+    const parent = this.version() ?? "";
+    return this._repo_().commit(parent, message, entries, this.ref, {
+      ...(this._author != null ? { author: this._author } : null),
+      ...(this._committer != null ? { committer: this._committer } : null),
+      ...(this._timezone != null ? { timezone: this._timezone } : null),
+      ...options,
+    });
+  }
+
+  writeText(path, text, message = "update", options = {}) {
+    return this.write({ [path]: enc.encode(text) }, message, options);
+  }
+
+  /// Full pull (explicit refresh). No merge: unpushed writes must be pushed
+  /// first, else the fetch moves the tip underneath them (still reachable by sha).
+  pull(opts = {}) {
+    return this._seq(() => this._pullInner(opts));
+  }
+
+  /// Optional warmup (same as pull). Reads work without it — the first read
+  /// bootstraps structure itself — but warming avoids per-key roundtrips.
+  fetch(opts = {}) {
+    return this._seq(() => this._pullInner(opts));
+  }
+
+  /// Fast-forward publish of the local tip; rejects on non-fast-forward.
+  push(opts = {}) {
+    return this._seq(() => this._repo_().push(this.url, this.ref, { ...this._net(), ...opts }));
+  }
+
+  /// One-shot: pull latest, then return the requested keys.
+  async sync(paths, opts = {}) {
+    return this._seq(async () => {
+      await this._pullInner(opts.pull ?? {});
+      const out = new Map();
+      for (const p of paths ?? []) {
+        const b = await this._blobBytesInner(p);
+        if (b) out.set(p, b);
+      }
+      return out;
+    });
+  }
+}
 
 /// wasmBytesOrModule: Uint8Array bytes, or a precompiled WebAssembly.Module
 /// (workerd `CompiledWasm`; see wire.toModule).

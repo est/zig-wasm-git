@@ -39,27 +39,23 @@ appends a version (a commit) on the current tip; `publish` moves the remote tip
 and rejects on non-fast-forward (last-writer-wins, no merge).
 
 ```js
-import { loadFromBytes, memoryStore, createBlobService } from "./src/host/portable.mjs";
+import { RemoteGit } from "./src/host/portable.mjs";
 
-const wasmBytes = new Uint8Array(await (await fetch("zig_wasm_git.wasm")).arrayBuffer());
-const blobs = createBlobService(
-  loadFromBytes(wasmBytes, { store: memoryStore() }),
-  { ref: "main" }, // one branch == one keyspace
-);
+const wasm = new Uint8Array(await (await fetch("zig_wasm_git.wasm")).arrayBuffer());
+const git = new RemoteGit("https://user:pass@git.example.com/team/docs.git", {
+  wasm,               // bytes (browser/Node) or precompiled Module (CF workerd)
+  ref: "main",        // one branch == one keyspace
+  author: "bot <bot@example.com>", // optional defaults; per-write options win
+});
+await git.fetch(); // optional warmup (full pull); reads work without it
 
-await blobs.pull("https://git.example.com/team/docs.git");
-blobs.readText("README.md");                    // string | null
-blobs.readMany(["a.txt", "d/b.bin"]);          // Map(path -> Uint8Array, missing skipped)
-const version = blobs.write({ "a.txt": "hi" }, "update greeting"); // -> commit sha
-await blobs.publish("https://git.example.com/team/docs.git");
+await git.readText("some/path/README.md"); // string | null (missing blobs auto-fetched)
+await git.readMany(["a.txt", "d/b.bin"]);  // Map(path -> Uint8Array, missing skipped)
+const version = git.write({ "a.txt": "hi" }, "update greeting"); // -> commit sha
+await git.push(); // fast-forward only; rejects on non-fast-forward
 
-// one-shot: pull latest, then return keys (partial keyspace supported)
-await blobs.sync("https://git.example.com/team/docs.git", ["README.md"]);
-
-// versions without bytes: pull with filter, read still resolves, bytes stay null
-const partial = createBlobService(repo, { ref: "main", filter: "blob:none" });
-await partial.pull(url);
-partial.version(); // sha present; partial.read(path) -> null until full pull
+// one-shot: pull latest, then return keys (pass { filter: "blob:none" } via pull/fetch for versions-without-bytes)
+await git.sync(["README.md"]);
 ```
 
 ## Browser / Workers
@@ -89,7 +85,8 @@ underlying `want` / `have` negotiation, `delta` handling, and filters actually d
 | Incremental pull bandwidth | `have` negotiation is **not** sent on fetch (v2 `fetch` is `want`-only, stateless); savings come from server-side pack `delta` + local cached-tip short-circuit (`fetch` returns `{cached:true}` when `want` is already stored) | Partial: no `have` lines on fetch |
 | Small transfer of similar blobs | `ofs-delta` + `ref-delta` decode (`wasm_delta_apply`), incl. thin-pack bases already in local store | Decode supported |
 | Small upload of similar blobs | `delta` encode on push | **Not supported** — push sends full objects (server re-deltifies on `gc`) |
-| Skip bytes, keep versions | `filter blob:none` / `blob:limit=<n>[kmg]` / `tree:0` / `object:type=` / `combine:+` | Supported both sides; omitted blobs read as `NotFound`/`null` (no promisor on-demand fetch yet) |
+| Skip bytes, keep versions | `filter blob:none` / `blob:limit=<n>[kmg]` / `tree:0` / `object:type=` / `combine:+` | Supported both sides; `RemoteGit.read` auto-fetches missing blobs on demand (`want=<blob-oid>`, byte-equal to full fetch) |
+| Single-file download | structure fetch (`blob:none`) + `want=<blob-oid>` promisor roundtrip | Supported via `RemoteGit.read/readMany` (unknown paths cost zero RTT; needs `uploadpack.allowTipSHA1InWant` on self-hosted servers, GitHub OK) |
 | Shallow history | `shallow` / `deepen` / `deepen-since` / `deepen-not` | **Not supported** (client never sends `deepen`) |
 | Delete a key | tree-entry removal in `wasm_commit` | **Not supported** — `write` only upserts; full history retained |
 | Concurrent writers | merge / conflict resolution | **None** — last-writer-wins; `publish` rejects non-fast-forward, caller re-pulls and rewrites |
