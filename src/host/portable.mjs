@@ -71,10 +71,11 @@ function nodeFs() {
   pass the Module explicitly. Anything else fails in instantiate; figure it out.
 */
 async function resolveWasmInput(wasmOpt) {
-  if (wasmOpt instanceof WebAssembly.Module) return wasmOpt;
-  if (wasmOpt == null) wasmOpt = new URL("zig_wasm_git.wasm", import.meta.url).href;
-  if (typeof wasmOpt !== "string") return wasmOpt; // typed array / ArrayBuffer; instantiate validates
-  const href = wasmOpt;
+  if (wasmOpt && (wasmOpt instanceof WebAssembly.Module || typeof wasmOpt !== "string")) {
+    return wasmOpt; // typed array / ArrayBuffer; instantiate validates
+  }
+  // falsy, or a string
+  const href = wasmOpt?.trim() || new URL("zig_wasm_git.wasm", import.meta.url).href;
   // Local file first: non-http(s) string on Node (plain path or file: URL).
   // Browsers skip this (no getBuiltinModule) and fetch instead.
   if (!/^https?:\/\//.test(href)) {
