@@ -167,6 +167,8 @@ export function unpackPack(wasm, pack) {
 
 /// Resolve pending ref-deltas given hex-> {type, body} map (hashed pass-1
 /// objects + optional store assist). Mutates `known`, returns newly resolved.
+/// 注:会掏空并重排入参 `pending`(当队列用),残留未解的留在其中。
+/// 内部函数,外部调用者勿复用传入数组。
 export function resolveRefDeltas(wasm, pending, known) {
   const out = [];
   let guard = pending.length * 2 + 8;

@@ -309,6 +309,8 @@ export function decodePackHeaderJS(buf, pos = 0) {
 
 /// Inflate one zlib stream starting at pos via wasm (single pass, exact
 /// consumed — no trial-inflate). Returns {body, consumed}.
+/// TODO(大包):每次把 pack 尾部整体拷进 wasm 内存,O(n^2) memcpy。
+/// 本库定位小包 blob-store,暂不做窗口化;大仓场景再优化。
 export function inflateOne(wasm, buf, pos = 0) {
   wasm.wasm_reset();
   const total = buf.length - pos;

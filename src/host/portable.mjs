@@ -13,7 +13,7 @@
 // Wire: git protocol weight lifting in wasm (utils.mjs); IO/compression/hash in JS;
 // remote sync (fetch/push) in sync.mjs; blob facade below in this file.
 
-import { memoryStore, bootWasm, toModule, deflateZlib, joinUrl, withBasicAuth, looseBody, enc, dec, hexOfBytes, concatU8, parseCommit } from "./utils.mjs";
+import { memoryStore, toModule, deflateZlib, joinUrl, withBasicAuth, looseBody, enc, dec, hexOfBytes, concatU8, parseCommit } from "./utils.mjs";
 import {
   fetchIntoStore, lsRemote,
   collectObjects, TYPE_NUM, ZERO_OID, decodeRefsTlv, decodeStatusTlv,
@@ -31,9 +31,53 @@ export { memoryStore, withBasicAuth };
 /// call site. Pass { fetchImpl, subtle } only to override (tests/auth).
 export function loadFromBytes(wasmBytesOrModule, opts = {}) {
   const store = opts.store ?? memoryStore();
-  const fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
-  const subtle = opts.subtle ?? globalThis.crypto.subtle;
-  const { wasm, takeEmit } = bootWasm(wasmBytesOrModule);
+  // 延迟绑定:只做 get/commit 的调用方不应因为缺 fetch/subtle 而在
+  // load 时就抛错;network 方法调用时再 resolve,默认值走 globalThis。
+  const fetchOpt = opts.fetchImpl ?? null;
+  const subtleOpt = opts.subtle ?? null;
+  const lazyFetch = () => fetchOpt ?? globalThis.fetch.bind(globalThis);
+  const lazySubtle = () => subtleOpt ?? globalThis.crypto.subtle;
+  // 单实例:Module 只编译一次,直连 store 回调(protocol 方法不碰 store,
+  // 回调闲置即可;省掉第二份线性内存与第二套 alloc  helper)。
+  const emitChunks = [];
+  const mod = toModule(wasmBytesOrModule);
+  let inst;
+  inst = new WebAssembly.Instance(mod, {
+    env: {
+      host_emit_bytes(ptr, len) {
+        emitChunks.push(new Uint8Array(inst.exports.memory.buffer.slice(ptr, ptr + len)));
+      },
+      host_log() {},
+      host_get_object(oidHexPtr, outPtr, outCap, outLenPtr) {
+        try {
+          const hex = dec.decode(new Uint8Array(inst.exports.memory.buffer.slice(oidHexPtr, oidHexPtr + 40)));
+          const obj = store.get(hex);
+          if (!obj) return -1;
+          const u8 = obj instanceof Uint8Array ? obj : new Uint8Array(obj);
+          if (u8.length > outCap) {
+            new DataView(inst.exports.memory.buffer).setUint32(outLenPtr >>> 0, u8.length, true);
+            return 1;
+          }
+          if (u8.length > 0) new Uint8Array(inst.exports.memory.buffer).set(u8, outPtr);
+          new DataView(inst.exports.memory.buffer).setUint32(outLenPtr >>> 0, u8.length, true);
+          return 0;
+        } catch {
+          return -2;
+        }
+      },
+      host_put_object(oidHexPtr, loosePtr, len) {
+        try {
+          const hex = dec.decode(new Uint8Array(inst.exports.memory.buffer.slice(oidHexPtr, oidHexPtr + 40)));
+          store.put(hex, new Uint8Array(inst.exports.memory.buffer.slice(loosePtr, loosePtr + len)));
+          return 0;
+        } catch {
+          return -2;
+        }
+      },
+    },
+  });
+  const wasm = inst.exports;
+  const takeEmit = () => concatU8(emitChunks.splice(0));
 
   function allocBytes(b) {
     const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
@@ -45,59 +89,11 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
   }
   const allocStr = (s) => allocBytes(enc.encode(s));
 
-  // Attach object-store callbacks by re-instantiating with host IO.
-  // bootWasm used stubs; get/commit need real store access, so we rebind:
-  // (re-instantiation is cheap; fetch-only callers never touch the store.)
-  let bound = null;
-  function storeWasm() {
-    if (bound) return bound;
-    const emitChunks = [];
-    const mod = toModule(wasmBytesOrModule);
-    const inst = new WebAssembly.Instance(mod, {
-      env: {
-        host_emit_bytes(ptr, len) {
-          emitChunks.push(new Uint8Array(inst.exports.memory.buffer.slice(ptr, ptr + len)));
-        },
-        host_log() {},
-        host_get_object(oidHexPtr, outPtr, outCap, outLenPtr) {
-          try {
-            const hex = dec.decode(new Uint8Array(inst.exports.memory.buffer.slice(oidHexPtr, oidHexPtr + 40)));
-            const obj = store.get(hex);
-            if (!obj) return -1;
-            const u8 = obj instanceof Uint8Array ? obj : new Uint8Array(obj);
-            if (u8.length > outCap) {
-              new DataView(inst.exports.memory.buffer).setUint32(outLenPtr >>> 0, u8.length, true);
-              return 1;
-            }
-            if (u8.length > 0) new Uint8Array(inst.exports.memory.buffer).set(u8, outPtr);
-            new DataView(inst.exports.memory.buffer).setUint32(outLenPtr >>> 0, u8.length, true);
-            return 0;
-          } catch {
-            return -2;
-          }
-        },
-        host_put_object(oidHexPtr, loosePtr, len) {
-          try {
-            const hex = dec.decode(new Uint8Array(inst.exports.memory.buffer.slice(oidHexPtr, oidHexPtr + 40)));
-            store.put(hex, new Uint8Array(inst.exports.memory.buffer.slice(loosePtr, loosePtr + len)));
-            return 0;
-          } catch {
-            return -2;
-          }
-        },
-      },
-    });
-    bound = {
-      wasm: inst.exports,
-      takeEmit() {
-        return concatU8(emitChunks.splice(0));
-      },
-    };
-    return bound;
-  }
-
   function resolveRef(ref) {
     if (/^[0-9a-f]{40}$/i.test(ref)) return ref.toLowerCase();
+    // 注:HEAD 取第一个 heads() 分支,不读符号 HEAD 文件。本库定位是
+    // 单分支 blob-store,调用方(及 blob 门面)永远传明确分支名;HEAD
+    // 只是兼容保留,不做真 git 语义。
     if (ref === "HEAD") {
       for (const b of store.heads()) {
         const v = store.getRef(`refs/heads/${b}`);
@@ -166,9 +162,9 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
     return out;
   }
 
-  // Wrap a store-bound wasm instance with alloc helpers for one call.
+  // Wrap the single store-bound instance with alloc helpers for one call.
   function withStore(fn) {
-    const { wasm: w } = storeWasm();
+    const w = wasm;
     w.wasm_reset();
     const mem = () => new Uint8Array(w.memory.buffer);
     const ab = (b) => {
@@ -235,8 +231,8 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
     /** Fetch/clone a remote ref into this store (smart HTTP v2). */
     fetch(url, ref = "main", opts = {}) {
       return fetchIntoStore(wasm, store, url, ref, {
-        fetchImpl: opts.fetchImpl ?? fetchImpl,
-        subtle: opts.subtle ?? subtle,
+        fetchImpl: opts.fetchImpl ?? lazyFetch(),
+        subtle: opts.subtle ?? lazySubtle(),
         filter: opts.filter ?? "",
         setRef: opts.setRef,
         onProgress: opts.onProgress,
@@ -260,7 +256,7 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
     },
 
     lsRemote(url, opts = {}) {
-      return lsRemote(wasm, url, { fetchImpl: opts.fetchImpl ?? fetchImpl });
+      return lsRemote(wasm, url, { fetchImpl: opts.fetchImpl ?? lazyFetch() });
     },
 
     resolveRef,
@@ -284,7 +280,7 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
     },
 
     async push(url, ref = "refs/heads/main", opts = {}) {
-      const fi = opts.fetchImpl ?? fetchImpl;
+      const fi = opts.fetchImpl ?? lazyFetch();
       const fullRef = ref.startsWith("refs/") ? ref : `refs/heads/${ref}`;
       const newOid = resolveRef(ref).toLowerCase();
       const discRes = await fi(joinUrl(url, "/info/refs?service=git-receive-pack"));
@@ -293,11 +289,12 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
       wasm.wasm_reset();
       takeEmit();
       const adv = allocBytes(advert);
-      const lrPtr = wasm.wasm_alloc(4);
-      const lrLen = wasm.wasm_alloc(4);
-      if (wasm.wasm_list_refs(adv.ptr, adv.len, lrPtr, lrLen) !== 0) throw new Error("wasm_list_refs failed");
+      const lrPtrAddr = wasm.wasm_alloc(4);
+      const lrLenAddr = wasm.wasm_alloc(4);
+      if (wasm.wasm_list_refs(adv.ptr, adv.len, lrPtrAddr, lrLenAddr) !== 0) throw new Error("wasm_list_refs failed");
       const dv = new DataView(wasm.memory.buffer);
-      const refs = decodeRefsTlv(new Uint8Array(wasm.memory.buffer.slice(dv.getUint32(lrPtr, true), dv.getUint32(lrPtr, true) + dv.getUint32(lrLen, true))));
+      const lrPtr = dv.getUint32(lrPtrAddr, true);
+      const refs = decodeRefsTlv(new Uint8Array(wasm.memory.buffer.slice(lrPtr, lrPtr + dv.getUint32(lrLenAddr, true))));
       const remote = refs.find((r) => r.name === fullRef);
       const old = remote ? remote.oid.toLowerCase() : ZERO_OID;
       if (old === newOid) return { updated: false, ref: fullRef, old, new: newOid, reason: "already-up-to-date" };
@@ -326,11 +323,12 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
       const stBuf = new Uint8Array(await postRes.arrayBuffer());
       wasm.wasm_reset();
       const sp = allocBytes(stBuf);
-      const soPtr = wasm.wasm_alloc(4);
-      const soLen = wasm.wasm_alloc(4);
-      const rc = wasm.wasm_parse_report_status(sp.ptr, sp.len, soPtr, soLen);
+      const soPtrAddr = wasm.wasm_alloc(4);
+      const soLenAddr = wasm.wasm_alloc(4);
+      const rc = wasm.wasm_parse_report_status(sp.ptr, sp.len, soPtrAddr, soLenAddr);
       const sdv = new DataView(wasm.memory.buffer);
-      const status = decodeStatusTlv(new Uint8Array(wasm.memory.buffer.slice(sdv.getUint32(soPtr, true), sdv.getUint32(soPtr, true) + sdv.getUint32(soLen, true))));
+      const soPtr = sdv.getUint32(soPtrAddr, true);
+      const status = decodeStatusTlv(new Uint8Array(wasm.memory.buffer.slice(soPtr, soPtr + sdv.getUint32(soLenAddr, true))));
       if (rc === -2 || !status.unpackOk) throw new Error(`unpack failed: ${status.unpackMsg}`);
       if (rc !== 0) {
         const row = status.refs.find((r) => r.ref === fullRef);

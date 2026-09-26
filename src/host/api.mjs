@@ -91,18 +91,28 @@ export function fileStore(dir) {
   return {
     get(hex) {
       const p = join(dir, "objects", hex.slice(0, 2), hex.slice(2));
-      if (!existsSync(p)) return null;
-      return readFileSync(p);
+      try {
+        return readFileSync(p);
+      } catch {
+        return null;
+      }
     },
     put(hex, loose) {
-      const d = join(dir, "objects", hex.slice(0, 2));
-      mkdirSync(d, { recursive: true });
-      writeFileSync(join(d, hex.slice(2)), loose);
+      const p = join(dir, "objects", hex.slice(0, 2), hex.slice(2));
+      try {
+        // loose 对象不可变:已存在直接跳过,省一次写
+        if (existsSync(p)) return;
+      } catch { /* fall through to write */ }
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, loose);
     },
     getRef(name) {
       const p = join(dir, name);
-      if (!existsSync(p)) return null;
-      return readFileSync(p, "utf8").trim();
+      try {
+        return readFileSync(p, "utf8").trim();
+      } catch {
+        return null;
+      }
     },
     putRef(name, sha) {
       const p = join(dir, name);
@@ -110,7 +120,22 @@ export function fileStore(dir) {
       writeFileSync(p, sha + "\n");
     },
     heads() {
-      return readdirSync(join(dir, "refs/heads"));
+      // 递归走 refs/heads (支持 feature/x 这类嵌套分支),只收文件
+      const out = [];
+      const walk = (rel) => {
+        let entries;
+        try {
+          entries = readdirSync(join(dir, "refs/heads", rel), { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const e of entries) {
+          if (e.isDirectory()) walk(rel ? `${rel}/${e.name}` : e.name);
+          else if (e.isFile()) out.push(rel ? `${rel}/${e.name}` : e.name);
+        }
+      };
+      walk("");
+      return out;
     },
   };
 }
