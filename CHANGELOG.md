@@ -24,6 +24,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
   compare-and-swap. `fetchIntoStore` accepts raw-oid arrays (batch blob
   fetch, never touches refs).
 
+### Changed
+
+- **Single wasm instance** (`portable.mjs` `loadFromBytes`): was two instances
+  (stub for protocol + store-bound re-instantiation, compiling the Module
+  twice on bytes input); now one instance bound to the store up front.
+  `fetchImpl`/`subtle` resolve lazily so get/commit-only callers never require
+  a `fetch`/SubtleCrypto environment at load time.
+- **`api.mjs` export surface**: re-exports `loadFromBytes`, `withBasicAuth`,
+  `RemoteGit` alongside `createBlobService`/`memoryStore` (node bundle entry
+  is a superset for custom stores/auth); `fileStore` hardened (try/catch IO,
+  skip-if-exists puts, recursive `heads()` for nested branches).
+
 ### Fixed
 
 - **Default commit time is now wall-clock**: `portable.mjs` `commit()` without

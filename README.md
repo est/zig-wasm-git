@@ -32,7 +32,7 @@ Each release ships fixed-name files + `SHA256SUMS`, built by CI from the tagged 
 - **~69KB** `wasm32-freestanding ReleaseSmall`, no libc, imports only `env.host_*`
 - Division of labor: **protocol weight lifting in wasm** (pkt-line, smart HTTP v1/v2 framing, pack framing/parsing, delta apply, single-pass inflate with exact `consumed`), **IO + platform ABIs in JS** (`fetch`, `CompressionStream`/`DecompressionStream`, `crypto.subtle`, pluggable store)
 - Object-level API: read blobs by path / write commits from `{path: content}` maps / fetch+push over smart HTTP
-- `RemoteGit` facade (in `portable.mjs`, recommended): url-bound, `read`/`readText`/`readMany`/`write`/`writeText`/`fetch`/`push`/`sync` over one branch-keyspace; missing blobs auto-fetched on demand (`want=<blob-oid>`); missing key is `null`, each write is a version (author/time options), push is fast-forward-only
+- `RemoteGit` facade (in `portable.mjs`, recommended): url-bound, `read`/`readText`/`readMany`/`list`/`write`/`writeText`/`fetch`/`push`/`sync`/`version`/`remoteVersion` over one branch-keyspace; missing blobs auto-fetched on demand (`want=<blob-oid>`, batched); missing key is `null`, each write is a version (author/time options, CAS parent), push is fast-forward-only
 - SHA-1 / zlib / pack v2 (incl. ofs/ref delta) / pkt-line / smart HTTP (`v1` + `v2 ls-refs/fetch=filter` + receive-pack + upload-pack clients)
 - Partial clone filters: `blob:none`, `blob:limit`, `tree:0`, `object:type`, `combine:+`
 - **No FS, no CLI on the client**: `src/host/{portable,sync,utils}.mjs` run in browsers/CF Workers (zero `node:` imports); Node adds `src/host/api.mjs` (file store + Buffer flavors)
@@ -40,7 +40,7 @@ Each release ships fixed-name files + `SHA256SUMS`, built by CI from the tagged 
 ## Blob-service API (recommended)
 
 One branch is one keyspace. Missing keys are `null`, not errors. Each `write`
-appends a version (a commit) on the current tip; `publish` moves the remote tip
+appends a version (a commit) on the current tip; `push` moves the remote tip
 and rejects on non-fast-forward (last-writer-wins, no merge).
 
 ```js
@@ -150,7 +150,7 @@ See `tests/server.mjs` for a working server and `src/host/portable.mjs` for the 
 
 ```bash
 ./scripts/fetch-deps.sh     # vendor zig 0.16.0 into ./third_party (or use system zig)
-./tests/run.sh              # zig unit + wasm/filter/fetch/push/api e2e (fetch: worker-like, delta+filter, git-verified)
+./tests/run.sh              # zig unit + wasm/filter/fetch/push/api/blob/remote/codec e2e (fetch: worker-like, delta+filter, git-verified)
 PORT=3002 ./scripts/e2e.sh  # smart HTTP e2e: clone/push/fetch/partial clone (real git client)
 ```
 
