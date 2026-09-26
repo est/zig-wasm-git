@@ -12,6 +12,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Install Zig (official tarball)
         run: |
           ARCH=$(uname -m)
@@ -23,29 +26,31 @@ jobs:
           echo "$HOME/.zig" >> "$GITHUB_PATH"
       - name: Build wasm (ReleaseSmall)
         run: zig build -Doptimize=ReleaseSmall
+      - name: Bundle JS entries (esbuild, pinned; no repo deps)
+        run: |
+          npx -y esbuild@0.25.0 src/host/portable.mjs --bundle --format=esm --platform=neutral --outfile=zig_wasm_git.portable.mjs
+          npx -y esbuild@0.25.0 src/host/api.mjs --bundle --format=esm --platform=node --outfile=zig_wasm_git.node.mjs
       - name: Run tests
         run: ./tests/run.sh
       - name: Package + checksum
-        id: pkg
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          OUT="zig_wasm_git.wasm"
-          cp zig-out/bin/zig_wasm_git.wasm "$OUT"
-          sha256sum "$OUT" > "$OUT.sha256"
-          SIZE=$(stat -c%s "$OUT")
-          echo "name=$OUT" >> "$GITHUB_OUTPUT"
-          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          cp zig-out/bin/zig_wasm_git.wasm .
+          sha256sum zig_wasm_git.wasm zig_wasm_git.portable.mjs zig_wasm_git.node.mjs > SHA256SUMS
           {
             echo "### zig_wasm_git ${GITHUB_REF_NAME}"
             echo ""
-            echo "- \`$OUT\` (${SIZE} bytes) — wasm32-freestanding, no libc"
-            echo "- Download: \`curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/$OUT\`"
-            echo "- Verify: \`sha256sum -c $OUT.sha256\`"
+            echo "- \`zig_wasm_git.wasm\` ($(stat -c%s zig_wasm_git.wasm) bytes) — wasm32-freestanding, no libc"
+            echo "- \`zig_wasm_git.portable.mjs\` ($(stat -c%s zig_wasm_git.portable.mjs) bytes) — single-file JS for browser/CF Worker/Node (\`loadFromBytes\` + blob service)"
+            echo "- \`zig_wasm_git.node.mjs\` ($(stat -c%s zig_wasm_git.node.mjs) bytes) — single-file JS for Node (\`load\`, fileStore, Buffer flavors)"
+            echo "- Download: \`curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/zig_wasm_git.portable.mjs\`"
+            echo "- Verify: \`sha256sum -c SHA256SUMS\`"
           } > body.md
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           body_path: body.md
           files: |
-            ${{ steps.pkg.outputs.name }}
-            ${{ steps.pkg.outputs.name }}.sha256
+            zig_wasm_git.wasm
+            zig_wasm_git.portable.mjs
+            zig_wasm_git.node.mjs
+            SHA256SUMS

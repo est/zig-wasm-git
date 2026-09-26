@@ -28,8 +28,36 @@ jobs:
         run: zig build -Doptimize=ReleaseSmall
       - name: Run tests (zig unit + wasm filter + object API e2e)
         run: ./tests/run.sh
-      - name: Upload wasm artifact
+      - name: Bundle JS entries (esbuild, pinned; no repo deps)
+        run: |
+          npx -y esbuild@0.25.0 src/host/portable.mjs --bundle --format=esm --platform=neutral --outfile=zig-out/bin/zig_wasm_git.portable.mjs
+          npx -y esbuild@0.25.0 src/host/api.mjs --bundle --format=esm --platform=node --outfile=zig-out/bin/zig_wasm_git.node.mjs
+      # NOTE: --platform=neutral doubles as a portability guard — a node:
+      # import leaking into the portable chain fails the build here.
+      - name: Smoke-test bundles (commit/get parity with src)
+        run: |
+          node --check zig-out/bin/zig_wasm_git.portable.mjs
+          node --check zig-out/bin/zig_wasm_git.node.mjs
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const wasm = readFileSync("zig-out/bin/zig_wasm_git.wasm");
+            const fixed = { time: 1755859200, timezone: "+0000", author: "CI <ci@x>" };
+            const shas = new Set();
+            for (const p of ["./src/host/portable.mjs", "./zig-out/bin/zig_wasm_git.portable.mjs", "./zig-out/bin/zig_wasm_git.node.mjs"]) {
+              const mod = await import(p);
+              const repo = mod.loadFromBytes(wasm, { store: mod.memoryStore() });
+              const sha = repo.commit("", "smoke", { "s.txt": "ok" }, "refs/heads/main", fixed);
+              if (new TextDecoder().decode(repo.get("main", ["s.txt"])[0].content) !== "ok") throw new Error("smoke get failed: " + p);
+              shas.add(sha);
+            }
+            if (shas.size !== 1) throw new Error("bundle parity failed");
+            console.log("bundle smoke ok:", [...shas][0].slice(0, 7));
+          '
+      - name: Upload dist artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zig_wasm_git.wasm
-          path: zig-out/bin/zig_wasm_git.wasm
+          name: dist
+          path: |
+            zig-out/bin/zig_wasm_git.wasm
+            zig-out/bin/zig_wasm_git.portable.mjs
+            zig-out/bin/zig_wasm_git.node.mjs
