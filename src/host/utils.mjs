@@ -12,8 +12,9 @@
 //   codec: hex/url/auth, zlib, loose/tree/commit parsing
 //   wire:  wasm boot + git-protocol call wrappers (source of truth for pkt shapes)
 
-const _dec = new TextDecoder();
-const _enc = new TextEncoder();
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+export { enc, dec };
 
 // ── store ──
 
@@ -75,7 +76,7 @@ export function withBasicAuth(fetchImpl) {
     }
     if (!u.username && !u.password) return fetchImpl(url, init);
     const creds = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
-    const bytes = _enc.encode(creds);
+    const bytes = enc.encode(creds);
     let bin = "";
     for (let i = 0; i < bytes.length; i += 0x8000) {
       bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
@@ -88,6 +89,19 @@ export function withBasicAuth(fetchImpl) {
   };
 }
 
+/// Concatenate chunks (single alloc). Shared by streamAll/takeEmit.
+export function concatU8(parts) {
+  let n = 0;
+  for (const p of parts) n += p.length;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+
 async function streamAll(stream, input) {
   const w = stream.writable.getWriter();
   await w.write(input);
@@ -96,15 +110,7 @@ async function streamAll(stream, input) {
   for await (const c of stream.readable) {
     chunks.push(new Uint8Array(c.buffer, c.byteOffset, c.byteLength));
   }
-  let n = 0;
-  for (const c of chunks) n += c.length;
-  const out = new Uint8Array(n);
-  let o = 0;
-  for (const c of chunks) {
-    out.set(c, o);
-    o += c.length;
-  }
-  return out;
+  return concatU8(chunks);
 }
 
 /// pack 对象 payload:zlib(body)。直出,无需手工包头/adler。
@@ -121,7 +127,7 @@ export async function looseBody(loose) {
   const raw = await inflateZlib(loose instanceof Uint8Array ? loose : new Uint8Array(loose));
   const nul = raw.indexOf(0);
   if (nul < 0) throw new Error("bad loose object");
-  const [type, len] = _dec.decode(raw.subarray(0, nul)).split(" ");
+  const [type, len] = dec.decode(raw.subarray(0, nul)).split(" ");
   const body = raw.subarray(nul + 1);
   if (body.length !== Number(len)) throw new Error("loose length mismatch");
   return { type, body: body.slice() };
@@ -137,8 +143,8 @@ export function parseTreeEntries(body) {
     const nul = u8.indexOf(0, sp + 1);
     if (sp < 0 || nul < 0 || nul + 21 > u8.length) throw new Error("bad tree body");
     out.push({
-      mode: _dec.decode(u8.subarray(i, sp)),
-      name: _dec.decode(u8.subarray(sp + 1, nul)),
+      mode: dec.decode(u8.subarray(i, sp)),
+      name: dec.decode(u8.subarray(sp + 1, nul)),
       oid: hexOfBytes(u8.subarray(nul + 1, nul + 21)),
     });
     i = nul + 21;
@@ -149,7 +155,7 @@ export function parseTreeEntries(body) {
 export function commitParentsAndTree(body) {
   const parents = [];
   let tree = null;
-  const text = typeof body === "string" ? body : _dec.decode(body instanceof Uint8Array ? body : new Uint8Array(body));
+  const text = typeof body === "string" ? body : dec.decode(body instanceof Uint8Array ? body : new Uint8Array(body));
   for (const line of text.split("\n")) {
     if (line.startsWith("parent ")) parents.push(line.slice(7).trim());
     else if (line.startsWith("tree ") && tree === null) tree = line.slice(5, 45);
@@ -158,10 +164,20 @@ export function commitParentsAndTree(body) {
   return { parents, tree };
 }
 
-// ── wire ──
+/// Parse a commit body into a log row {sha, tree, parents, author, message}.
+/// Shared by portable (async) and Node (sync) log(); keep them in sync.
+export function parseCommit(sha, text) {
+  const lines = text.split("\n");
+  const hdrEnd = lines.indexOf("");
+  const headers = lines.slice(0, hdrEnd);
+  const message = lines.slice(hdrEnd + 1).join("\n").trim();
+  const tree = (headers.find((l) => l.startsWith("tree ")) ?? "").slice(5);
+  const parents = headers.filter((l) => l.startsWith("parent ")).map((l) => l.slice(7));
+  const authorLine = headers.find((l) => l.startsWith("author ")) ?? "";
+  return { sha, tree, parents, author: authorLine.slice(7), message };
+}
 
-const enc = new TextEncoder();
-const dec = new TextDecoder();
+// ── wire ──
 
 /// Accept wasm bytes or a precompiled WebAssembly.Module and return a Module.
 /// Runtimes that forbid runtime codegen (e.g. Cloudflare workerd, where
@@ -194,18 +210,7 @@ export function bootWasm(wasmBytesOrModule) {
     },
   });
   const wasm = inst.exports;
-  const takeEmit = () => {
-    const parts = emitChunks.splice(0);
-    let n = 0;
-    for (const p of parts) n += p.length;
-    const out = new Uint8Array(n);
-    let o = 0;
-    for (const p of parts) {
-      out.set(p, o);
-      o += p.length;
-    }
-    return out;
-  };
+  const takeEmit = () => concatU8(emitChunks.splice(0));
   return { wasm, takeEmit };
 }
 

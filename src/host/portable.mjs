@@ -13,24 +13,26 @@
 // Wire: git protocol weight lifting in wasm (utils.mjs); IO/compression/hash in JS;
 // remote sync (fetch/push) in sync.mjs; blob facade below in this file.
 
-import { memoryStore, bootWasm, toModule, deflateZlib, joinUrl, withBasicAuth } from "./utils.mjs";
+import { memoryStore, bootWasm, toModule, deflateZlib, joinUrl, withBasicAuth, looseBody, enc, dec, hexOfBytes, concatU8, parseCommit } from "./utils.mjs";
 import {
   fetchIntoStore, lsRemote,
   collectObjects, TYPE_NUM, ZERO_OID, decodeRefsTlv, decodeStatusTlv,
 } from "./sync.mjs";
 
-const enc = new TextEncoder();
-const dec = new TextDecoder();
 const ERR_NAMES = { 1: "NotFound", 2: "PathIsDir", 3: "NotATree", 4: "NotABlob", 5: "BadCommit" };
 
 export { memoryStore, withBasicAuth };
 
 /// wasmBytesOrModule: Uint8Array bytes, or a precompiled WebAssembly.Module
 /// (workerd `CompiledWasm`; see wire.toModule).
+/// Prerequisites (no runtime checks): WebAssembly, fetch, crypto.subtle,
+/// CompressionStream/DecompressionStream, TextEncoder/Decoder — Node 18+,
+/// CF workerd, or modern browsers. Missing pieces fail naturally at the
+/// call site. Pass { fetchImpl, subtle } only to override (tests/auth).
 export function loadFromBytes(wasmBytesOrModule, opts = {}) {
   const store = opts.store ?? memoryStore();
-  const fetchImpl = opts.fetchImpl ?? globalThis.fetch?.bind(globalThis);
-  const subtle = opts.subtle ?? globalThis.crypto?.subtle;
+  const fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  const subtle = opts.subtle ?? globalThis.crypto.subtle;
   const { wasm, takeEmit } = bootWasm(wasmBytesOrModule);
 
   function allocBytes(b) {
@@ -88,16 +90,7 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
     bound = {
       wasm: inst.exports,
       takeEmit() {
-        const parts = emitChunks.splice(0);
-        let n = 0;
-        for (const p of parts) n += p.length;
-        const out = new Uint8Array(n);
-        let o = 0;
-        for (const p of parts) {
-          out.set(p, o);
-          o += p.length;
-        }
-        return out;
+        return concatU8(emitChunks.splice(0));
       },
     };
     return bound;
@@ -134,7 +127,7 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
       const path = dec.decode(u8.subarray(pos, pos + plen));
       pos += plen;
       if (status === 0) {
-        const oidHex = Array.from(u8.subarray(pos, pos + 20), (b) => b.toString(16).padStart(2, "0")).join("");
+        const oidHex = hexOfBytes(u8.subarray(pos, pos + 20));
         pos += 20;
         const clen = dv.getUint32(pos, true);
         pos += 4;
@@ -152,7 +145,7 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
     let n = 2;
     const ps = entries.map((e) => {
       const pb = enc.encode(e.path);
-      const cb = e.content instanceof Uint8Array ? e.content : enc.encode(String(e.content));
+      const cb = e.content instanceof Uint8Array ? e.content : enc.encode(e.content);
       n += 2 + pb.length + 4 + cb.length;
       return { pb, cb };
     });
@@ -215,7 +208,7 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
         const msg = as(message);
         const entries = Object.entries(entriesObj).map(([path, content]) => ({
           path,
-          content: content instanceof Uint8Array ? content : enc.encode(String(content)),
+          content: typeof content === "string" ? enc.encode(content) : content,
         }));
         const ej = ab(encodeEntriesTlv(entries));
         const outHex = w.wasm_alloc(40);
@@ -242,8 +235,8 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
     /** Fetch/clone a remote ref into this store (smart HTTP v2). */
     fetch(url, ref = "main", opts = {}) {
       return fetchIntoStore(wasm, store, url, ref, {
-        fetchImpl,
-        subtle,
+        fetchImpl: opts.fetchImpl ?? fetchImpl,
+        subtle: opts.subtle ?? subtle,
         filter: opts.filter ?? "",
         setRef: opts.setRef,
         onProgress: opts.onProgress,
@@ -252,7 +245,6 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
 
     /** Recent history without protocol (reads local store; async inflate). */
     async log(ref, limit = 10) {
-      const { looseBody } = await import("./utils.mjs");
       const sha0 = resolveRef(ref);
       const out = [];
       let cur = sha0;
@@ -260,22 +252,15 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
         const loose = store.get(cur);
         if (!loose) break;
         const { body } = await looseBody(loose);
-        const text = dec.decode(body);
-        const lines = text.split("\n");
-        const hdrEnd = lines.indexOf("");
-        const headers = lines.slice(0, hdrEnd);
-        const message = lines.slice(hdrEnd + 1).join("\n").trim();
-        const tree = (headers.find((l) => l.startsWith("tree ")) ?? "").slice(5);
-        const parents = headers.filter((l) => l.startsWith("parent ")).map((l) => l.slice(7));
-        const authorLine = headers.find((l) => l.startsWith("author ")) ?? "";
-        out.push({ sha: cur, tree, parents, author: authorLine.slice(7), message });
-        cur = parents[0];
+        const row = parseCommit(cur, dec.decode(body));
+        out.push(row);
+        cur = row.parents[0];
       }
       return out;
     },
 
     lsRemote(url, opts = {}) {
-      return lsRemote(wasm, url, { fetchImpl });
+      return lsRemote(wasm, url, { fetchImpl: opts.fetchImpl ?? fetchImpl });
     },
 
     resolveRef,
@@ -300,7 +285,6 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
 
     async push(url, ref = "refs/heads/main", opts = {}) {
       const fi = opts.fetchImpl ?? fetchImpl;
-      if (!fi) throw new Error("fetch unavailable on this platform (pass fetchImpl)");
       const fullRef = ref.startsWith("refs/") ? ref : `refs/heads/${ref}`;
       const newOid = resolveRef(ref).toLowerCase();
       const discRes = await fi(joinUrl(url, "/info/refs?service=git-receive-pack"));
@@ -371,7 +355,7 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
 // Each write is a full-snapshot commit of the given keys on top of the
 // current tip (last-writer-wins; push rejects on non-fast-forward).
 
-const toU8 = (v) => (v instanceof Uint8Array ? v : enc.encode(String(v ?? "")));
+const toU8 = (v) => (v instanceof Uint8Array ? v : enc.encode(v ?? ""));
 
 export function createBlobService(repo, opts = {}) {
   const shortRef = opts.ref ?? "main";
@@ -423,7 +407,7 @@ export function createBlobService(repo, opts = {}) {
   }
 
   function writeText(path, text, message = "update", options = {}) {
-    return write({ [path]: enc.encode(String(text)) }, message, options);
+    return write({ [path]: enc.encode(text) }, message, options);
   }
 
   // Network: pull == fetch remote tip into local store (plus ref update).

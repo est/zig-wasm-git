@@ -17,6 +17,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 
 import zlib from "node:zlib";
 import { join, dirname } from "node:path";
 import { loadFromBytes, memoryStore as portableMemoryStore, createBlobService } from "./portable.mjs";
+import { parseCommit } from "./utils.mjs";
 
 export { createBlobService };
 export const memoryStore = portableMemoryStore;
@@ -36,7 +37,7 @@ export function load(wasmPath, opts = {}) {
     /** options: { author="<name> <email>", committer, time(sec), timezone } (all optional) */
     commit(parentRef, message, entriesObj, updateRef = "refs/heads/main", options = {}) {
       const entries = Object.fromEntries(
-        Object.entries(entriesObj).map(([p, c]) => [p, Buffer.isBuffer(c) ? c : c instanceof Uint8Array ? c : Buffer.from(String(c))]),
+        Object.entries(entriesObj).map(([p, c]) => [p, typeof c === "string" ? Buffer.from(c) : c]),
       );
       return inner.commit(parentRef, message, entries, updateRef, options);
     },
@@ -51,16 +52,9 @@ export function load(wasmPath, opts = {}) {
         if (!loose) break;
         const raw = zlib.inflateSync(loose); // "<type> <size>\0<body>"
         const nul = raw.indexOf(0);
-        const body = raw.subarray(nul + 1).toString("utf8");
-        const lines = body.split("\n");
-        const hdrEnd = lines.indexOf("");
-        const headers = lines.slice(0, hdrEnd);
-        const message = lines.slice(hdrEnd + 1).join("\n").trim();
-        const tree = (headers.find((l) => l.startsWith("tree ")) ?? "").slice(5);
-        const parents = headers.filter((l) => l.startsWith("parent ")).map((l) => l.slice(7));
-        const authorLine = headers.find((l) => l.startsWith("author ")) ?? "";
-        out.push({ sha: cur, tree, parents, author: authorLine.slice(7), message });
-        cur = parents[0];
+        const row = parseCommit(cur, raw.subarray(nul + 1).toString("utf8"));
+        out.push(row);
+        cur = row.parents[0];
       }
       return out;
     },
@@ -116,11 +110,7 @@ export function fileStore(dir) {
       writeFileSync(p, sha + "\n");
     },
     heads() {
-      try {
-        return readdirSync(join(dir, "refs/heads"));
-      } catch {
-        return [];
-      }
+      return readdirSync(join(dir, "refs/heads"));
     },
   };
 }

@@ -1,6 +1,7 @@
 // src/host/sync.mjs — remote sync clients (JS side: IO + enumeration; wire protocol in wasm).
-// Zero node: imports. Requires fetch, CompressionStream, crypto.subtle
-// (present in Node 18+/Workers/modern browsers; no runtime checks).
+// Prerequisites: fetch, CompressionStream, crypto.subtle (Node 18+/Workers/
+// modern browsers; no runtime checks — missing pieces fail naturally).
+// fetchImpl/subtle are required opts, resolved once by loadFromBytes.
 // Sections:
 //   fetch: upload-pack v2 (discovery -> ls-refs -> fetch/sideband demux ->
 //          unpack/delta resolve -> store), plus lsRemote
@@ -9,13 +10,11 @@
 import {
   buildLsRefsReq, buildFetchReq, listRefs, decodePackHeaderJS, inflateOne, deltaApply,
   decodeRefsTlv, looseBody, parseTreeEntries, commitParentsAndTree,
-  deflateZlib, hexOfBytes, joinUrl,
+  deflateZlib, hexOfBytes, joinUrl, enc, dec,
 } from "./utils.mjs";
 
 export { decodeRefsTlv };
 
-const enc = new TextEncoder();
-const dec = new TextDecoder();
 const _utf8 = (b) => dec.decode(b instanceof Uint8Array ? b : new Uint8Array(b));
 
 // ── fetch ──
@@ -227,12 +226,13 @@ export async function verifyPackTrailer(subtle, pack) {
 }
 
 /// Full clone/fetch into store (portable).
-/// opts: {fetchImpl=globalThis.fetch, subtle=globalThis.crypto.subtle,
-///        filter="", ref="refs/heads/main", setRef=true, onProgress}
+/// opts: {fetchImpl, subtle} (required — resolved once by loadFromBytes;
+/// see portable prerequisites), plus {filter="", ref="refs/heads/main",
+/// setRef=true, onProgress}.
 /// Returns {ref, oid, objects, packBytes, shallow}.
 export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
-  const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
-  const subtle = opts.subtle ?? globalThis.crypto?.subtle;
+  const fetchImpl = opts.fetchImpl;
+  const subtle = opts.subtle;
   const filter = opts.filter ?? "";
   const headers = { "Git-Protocol": "version=2" };
 
@@ -327,9 +327,9 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   return { ref: wantRef, oid: wantOid, objects: stored, packBytes: pack.length, shallow, refs };
 }
 
-/// List remote refs without fetching objects.
+/// List remote refs without fetching objects (fetchImpl required, see above).
 export async function lsRemote(wasm, url, opts = {}) {
-  const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+  const fetchImpl = opts.fetchImpl;
   const headers = { "Git-Protocol": "version=2" };
   const discRes = await fetchImpl(joinUrl(url, "/info/refs?service=git-upload-pack"), { headers });
   if (!discRes.ok) throw new Error(`discovery http ${discRes.status}`);
