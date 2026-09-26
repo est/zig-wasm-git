@@ -8,7 +8,7 @@
 // crypto.subtle (sync clients), fetch (sync clients).
 //
 // Sections:
-//   store: in-memory object store (same interface as the Node fileStore)
+//   store: in-memory object store (same interface as any custom backend)
 //   codec: hex/url/auth, zlib, loose/tree/commit parsing
 //   wire:  wasm boot + git-protocol call wrappers (source of truth for pkt shapes)
 
@@ -178,41 +178,6 @@ export function parseCommit(sha, text) {
 }
 
 // ── wire ──
-
-/// Accept wasm bytes or a precompiled WebAssembly.Module and return a Module.
-/// Runtimes that forbid runtime codegen (e.g. Cloudflare workerd, where
-/// `new WebAssembly.Module(bytes)` throws "Wasm code generation disallowed
-/// by embedder") precompile at upload time (wrangler `CompiledWasm` rule)
-/// and pass the Module straight in; Node/browsers keep passing bytes.
-export function toModule(wasmBytesOrModule) {
-  if (typeof WebAssembly.Module === "function" && wasmBytesOrModule instanceof WebAssembly.Module) {
-    return wasmBytesOrModule;
-  }
-  return new WebAssembly.Module(wasmBytesOrModule);
-}
-
-export function bootWasm(wasmBytesOrModule) {
-  const emitChunks = [];
-  let inst;
-  const mod = toModule(wasmBytesOrModule);
-  inst = new WebAssembly.Instance(mod, {
-    env: {
-      host_emit_bytes(ptr, len) {
-        emitChunks.push(new Uint8Array(inst.exports.memory.buffer.slice(ptr, ptr + len)));
-      },
-      host_log() {},
-      host_get_object() {
-        return -1;
-      },
-      host_put_object() {
-        return -1;
-      },
-    },
-  });
-  const wasm = inst.exports;
-  const takeEmit = () => concatU8(emitChunks.splice(0));
-  return { wasm, takeEmit };
-}
 
 function dv(wasm) {
   return new DataView(wasm.memory.buffer);

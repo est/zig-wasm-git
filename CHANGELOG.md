@@ -5,6 +5,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 
 ## [Unreleased]
 
+### Changed
+
+- **Single API: `RemoteGit` only** (`src/host/portable.mjs`, no back-compat).
+  `createBlobService`, `loadFromBytes`' low-level repo (`get`/`commit`/`fetch`/`push`/
+  `lsRemote`/`pushPack`), `load()` (Buffer flavors, sync `log`), `bootWasm`/`toModule`,
+  and `tests/pack.mjs` are gone. Everything is a method on `RemoteGit`, all async,
+  batch-only: `open`/`getMany`/`putMany`/`list`/`log`/`version`/`remoteVersion`/
+  `pull`/`push`/`sync`. Removed aliases and Text twins (`read`/`readText`/`readMany`,
+  `write`/`writeText`, `fetch`); single keys go through the Many variants.
+- **`RemoteGit.open(url, { wasm })` async factory** replaces `new RemoteGit(...)`
+  + lazy sync init. `wasm` accepts bytes | precompiled Module | url string |
+  `{ url | bytes | module }`; boot uses async `WebAssembly.instantiate`
+  (off-thread compile; workerd `CompiledWasm` still passes straight through).
+  New explicit `auth` option alongside URL-userinfo Basic auth.
+- **Client-side fast-forward check on `push`**: stale tips now throw locally
+  (`non-fast-forward ... pull first`). `receive-pack` answers empty-pack rewinds
+  with `ok`, so the server was never a reliable backstop (found + covered by
+  `tests/test_remote.mjs`).
+- **`remoteVersion()` throws on network failure** (was `null`); `null` now means
+  only "ref absent remotely". `version()` is async like everything else.
+- **Tests**: `test_blob`/`test_api`/`test_memory_store`/`test_codec_auth`/
+  `test_pack` folded into `test_remote`/`test_push`/`test_fetch` (all on the
+  public API; by-sha assertions use the private `_getInner` only in tests).
+- **Deleted `api.mjs` (`fileStore` had zero users)**: single `portable.mjs` for
+  browser/Node/workerd. `{ wasm }` takes bytes | Module | url-or-path string |
+  `{ url | bytes | module }`: http(s) strings are fetched inside the lib, other
+  strings are filesystem paths read on Node via the runtime
+  `process.getBuiltinModule("node:fs")` probe (a string lookup — no static or
+  dynamic `node:` import, so the `--platform=neutral` bundle keeps building;
+  runtimes without it pass bytes instead). The library reads nothing else from
+  disk (stores stay caller-provided). Single release bundle
+  (`zig_wasm_git.portable.mjs`); `node.mjs` bundle dropped.
+
 ### Added
 
 - **`RemoteGit` url-bound facade** (`portable.mjs`, re-exported from `api.mjs`):

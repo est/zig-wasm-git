@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 全部测试：zig unit + wasm filter + object-level API
+# zig unit + wasm filter + RemoteGit/pull/push e2e
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -12,20 +12,10 @@ echo "== zig unit tests =="
 "$ZIG" test src/zig/root.zig "${LIBARGS[@]}" --cache-dir .zig-cache --global-cache-dir tmp/cache
 echo "== wasm filter tests =="
 node tests/test_wasm.mjs
-echo "== pack format tests (git-verified) =="
-node tests/test_pack.mjs
-echo "== object API e2e =="
-node tests/test_api.mjs
 echo "== push client e2e (wasm protocol + git-verified) =="
 node tests/test_push.mjs
-echo "== fetch client e2e (worker-like, delta + filter, git-verified) =="
+echo "== pull client e2e (worker-like, delta + filter, git-verified) =="
 node tests/test_fetch.mjs
-echo "== memory store / author options =="
-node tests/test_memory_store.mjs
-echo "== blob-service facade e2e =="
-node tests/test_blob.mjs
-echo "== RemoteGit facade e2e (auto on-demand fetch) =="
+echo "== RemoteGit facade e2e (versioned blob store) =="
 node tests/test_remote.mjs
-echo "== portable helpers (toModule/withBasicAuth) =="
-node tests/test_codec_auth.mjs
 echo "== ALL TESTS PASSED =="

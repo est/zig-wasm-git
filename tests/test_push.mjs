@@ -1,15 +1,12 @@
-// tests/test_push.mjs — 新编排 e2e:repo.push() 直推本地 server.mjs,真 git 验收 + wasm/JS pack 照
+// tests/test_push.mjs — push e2e: RemoteGit straight to server.mjs, real git accepts.
 import { spawn, execFileSync } from "node:child_process";
-import { rmSync } from "node:fs";
+import { rmSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { load, memoryStore } from "../src/host/api.mjs";
-import { collectObjects } from "../src/host/sync.mjs";
-import { deflateZlib } from "../src/host/utils.mjs";
-import { buildPack } from "./pack.mjs";
+import { RemoteGit } from "../src/host/portable.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const WASM = join(ROOT, "zig-out/bin/zig_wasm_git.wasm");
+const WASM = readFileSync(join(ROOT, "zig-out/bin/zig_wasm_git.wasm"));
 const PORT = 32123;
 const BASE = `http://localhost:${PORT}/pushtest.git`;
 const SERVER_REPO = join(ROOT, "data/pushtest.git");
@@ -30,37 +27,12 @@ try {
     await new Promise((r) => setTimeout(r, 100));
   }
 
-  const store = memoryStore();
-  const local = load(WASM, { store });
-  const c1 = local.commit("", "init", { "README.md": "hello push\n", "src/a.txt": "a\n" });
+  const local = await RemoteGit.open(BASE, { wasm: WASM, ref: "main" });
+  const c1 = await local.putMany({ "README.md": "hello push\n", "src/a.txt": "a\n" }, "init");
   console.log("local c1:", c1);
 
-  // ── differential:wasm pack 字节 == JS 参考实现(同 deflated 输入) ──
-  const objects = await collectObjects(store, c1, new Set());
-  console.log(`collected: ${objects.length} objects (${objects.map((o) => o.type).join(",")})`);
-  const wasmPack = await local.pushPack(objects);
-  const { hexOfBytes } = await import("../src/host/utils.mjs");
-  const devMap = new Map();
-  for (const o of objects) devMap.set(hexOfBytes(o.body), await deflateZlib(o.body));
-  const refPack = buildPack(objects.map((o) => ({ type: o.type, body: o.body })), {
-    deflate: (b) => devMap.get(hexOfBytes(b)),
-  });
-  if (!wasmPack.equals(refPack)) throw new Error(`wasm/JS pack mismatch: ${wasmPack.length} vs ${refPack.length}`);
-  console.log(`differential ok: pack=${wasmPack.length}B byte-identical`);
-  // wasm pack 直接喂真 git
-  const { mkdirSync, readdirSync } = await import("node:fs");
-  const tmpd = join(ROOT, "tmp/test_push_pack");
-  rmSync(tmpd, { recursive: true, force: true });
-  mkdirSync(tmpd, { recursive: true });
-  execFileSync("git", ["init", "-q", join(tmpd, "repo")]);
-  execFileSync("git", ["-C", join(tmpd, "repo"), "index-pack", "--stdin"], { input: wasmPack });
-  const back = execFileSync("git", ["-C", join(tmpd, "repo"), "cat-file", "-p", `${c1}:README.md`]).toString();
-  if (back !== "hello push\n") throw new Error("wasm pack cat-file mismatch");
-  console.log("wasm pack accepted by git");
-  rmSync(tmpd, { recursive: true, force: true });
-
-  // ── 首推(新分支) ──
-  const r1 = await local.push(BASE, "refs/heads/main");
+  // ── first push (new branch) ──
+  const r1 = await local.push();
   console.log("push1:", JSON.stringify({ ...r1, new: r1.new.slice(0, 7) }));
   if (!r1.updated || r1.objects < 4) throw new Error(`push1 suspect: objects=${r1.objects}`);
   const ref1 = execFileSync("git", ["--git-dir", SERVER_REPO, "rev-parse", "refs/heads/main"]).toString().trim();
@@ -71,13 +43,13 @@ try {
   console.log("server fsck clean");
 
   // ── noop ──
-  const rNoop = await local.push(BASE, "main");
+  const rNoop = await local.push();
   if (rNoop.updated) throw new Error("noop push should not update");
   console.log("noop ok");
 
-  // ── 增量推 ──
-  const c2 = local.commit("main", "v2", { "README.md": "hello v2\n" });
-  const r2 = await local.push(BASE, "refs/heads/main");
+  // ── incremental push ──
+  const c2 = await local.putMany({ "README.md": "hello v2\n" }, "v2");
+  const r2 = await local.push();
   console.log("push2:", JSON.stringify({ ...r2, new: r2.new.slice(0, 7), old: r2.old.slice(0, 7) }));
   if (!r2.updated) throw new Error("push2 failed");
   if (r2.objects >= r1.objects) throw new Error(`incremental should send fewer: ${r2.objects} vs ${r1.objects}`);

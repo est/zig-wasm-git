@@ -26,22 +26,20 @@ jobs:
           echo "$HOME/.zig" >> "$GITHUB_PATH"
       - name: Build wasm (ReleaseSmall)
         run: zig build -Doptimize=ReleaseSmall
-      - name: Bundle JS entries (esbuild, pinned; no repo deps)
+      - name: Bundle JS (esbuild, pinned; no repo deps)
         run: |
           npx -y esbuild@0.25.0 src/host/portable.mjs --bundle --format=esm --platform=neutral --outfile=zig_wasm_git.portable.mjs
-          npx -y esbuild@0.25.0 src/host/api.mjs --bundle --format=esm --platform=node --outfile=zig_wasm_git.node.mjs
       - name: Run tests
         run: ./tests/run.sh
       - name: Package + checksum
         run: |
           cp zig-out/bin/zig_wasm_git.wasm .
-          sha256sum zig_wasm_git.wasm zig_wasm_git.portable.mjs zig_wasm_git.node.mjs > SHA256SUMS
+          sha256sum zig_wasm_git.wasm zig_wasm_git.portable.mjs > SHA256SUMS
           {
             echo "### zig_wasm_git ${GITHUB_REF_NAME}"
             echo ""
             echo "- \`zig_wasm_git.wasm\` ($(stat -c%s zig_wasm_git.wasm) bytes) — wasm32-freestanding, no libc"
-            echo "- \`zig_wasm_git.portable.mjs\` ($(stat -c%s zig_wasm_git.portable.mjs) bytes) — single-file JS for browser/CF Worker/Node (\`loadFromBytes\` + blob service)"
-            echo "- \`zig_wasm_git.node.mjs\` ($(stat -c%s zig_wasm_git.node.mjs) bytes) — single-file JS for Node (\`load\`, fileStore, Buffer flavors)"
+            echo "- \`zig_wasm_git.portable.mjs\` ($(stat -c%s zig_wasm_git.portable.mjs) bytes) — single-file JS for browser/CF Worker/Node (\`RemoteGit\`)"
             echo "- Download: \`curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/zig_wasm_git.portable.mjs\`"
             echo "- Verify: \`sha256sum -c SHA256SUMS\`"
           } > body.md
@@ -52,5 +50,4 @@ jobs:
           files: |
             zig_wasm_git.wasm
             zig_wasm_git.portable.mjs
-            zig_wasm_git.node.mjs
             SHA256SUMS

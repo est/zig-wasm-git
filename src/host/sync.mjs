@@ -1,7 +1,7 @@
 // src/host/sync.mjs — remote sync clients (JS side: IO + enumeration; wire protocol in wasm).
 // Prerequisites: fetch, CompressionStream, crypto.subtle (Node 18+/Workers/
 // modern browsers; no runtime checks — missing pieces fail naturally).
-// fetchImpl/subtle are required opts, resolved once by loadFromBytes.
+// fetchImpl/subtle are required opts, resolved per call by RemoteGit._net().
 // Sections:
 //   fetch: upload-pack v2 (discovery -> ls-refs -> fetch/sideband demux ->
 //          unpack/delta resolve -> store), plus lsRemote
@@ -228,7 +228,7 @@ export async function verifyPackTrailer(subtle, pack) {
 }
 
 /// Full clone/fetch into store (portable).
-/// opts: {fetchImpl, subtle} (required — resolved once by loadFromBytes;
+/// opts: {fetchImpl, subtle} (required — resolved per call by RemoteGit._net();
 /// see portable prerequisites), plus {filter="", ref="refs/heads/main",
 /// setRef=true, onProgress}.
 /// want: ref name, raw oid, or an array of raw oids (batch blob fetch —
