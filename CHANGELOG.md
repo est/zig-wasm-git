@@ -5,6 +5,68 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 
 ## [Unreleased]
 
+### Added
+
+- **`RemoteGitError` + stable `.code` on every throw.** All failures are now
+  branchable without string matching: `NETWORK`, `HTTP` (with `.status`),
+  `NO_V2`, `NO_REMOTE_REF`, `NO_SUCH_OBJECT`, `BAD_STORE`, `BAD_KEY`,
+  `BAD_REF`, `CAS_MISMATCH`, `NON_FAST_FORWARD`, `PUSH_REJECTED`,
+  `UNPACK_FAILED`, `WASM_ALLOC`, `WASM_RC`, `BAD_TREE_PATH`. Original errors
+  are kept in `.cause`; `ERR` and `isGitError(e, code)` are exported.
+  Existing message text is preserved, so message-matching code still works.
+- **`close()` / `closed`**: release the wasm instance and its ~5MB linear memory
+  (a 4MB arena plus growth) once you are done with a `RemoteGit` — for a
+  serverless handler, a Worker, or a process that makes many short-lived
+  instances. Waits for in-flight work first, is idempotent, and does not clear
+  the store (pass a throwaway `store` if you want those objects gone too).
+  Methods after `close()` throw `CLOSED`.
+- **`getMany(paths, { local: false })` / `list(prefix, { local: false })`**:
+  cache-only reads with no bootstrap and no I/O.
+- **`getMany(paths, { as: "text" })`**: decode UTF-8 and return
+  `Map(path -> string)` instead of bytes.
+- **`getMany` / `sync` accept a single key string** as well as an array.
+- **`BAD_ARG`** for arguments of the wrong shape: a non-string/non-bytes blob
+  value, or `entries` that is not an object/Map. Previously these were coerced
+  silently, storing the 15 bytes `"[object Object]"` for a plain object.
+- **Store contract probe**: `open()` verifies a custom `store` implements
+  `{get,put,getRef,putRef,heads}` and returns values (not Promises).
+- **Key validation** on `putMany` (`keyProblem` exported): relative paths only,
+  no empty segment, no `.` / `..` / `.git`, no NUL/backslash/control chars.
+  All offending keys in a batch are reported together, and a rejected batch
+  writes nothing.
+- **wasm `wasm_commit`/`wasm_commit2` path guard** (rc `-14`), checked before
+  any blob is stored, so direct wasm callers cannot create unnamed tree
+  entries either.
+- Documented that the store is append-only with no eviction, so a long-lived
+  instance grows monotonically; `close()` bounds the wasm arena, and a custom
+  `store` is where an eviction policy belongs.
+
+### Fixed
+
+- **Network failures are no longer reported as "key not found".** `getMany`
+  and `list` used to swallow every bootstrap/on-demand-fetch error and return
+  `{}` / `[]`, so a dropped connection was indistinguishable from an empty
+  keyspace. They now throw `NETWORK` / `HTTP` / `NO_V2`; only a key genuinely
+  absent from the keyspace (or a blob the server declines to send) is skipped.
+- **A Promise-returning `store` no longer corrupts silently.** It previously
+  made `putMany` return a plausible sha while `version()` returned `null` and
+  every read came back empty (wasm read a zero-length object from the
+  unresolved Promise). `open()` now throws `BAD_STORE`.
+- **Silent key loss on write.** `putMany({"/a.txt": ..., "": ...})` returned a
+  success sha while dropping `/a.txt`: both paths produced the same unnamed
+  tree entry and overwrote each other. A lone `""` key was also listed but
+  unreadable. Malformed keys are now rejected (`BAD_KEY`); no key accepted by
+  `putMany` can fail to round-trip through `getMany`.
+- **An unopened `RemoteGit` no longer fails with a raw `TypeError`.**
+  `new RemoteGit(url)` leaves `_wasm` null, so any wasm-backed method died with
+  `Cannot read properties of null (reading 'wasm_reset')`. Since
+  instantiation is async the constructor cannot boot wasm, so these now throw
+  `CLOSED` naming `RemoteGit.open()` as the fix.
+- **`log()` shares the method queue.** It was the one public method bypassing
+  the serializer (it is local and never touches wasm memory, so there was no
+  race — but the file header claimed all methods were serialized). It is now
+  queued like the rest, so every public method has the same ordering.
+
 ### Changed
 
 - **Single API: `RemoteGit` only** (`src/host/portable.mjs`, no back-compat).

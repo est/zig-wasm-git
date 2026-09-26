@@ -8,18 +8,132 @@
 // crypto.subtle (sync clients), fetch (sync clients).
 //
 // Sections:
-//   store: in-memory object store (same interface as any custom backend)
-//   codec: hex/url/auth, zlib, loose/tree/commit parsing
-//   wire:  wasm boot + git-protocol call wrappers (source of truth for pkt shapes)
+//   errors: RemoteGitError + ERR codes (every throw from the client chain)
+//   net:    netFetch — fetch + failure normalization (NETWORK / HTTP)
+//   keys:   key validation (a key that cannot round-trip is rejected)
+//   store:  in-memory object store (same interface as any custom backend)
+//   codec:  hex/url/auth, zlib, loose/tree/commit parsing
+//   wire:   wasm boot + git-protocol call wrappers (source of truth for pkt shapes)
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 export { enc, dec };
 
+// ── errors ──
+
+/// Stable failure codes. Every throw from the client chain is a
+/// RemoteGitError carrying one of these, so callers branch on `code`
+/// instead of matching message text.
+export const ERR = {
+  BAD_STORE: "BAD_STORE", // store does not satisfy the synchronous interface
+  BAD_KEY: "BAD_KEY", // a write key cannot round-trip
+  BAD_REF: "BAD_REF", // ref unresolvable in the local store
+  CAS_MISMATCH: "CAS_MISMATCH", // putMany parent != current tip
+  NON_FAST_FORWARD: "NON_FAST_FORWARD", // push target is not a descendant of the remote tip
+  PUSH_REJECTED: "PUSH_REJECTED", // server refused the ref update
+  UNPACK_FAILED: "UNPACK_FAILED", // server could not unpack the pushed pack
+  NO_REMOTE_REF: "NO_REMOTE_REF", // ref/branch does not exist on the remote
+  NO_SUCH_OBJECT: "NO_SUCH_OBJECT", // server accepted the want but did not send the object
+  NO_V2: "NO_V2", // server lacks protocol v2 (pull / ls-refs require it)
+  HTTP: "HTTP", // non-2xx response; see .status
+  NETWORK: "NETWORK", // fetch threw (offline, DNS, TLS, CORS); see .cause
+  WASM_ALLOC: "WASM_ALLOC", // wasm arena exhausted
+  WASM_RC: "WASM_RC", // a wasm export returned non-zero
+  BAD_TREE_PATH: "BAD_TREE_PATH", // wasm refused a path (defense in depth)
+  BAD_ARG: "BAD_ARG", // argument has the wrong shape/type
+  CLOSED: "CLOSED", // method called on a closed instance
+};
+
+export class RemoteGitError extends Error {
+  constructor(code, message, extra = {}) {
+    super(message);
+    this.name = "RemoteGitError";
+    this.code = code;
+    if (extra.cause !== undefined) this.cause = extra.cause;
+    if (extra.status !== undefined) this.status = extra.status;
+    if (extra.key !== undefined) this.key = extra.key;
+    if (extra.ref !== undefined) this.ref = extra.ref;
+  }
+}
+
+/// True when `e` is a RemoteGitError, optionally of one specific code.
+export const isGitError = (e, code) =>
+  e instanceof RemoteGitError && (code === undefined || e.code === code);
+
+/// Throw a RemoteGitError. Exported so the client chain never writes a bare
+/// `new Error` for a condition a caller may need to branch on.
+export function failed(code, message, extra) {
+  throw new RemoteGitError(code, message, extra);
+}
+
+// ── net ──
+
+/// fetch + failure normalization: a thrown fetch becomes NETWORK (original
+/// kept in .cause), a non-2xx becomes HTTP with .status. Never returns a
+/// non-ok response, so no call site can forget the check.
+export async function netFetch(fetchImpl, url, init, what) {
+  let r;
+  try {
+    r = await fetchImpl(url, init);
+  } catch (e) {
+    failed(ERR.NETWORK, `${what}: ${e?.message ?? e}`, { cause: e });
+  }
+  if (!r?.ok) failed(ERR.HTTP, `${what} http ${r?.status ?? 0}`, { status: r?.status });
+  return r;
+}
+
+// ── keys ──
+
+/// Why `key` cannot be stored, or null when it is well-formed.
+///
+/// A key is a relative, slash-separated path whose every segment is non-empty
+/// and is not "." / ".." / ".git". Malformed keys are rejected rather than
+/// normalized: the git tree layer turns an empty segment into an *unnamed*
+/// tree entry, and two keys sharing one ("" and "/a.txt") silently overwrite
+/// each other inside a single putMany batch — a success sha for lost data.
+/// Every key accepted by assertKeys can also be read back by getMany.
+export function keyProblem(key) {
+  if (typeof key !== "string") return "not a string";
+  if (!key.length) return "empty";
+  if (key.includes("\0")) return "contains NUL";
+  if (key.includes("\\")) return "contains a backslash";
+  if (/[\u0000-\u001f\u007f]/.test(key)) return "contains a control character";
+  if (key.startsWith("/")) return "leading '/' — use a relative path";
+  if (key.endsWith("/")) return "trailing '/' — that is a directory, not a key";
+  for (const seg of key.split("/")) {
+    if (!seg) return "empty path segment ('//')";
+    if (seg === "." || seg === "..") return `'${seg}' segment`;
+    if (seg === ".git") return "'.git' segment (reserved)";
+  }
+  return null;
+}
+
+/// Throw BAD_KEY listing every bad key at once, so a batch is fixable in one pass.
+export function assertKeys(keys) {
+  const bad = [];
+  for (const k of keys) {
+    const why = keyProblem(k);
+    if (why) bad.push(`${JSON.stringify(k)} (${why})`);
+  }
+  if (bad.length) {
+    failed(
+      ERR.BAD_KEY,
+      `invalid key(s): ${bad.join("; ")} — keys are relative paths like "docs/a.md"`,
+    );
+  }
+}
+
 // ── store ──
 
 /// Portable in-memory object store (zero FS, zero node: deps).
 /// get(hex) -> Uint8Array|null (loose zlib bytes); put(hex, loose) stores a copy.
+///
+/// The store interface is SYNCHRONOUS: every method must return a value, not a
+/// Promise. It is called from inside wasm host callbacks (host_get_object /
+/// host_put_object) and from ref resolution, neither of which can await, so a
+/// Promise-returning store does not fail loudly — wasm would read a
+/// zero-length object and the instance would write commits it cannot read back.
+/// RemoteGit.open probes the store and throws BAD_STORE instead.
 export function memoryStore() {
   const objs = new Map();
   const refs = new Map();
@@ -46,6 +160,48 @@ export function memoryStore() {
       return { objects: objs.size, refs: refs.size };
     },
   };
+}
+
+const STORE_METHODS = ["get", "put", "getRef", "putRef", "heads"];
+
+/// Verify a custom store satisfies the synchronous interface above, so the
+/// failure is a clear BAD_STORE at open() instead of silently-empty reads
+/// later. Read paths are probed with sentinel keys (no writes, so nothing is
+/// mutated); a probe that throws is not our business and is ignored — we only
+/// care that it did not hand back a thenable.
+export function assertSyncStore(store) {
+  if (!store || typeof store !== "object") {
+    failed(ERR.BAD_STORE, `store must be an object with {${STORE_METHODS.join(", ")}}`);
+  }
+  const missing = STORE_METHODS.filter((k) => typeof store[k] !== "function");
+  if (missing.length) {
+    failed(
+      ERR.BAD_STORE,
+      `store is missing ${missing.join(", ")} — it must implement {${STORE_METHODS.join(", ")}}`,
+    );
+  }
+  const probes = [
+    ["get", () => store.get("0".repeat(40))],
+    ["getRef", () => store.getRef("refs/heads/zig-wasm-git-probe")],
+    ["heads", () => store.heads()],
+  ];
+  for (const [name, call] of probes) {
+    let v;
+    try {
+      v = call();
+    } catch {
+      continue;
+    }
+    if (v && typeof v.then === "function") {
+      failed(
+        ERR.BAD_STORE,
+        `store.${name}() returned a Promise — the store interface is synchronous ` +
+          `(it is called from wasm host callbacks that cannot await). Buffer the ` +
+          `value yourself, or use memoryStore().`,
+      );
+    }
+  }
+  return store;
 }
 
 // ── codec ──
@@ -186,7 +342,7 @@ function dv(wasm) {
 function allocBytes(wasm, b) {
   if (b.length === 0) return { ptr: 0, len: 0 };
   const ptr = wasm.wasm_alloc(b.length);
-  if (!ptr) throw new Error("wasm_alloc failed (heap full; call reset between ops)");
+  if (!ptr) failed(ERR.WASM_ALLOC, "wasm_alloc failed (heap full; call reset between ops)");
   new Uint8Array(wasm.memory.buffer).set(b, ptr);
   return { ptr, len: b.length };
 }

@@ -648,6 +648,28 @@ fn loadTreeEntries(alloc: std.mem.Allocator, tree_oid_hex: []const u8) !LoadedTr
 
 const Change = struct { path: []const u8, oid_bytes: [20]u8 };
 
+/// Reject a path that cannot round-trip as a git tree entry. An empty segment
+/// (leading '/', '//', trailing '/') yields an *unnamed* tree entry, and two
+/// paths sharing one silently overwrite each other in the same commit — a
+/// success sha for lost data. '.', '..' and '.git' are rejected for the same
+/// reason the JS layer rejects them (keyProblem in utils.mjs); this is the
+/// defense-in-depth copy for direct wasm callers.
+fn validPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (path[0] == '/' or path[path.len - 1] == '/') return false;
+    if (std.mem.indexOfAny(u8, path, "\x00\\") != null) return false;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) return false;
+        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
+        if (std.mem.eql(u8, seg, ".git")) return false;
+        for (seg) |c| {
+            if (c < 0x20 or c == 0x7f) return false;
+        }
+    }
+    return true;
+}
+
 fn applyToTree(alloc: std.mem.Allocator, tree_oid_hex: []const u8, changes: []const Change) ![40]u8 {
     var entries = try loadTreeEntries(alloc, tree_oid_hex);
     for (changes) |ch| {
@@ -721,6 +743,8 @@ export fn wasm_commit(parent_hex_ptr: usize, parent_hex_len: usize, msg_ptr: usi
         if (pos + clen > tlv.len) return -3;
         const content = tlv[pos .. pos + clen];
         pos += clen;
+        // Validate before storing the blob, so a bad batch has no side effects.
+        if (!validPath(path)) return -14;
         // store blob
         const r = object.hashObject(alloc, .blob, content) catch return -1;
         var bhex: [40]u8 = undefined;
@@ -802,6 +826,7 @@ export fn wasm_commit2(
         if (pos + clen > tlv.len) return -3;
         const content = tlv[pos .. pos + clen];
         pos += clen;
+        if (!validPath(path)) return -14; // see wasm_commit
         const r = object.hashObject(alloc, .blob, content) catch return -1;
         var bhex: [40]u8 = undefined;
         oidmod.toHex(r.oid_val, &bhex);

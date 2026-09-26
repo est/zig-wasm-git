@@ -10,7 +10,7 @@
 import {
   buildLsRefsReq, buildFetchReq, listRefs, decodePackHeaderJS, inflateOne, deltaApply,
   decodeRefsTlv, looseBody, parseTreeEntries, commitParentsAndTree,
-  deflateZlib, hexOfBytes, joinUrl, enc, dec,
+  deflateZlib, hexOfBytes, joinUrl, enc, dec, netFetch, failed, ERR,
 } from "./utils.mjs";
 
 export { decodeRefsTlv };
@@ -241,29 +241,29 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   const headers = { "Git-Protocol": "version=2" };
 
   // 1. discovery (v2 gate)
-  const discRes = await fetchImpl(joinUrl(url, "/info/refs?service=git-upload-pack"), { headers });
-  if (!discRes.ok) throw new Error(`discovery http ${discRes.status}`);
+  const discRes = await netFetch(fetchImpl, joinUrl(url, "/info/refs?service=git-upload-pack"), { headers }, "discovery");
   const disc = new Uint8Array(await discRes.arrayBuffer());
-  if (!dec.decode(disc).includes("version 2")) throw new Error("server lacks protocol v2 (need version 2 advertisement)");
+  if (!dec.decode(disc).includes("version 2")) {
+    failed(ERR.NO_V2, "server lacks protocol v2 (need version 2 advertisement)");
+  }
 
   // 2. ls-refs
   const lsBody = buildLsRefsReq(wasm);
-  const lsRes = await fetchImpl(joinUrl(url, "/git-upload-pack"), {
+  const lsRes = await netFetch(fetchImpl, joinUrl(url, "/git-upload-pack"), {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/x-git-upload-pack-request" },
     body: lsBody,
-  });
-  if (!lsRes.ok) throw new Error(`ls-refs http ${lsRes.status}`);
+  }, "ls-refs");
   const refs = listRefs(wasm, new Uint8Array(await lsRes.arrayBuffer()));
-  if (!refs.length) throw new Error("remote has no refs (empty repo — nothing to fetch)");
+  if (!refs.length) failed(ERR.NO_REMOTE_REF, "remote has no refs (empty repo — nothing to fetch)");
 
   // resolve want(s): full ref, short name, raw oid, or raw-oid array
   let wantOids;
   let wantRef = null;
   if (Array.isArray(want)) {
-    if (!want.length) throw new Error("empty want list");
+    if (!want.length) failed(ERR.BAD_KEY, "empty want list");
     wantOids = want.map((w) => {
-      if (!/^[0-9a-f]{40}$/i.test(w)) throw new Error(`batch fetch only takes raw oids, got: ${w}`);
+      if (!/^[0-9a-f]{40}$/i.test(w)) failed(ERR.BAD_KEY, `batch fetch only takes raw oids, got: ${w}`);
       return w.toLowerCase();
     });
   } else if (/^[0-9a-f]{40}$/i.test(want)) {
@@ -272,7 +272,11 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   } else {
     const full = want.startsWith("refs/") ? want : `refs/heads/${want}`;
     const hit = refs.find((r) => r.name === full) ?? refs.find((r) => r.name === want);
-    if (!hit) throw new Error(`remote ref not found: ${want} (have: ${refs.map((r) => r.name).join(", ")})`);
+    if (!hit) {
+      failed(ERR.NO_REMOTE_REF, `remote ref not found: ${want} (have: ${refs.map((r) => r.name).join(", ")})`, {
+        ref: want,
+      });
+    }
     wantOids = [hit.oid.toLowerCase()];
     wantRef = hit.name;
   }
@@ -283,12 +287,11 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
     return { ref: wantRef, oid: wantOids[0], oids: wantOids, objects: 0, packBytes: 0, shallow: [], cached: true, refs };
   }
   const fetchBody = buildFetchReq(wasm, wantOids, filter);
-  const fRes = await fetchImpl(joinUrl(url, "/git-upload-pack"), {
+  const fRes = await netFetch(fetchImpl, joinUrl(url, "/git-upload-pack"), {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/x-git-upload-pack-request" },
     body: fetchBody,
-  });
-  if (!fRes.ok) throw new Error(`fetch http ${fRes.status}`);
+  }, "fetch");
   const raw = new Uint8Array(await fRes.arrayBuffer());
   const { pack, shallow, progress } = decodeSideband(raw);
   if (opts.onProgress && progress.length) opts.onProgress(progress);
@@ -332,9 +335,17 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
     stored++;
   }
   // sanity: every want must now exist (filters only ever omit blobs,
-  // and blob:none never omits commits — a missing want here is a real gap)
+  // and blob:none never omits commits — a missing want here is a real gap).
+  // NO_SUCH_OBJECT is the one "the server said yes but did not send it" case
+  // (gc'd / unadvertised blob); callers treat it as a miss, not a failure.
   for (const o of wantOids) {
-    if (!store.get(o)) throw new Error(`fetched pack lacks wanted object ${o} (got ${stored} objects)`);
+    if (!store.get(o)) {
+      failed(
+        ERR.NO_SUCH_OBJECT,
+        `fetched pack lacks wanted object ${o} (got ${stored} objects)`,
+        { ref: o },
+      );
+    }
   }
   if (opts.setRef !== false && wantRef) store.putRef(wantRef, wantOids[0]);
   return { ref: wantRef, oid: wantOids[0], oids: wantOids, objects: stored, packBytes: pack.length, shallow, refs };
@@ -344,15 +355,13 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
 export async function lsRemote(wasm, url, opts = {}) {
   const fetchImpl = opts.fetchImpl;
   const headers = { "Git-Protocol": "version=2" };
-  const discRes = await fetchImpl(joinUrl(url, "/info/refs?service=git-upload-pack"), { headers });
-  if (!discRes.ok) throw new Error(`discovery http ${discRes.status}`);
+  const discRes = await netFetch(fetchImpl, joinUrl(url, "/info/refs?service=git-upload-pack"), { headers }, "discovery");
   const lsBody = buildLsRefsReq(wasm);
-  const lsRes = await fetchImpl(joinUrl(url, "/git-upload-pack"), {
+  const lsRes = await netFetch(fetchImpl, joinUrl(url, "/git-upload-pack"), {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/x-git-upload-pack-request" },
     body: lsBody,
-  });
-  if (!lsRes.ok) throw new Error(`ls-refs http ${lsRes.status}`);
+  }, "ls-refs");
   return listRefs(wasm, new Uint8Array(await lsRes.arrayBuffer()));
 }
 

@@ -21,7 +21,7 @@ for (const f of ["utils.mjs", "sync.mjs", "portable.mjs"]) {
     throw new Error(`${f} must stay portable (no node: imports)`);
   }
 }
-const { RemoteGit } = await import("../src/host/portable.mjs");
+const { RemoteGit, memoryStore } = await import("../src/host/portable.mjs");
 if (typeof RemoteGit?.open !== "function") throw new Error("portable.mjs must export RemoteGit with static open()");
 
 const enc = new TextEncoder();
@@ -32,7 +32,11 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
 {
   const git = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, ref: "main" });
   if ((await git.version()) !== null) throw new Error("empty version should be null");
-  if ((await git.getMany(["a.txt"])).size !== 0) throw new Error("empty getMany should be empty (no network touched)");
+  // { local: false } = cache-only: no bootstrap, no I/O, so an unreachable
+  // host is irrelevant here. (Default getMany would legitimately throw NETWORK.)
+  if ((await git.getMany(["a.txt"], { local: false })).size !== 0) {
+    throw new Error("empty getMany should be empty (no network touched)");
+  }
   const v1 = await git.putMany({ "a.txt": "hello", "d/b.bin": new Uint8Array([1, 2, 3]) }, "init");
   if (!/^[0-9a-f]{40}$/.test(v1)) throw new Error("putMany should return sha");
   if ((await git.version()) !== v1) throw new Error("version should track tip");
@@ -45,6 +49,10 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   if (text(await git.getMany(["d/b.bin"]), "d/b.bin") == null) throw new Error("untouched key must survive putMany");
   const hist = await git.log(5);
   if (hist.length !== 2 || hist[0].sha !== v2) throw new Error("log should walk newest-first");
+  // every public method shares one ordering: a log queued behind a write sees it
+  await Promise.all([git.putMany({ "c.txt": "3" }, "m3"), git.log(1)]);
+  if ((await git.log(1))[0].sha !== (await git.version())) throw new Error("log should serialize with writes");
+  if ((await git.log(0)).length !== 0) throw new Error("log(0) should be empty");
   console.log("[ok] local lifecycle (putMany/getMany/version/log, zero network)");
 }
 
@@ -116,15 +124,17 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
 // ── 2b. list() + CAS parent (local) ──
 {
   const git = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, ref: "main" });
-  if ((await git.list()).length !== 0) throw new Error("empty list should be []");
+  // local-only variant: this block is offline throughout, so cache-only reads.
+  const LC = { local: false };
+  if ((await git.list("", LC)).length !== 0) throw new Error("empty list should be []");
   await git.putMany({ "a.txt": "1", "docs/b.txt": "2", "docs/c.txt": "3" }, "init");
-  const paths = (await git.list()).map((e) => e.path).sort();
+  const paths = (await git.list("", LC)).map((e) => e.path).sort();
   if (JSON.stringify(paths) !== JSON.stringify(["a.txt", "docs/b.txt", "docs/c.txt"])) {
     throw new Error("list mismatch: " + JSON.stringify(paths));
   }
-  const keys = await git.list();
+  const keys = await git.list("", LC);
   if (!keys.every((e) => /^[0-9a-f]{40}$/.test(e.oid))) throw new Error("list entries need oids");
-  const sub = await git.list("docs/");
+  const sub = await git.list("docs/", LC);
   if (sub.length !== 2 || !sub.every((e) => e.path.startsWith("docs/"))) throw new Error("prefix filter broken");
   // CAS: stale parent throws locally, exact tip succeeds
   const tip = await git.version();
@@ -138,6 +148,186 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   }
   if (!threw) throw new Error("stale parent must throw CAS mismatch");
   console.log("[ok] list (+prefix) and CAS parent");
+}
+
+// ── 2c. fail loudly instead of silently (store contract / network / keys) ──
+{
+  // 1. store interface is synchronous — a Promise-returning store must be
+  //    rejected at open(), not silently write commits it cannot read back.
+  const inner = memoryStore();
+  const asyncStore = {
+    async get(h) { return inner.get(h); },
+    async put(h, b) { return inner.put(h, b); },
+    async getRef(n) { return inner.getRef(n); },
+    async putRef(n, s) { return inner.putRef(n, s); },
+    async heads() { return inner.heads(); },
+  };
+  let se;
+  try {
+    await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, store: asyncStore });
+  } catch (e) {
+    se = e;
+  }
+  if (se?.code !== "BAD_STORE") throw new Error("async store must be rejected, got: " + se?.code);
+  let me;
+  try {
+    await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, store: { get() {} } });
+  } catch (e) {
+    me = e;
+  }
+  if (me?.code !== "BAD_STORE" || !/putRef/.test(me.message)) {
+    throw new Error("incomplete store must name the missing methods");
+  }
+
+  // 2. an unreachable remote must throw, never report "no such key" as empty
+  const dead = await RemoteGit.open("https://nonexistent.invalid/r.git", { wasm: WASM });
+  for (const [name, fn] of [["getMany", () => dead.getMany(["a"])], ["list", () => dead.list()]]) {
+    let ne;
+    try {
+      await fn();
+    } catch (e) {
+      ne = e;
+    }
+    if (ne?.code !== "NETWORK") throw new Error(`${name} on a dead remote must throw NETWORK, got ${ne?.code ?? "(no throw)"}`);
+    if (ne.cause == null) throw new Error(`${name} should keep the original error in .cause`);
+  }
+  // ...while cache-only reads stay offline-safe and empty
+  const cached = await RemoteGit.open("https://nonexistent.invalid/r.git", { wasm: WASM });
+  await cached.putMany({ "k.txt": "v" }, "m");
+  if (text(await cached.getMany(["k.txt"], { local: false }), "k.txt") !== "v") {
+    throw new Error("getMany({local:false}) must read offline");
+  }
+  if ((await cached.list("", { local: false })).length !== 1) {
+    throw new Error("list({local:false}) must work offline");
+  }
+  // an HTTP status is preserved on the error
+  const denied = await RemoteGit.open("https://example.invalid/r.git", {
+    wasm: WASM, fetchImpl: async () => ({ ok: false, status: 403 }),
+  });
+  let he;
+  try {
+    await denied.remoteVersion();
+  } catch (e) {
+    he = e;
+  }
+  if (he?.code !== "HTTP" || he.status !== 403) throw new Error("HTTP errors should carry .status");
+
+  // 3. keys that cannot round-trip are rejected (and the batch writes nothing)
+  const kv = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
+  for (const k of ["", "/a.txt", "a//b.txt", "dir/", "..", ".", "a/../b", ".git/config", "a\\b"]) {
+    let ke;
+    try {
+      await kv.putMany({ [k]: "v" }, "m");
+    } catch (e) {
+      ke = e;
+    }
+    if (ke?.code !== "BAD_KEY") throw new Error(`key ${JSON.stringify(k)} should be BAD_KEY, got ${ke?.code ?? "(accepted)"}`);
+  }
+  // every offender reported at once, and no partial commit
+  let both;
+  try {
+    await kv.putMany({ "/a": "1", "": "2", "ok.txt": "3" }, "m");
+  } catch (e) {
+    both = e;
+  }
+  if (both?.code !== "BAD_KEY" || !both.message.includes('"/a"') || !both.message.includes('""')) {
+    throw new Error("all bad keys should be reported together: " + both?.message);
+  }
+  if ((await kv.list("", { local: false })).length !== 0) {
+    throw new Error("a rejected batch must not write anything");
+  }
+  // valid keys still round-trip
+  await kv.putMany({ "a/b.txt": "1", ".github/w.yml": "2", "üñî.md": "3" }, "m");
+  if ((await kv.getMany(["a/b.txt", ".github/w.yml", "üñî.md"], { local: false })).size !== 3) {
+    throw new Error("valid keys must still round-trip");
+  }
+  console.log("[ok] fail loudly: BAD_STORE / NETWORK+HTTP / BAD_KEY");
+}
+
+// ── 2d. lifecycle: close(), unopened instances, argument shapes ──
+{
+  // close() releases the wasm instance and guards later calls
+  const g = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
+  await g.putMany({ "a.txt": "x".repeat(100_000) }, "m");
+  if (g.closed) throw new Error("closed must start false");
+  if (!(g._wasm.memory.buffer.byteLength > 4 * 1024 * 1024)) throw new Error("expected a multi-MB wasm arena");
+  await g.close();
+  if (!g.closed || g._wasm !== null) throw new Error("close() should release the wasm instance");
+  for (const [name, fn] of [
+    ["putMany", () => g.putMany({ "b": "1" }, "m")],
+    ["getMany", () => g.getMany(["a.txt"], { local: false })],
+    ["log", () => g.log()],
+  ]) {
+    let ce;
+    try {
+      await fn();
+    } catch (e) {
+      ce = e;
+    }
+    if (ce?.code !== "CLOSED") throw new Error(`${name} after close should throw CLOSED, got ${ce?.code ?? "(no throw)"}`);
+  }
+  await g.close(); // idempotent
+  // the store survives; a fresh instance can reuse it
+  const g2 = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, store: g._store });
+  if (text(await g2.getMany(["a.txt"], { local: false }), "a.txt")?.length !== 100_000) {
+    throw new Error("reopening on the same store should still read");
+  }
+  await g2.close();
+  // close() waits for in-flight work instead of pulling memory out from under it
+  const g3 = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
+  await Promise.all([g3.putMany({ "slow.txt": "y".repeat(50_000) }, "m"), g3.close()]);
+  if (!g3.closed) throw new Error("close() should drain queued work");
+
+  // an unopened instance explains itself instead of throwing a raw TypeError
+  const unopened = new RemoteGit("https://example.invalid/r.git", { wasm: WASM });
+  for (const [name, fn] of [
+    ["putMany", () => unopened.putMany({ "a": "b" }, "m")],
+    ["getMany", () => unopened.getMany(["a"])],
+    ["list", () => unopened.list()],
+    ["log", () => unopened.log()],
+    ["version", () => unopened.version()],
+  ]) {
+    let ue;
+    try {
+      await fn();
+    } catch (e) {
+      ue = e;
+    }
+    if (ue?.code !== "CLOSED" || !/RemoteGit\.open/.test(ue.message)) {
+      throw new Error(`${name} on an unopened instance should point at RemoteGit.open (${ue?.code}: ${ue?.message})`);
+    }
+  }
+
+  // putMany takes an object (or a Map); content is a string or bytes
+  const sh = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
+  await sh.putMany({ "o.txt": "1", "a.txt": "2" }, "m");
+  await sh.putMany(new Map([["m.txt", "3"]]), "m");
+  const shapes = (await sh.list("", { local: false })).map((e) => e.path).sort();
+  if (JSON.stringify(shapes) !== JSON.stringify(["a.txt", "m.txt", "o.txt"])) {
+    throw new Error("entry shapes: " + JSON.stringify(shapes));
+  }
+  await sh.putMany({ "s.txt": "str", "u.txt": new Uint8Array([1, 2]) }, "m");
+  if (text(await sh.getMany(["s.txt"], { local: false }), "s.txt") !== "str") throw new Error("string content");
+  if ((await sh.getMany(["u.txt"], { local: false })).get("u.txt")?.length !== 2) throw new Error("Uint8Array content");
+  // getMany takes a single key too, and can decode text
+  if (!(await sh.getMany("o.txt", { local: false })).has("o.txt")) throw new Error("getMany should take one key");
+  const asText = await sh.getMany(["s.txt"], { local: false, as: "text" });
+  if (asText.get("s.txt") !== "str") throw new Error("as:'text'");
+  if (!(await sh.getMany(["s.txt"], { local: false })).get("s.txt") instanceof Uint8Array) {
+    throw new Error("default getMany should stay bytes");
+  }
+  // a non-string, non-bytes value is refused instead of stored as "[object Object]"
+  for (const bad of [{ "z.txt": {} }, { "z.txt": 42 }, "nope", 42, [["a", "b"]]]) {
+    let be;
+    try {
+      await sh.putMany(bad, "m");
+    } catch (e) {
+      be = e;
+    }
+    if (be?.code !== "BAD_ARG") throw new Error(`putMany(${JSON.stringify(bad)}) should be BAD_ARG, got ${be?.code ?? "(accepted)"}`);
+  }
+  await sh.close();
+  console.log("[ok] lifecycle: close(), unopened guard, argument shapes");
 }
 
 // ── 3. network: auto on-demand fetch without prior pull() ──
@@ -222,6 +412,14 @@ try {
     rejected = /rejected|non-fast|failed/i.test(e.message);
   }
   if (!rejected) throw new Error("stale push should reject");
+  // it must be a branchable NON_FAST_FORWARD, not just matching message text
+  let nff;
+  try {
+    await batched.push();
+  } catch (e) {
+    nff = e;
+  }
+  if (nff?.code !== "NON_FAST_FORWARD") throw new Error("stale push should carry NON_FAST_FORWARD, got: " + nff?.code);
   console.log("[ok] put/push/sync across clients + non-fast-forward reject");
 
   execFileSync("git", ["--git-dir", SERVER_REPO, "fsck", "--strict"]);

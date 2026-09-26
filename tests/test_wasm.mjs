@@ -67,4 +67,68 @@ function allocStr(s) {
   console.log("combine test done (parse ok)");
 }
 
+// wasm_commit path guard: a path that cannot round-trip as a git tree entry
+// must be refused (rc -14) *before* any blob is stored. An empty segment
+// yields an unnamed tree entry, and two paths sharing one silently overwrite
+// each other in a single commit — a success sha for lost data.
+{
+  const objs = new Map();
+  const dec = new TextDecoder();
+  const enc = new TextEncoder();
+  const guardInst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+    env: {
+      host_emit_bytes: () => {},
+      host_log: () => {},
+      host_get_object: () => -1,
+      host_put_object: (p, q, len) => {
+        const hex = dec.decode(new Uint8Array(guardInst.exports.memory.buffer.slice(p, p + 40)));
+        objs.set(hex, new Uint8Array(guardInst.exports.memory.buffer.slice(q, q + len)));
+        return 0;
+      },
+    },
+  });
+  const g = guardInst.exports;
+  const alloc = (u8) => {
+    const p = g.wasm_alloc(u8.length);
+    new Uint8Array(g.memory.buffer).set(u8, p);
+    return p;
+  };
+  const entriesTlv = (kvs) => {
+    const ps = kvs.map(([k, v]) => [enc.encode(k), enc.encode(v)]);
+    let n = 2;
+    for (const [p, c] of ps) n += 2 + p.length + 4 + c.length;
+    const out = new Uint8Array(n);
+    const dv = new DataView(out.buffer);
+    dv.setUint16(0, kvs.length, true);
+    let pos = 2;
+    for (const [p, c] of ps) {
+      dv.setUint16(pos, p.length, true); pos += 2;
+      out.set(p, pos); pos += p.length;
+      dv.setUint32(pos, c.length, true); pos += 4;
+      out.set(c, pos); pos += c.length;
+    }
+    return out;
+  };
+  const commit = (kvs) => {
+    g.wasm_reset();
+    const tlv = entriesTlv(kvs);
+    const e = alloc(tlv);
+    const outHex = g.wasm_alloc(40);
+    return g.wasm_commit(0, 0, 0, 0, e, tlv.length, outHex);
+  };
+
+  for (const k of ["", "/a.txt", "a//b.txt", "dir/", "..", ".", "a/../b", ".git/config", "a\\b", "a\nb"]) {
+    const before = objs.size;
+    const rc = commit([[k, "v"]]);
+    assert(rc === -14, `wasm_commit should reject ${JSON.stringify(k)} (rc=${rc})`);
+    assert(objs.size === before, `rejected batch ${JSON.stringify(k)} must store nothing`);
+  }
+  // the exact pair that used to silently lose one key
+  assert(commit([["/a.txt", "1"], ["", "2"]]) === -14, "empty-segment collision must be refused");
+  for (const k of ["a.txt", "a/b.txt", ".github/w.yml", "üñî.md", "a b/c-d_e.f"]) {
+    assert(commit([[k, "v"]]) === 0, `wasm_commit should accept ${JSON.stringify(k)}`);
+  }
+  console.log("wasm_commit path guard ok (rc=-14, no side effects)");
+}
+
 console.log("all wasm tests passed");
