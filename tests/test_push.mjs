@@ -1,12 +1,12 @@
 // tests/test_push.mjs — push e2e: RemoteGit straight to server.mjs, real git accepts.
 import { spawn, execFileSync } from "node:child_process";
-import { rmSync, readFileSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RemoteGit } from "../src/host/portable.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const WASM = readFileSync(join(ROOT, "zig-out/bin/zig_wasm_git.wasm"));
+const WASM = join(ROOT, "zig-out/bin/zig_wasm_git.wasm");
 const PORT = 32123;
 const BASE = `http://localhost:${PORT}/pushtest.git`;
 const SERVER_REPO = join(ROOT, "data/pushtest.git");

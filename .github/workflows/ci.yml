@@ -37,8 +37,7 @@ jobs:
         run: |
           node --check zig-out/bin/zig_wasm_git.portable.mjs
           node --input-type=module -e '
-            import { readFileSync } from "node:fs";
-            const wasm = readFileSync("zig-out/bin/zig_wasm_git.wasm");
+            const wasm = "zig-out/bin/zig_wasm_git.wasm";
             const fixed = { time: 1755859200, timezone: "+0000", author: "CI <ci@x>" };
             const shas = new Set();
             for (const p of ["./src/host/portable.mjs", "./zig-out/bin/zig_wasm_git.portable.mjs"]) {

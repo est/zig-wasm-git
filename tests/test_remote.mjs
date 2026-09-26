@@ -7,7 +7,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const WASM = readFileSync(join(ROOT, "zig-out/bin/zig_wasm_git.wasm"));
+const WASM = join(ROOT, "zig-out/bin/zig_wasm_git.wasm");
 const PORT = 32141;
 const BASE = `http://localhost:${PORT}/remotetest.git`;
 const SERVER_REPO = join(ROOT, "data/remotetest.git");
@@ -48,34 +48,35 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   console.log("[ok] local lifecycle (putMany/getMany/version/log, zero network)");
 }
 
-// ── 1b. wasm inputs (bytes / Module / path / url) + auth header ──
+// ── 1b. wasm inputs (path string / Module / default) + auth header ──
 {
+  const gp = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
+  await gp.putMany({ "p.txt": "via-path" }, "p");
+  if (dec.decode((await gp.getMany(["p.txt"])).get("p.txt")) !== "via-path") {
+    throw new Error("path-string wasm input failed");
+  }
   const gm = await RemoteGit.open("https://example.invalid/r.git", {
-    wasm: new WebAssembly.Module(WASM), ref: "main",
+    wasm: new WebAssembly.Module(readFileSync(WASM)), ref: "main",
   });
   await gm.putMany({ "m.txt": "via-module" }, "m");
   if (dec.decode((await gm.getMany(["m.txt"])).get("m.txt")) !== "via-module") {
     throw new Error("precompiled Module input failed");
   }
-  const gb = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
-  await gb.putMany({ "b.txt": "via-bytes" }, "b");
-  if (!((await gb.getMany(["b.txt"])).has("b.txt"))) throw new Error("bytes input failed");
-  // path string: Node reads via process.getBuiltinModule (no static node: import)
-  const gp = await RemoteGit.open("https://example.invalid/r.git", {
-    wasm: join(ROOT, "zig-out/bin/zig_wasm_git.wasm"),
-  });
-  await gp.putMany({ "p.txt": "via-path" }, "p");
-  if (dec.decode((await gp.getMany(["p.txt"])).get("p.txt")) !== "via-path") {
-    throw new Error("path-string wasm input failed");
+  const gt = await RemoteGit.open("https://example.invalid/r.git", { wasm: readFileSync(WASM) });
+  await gt.putMany({ "t.txt": "via-bytes" }, "t");
+  if (dec.decode((await gt.getMany(["t.txt"])).get("t.txt")) !== "via-bytes") {
+    throw new Error("typed-array wasm input failed");
   }
-  let noWasm = false;
+  // default (omitted): co-located zig_wasm_git.wasm next to portable.mjs —
+  // absent in this checkout, so open must fail mentioning the file.
+  let threw = false;
   try {
     await RemoteGit.open("https://example.invalid/r.git", {});
   } catch (e) {
-    noWasm = /needs \{ wasm \}/.test(e.message);
+    threw = /zig_wasm_git\.wasm/.test(e.message);
   }
-  if (!noWasm) throw new Error("open without wasm should throw a clear error");
-  console.log("[ok] wasm inputs (bytes, Module, path string, missing-wasm error)");
+  if (!threw) throw new Error("omitted wasm should fail on the co-located file");
+  console.log("[ok] wasm inputs (path string, Module, bytes, co-located default)");
 
   const { withBasicAuth } = await import("../src/host/utils.mjs");
   const seen = [];

@@ -28,15 +28,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 - **Tests**: `test_blob`/`test_api`/`test_memory_store`/`test_codec_auth`/
   `test_pack` folded into `test_remote`/`test_push`/`test_fetch` (all on the
   public API; by-sha assertions use the private `_getInner` only in tests).
-- **Deleted `api.mjs` (`fileStore` had zero users)**: single `portable.mjs` for
-  browser/Node/workerd. `{ wasm }` takes bytes | Module | url-or-path string |
-  `{ url | bytes | module }`: http(s) strings are fetched inside the lib, other
-  strings are filesystem paths read on Node via the runtime
-  `process.getBuiltinModule("node:fs")` probe (a string lookup — no static or
-  dynamic `node:` import, so the `--platform=neutral` bundle keeps building;
-  runtimes without it pass bytes instead). The library reads nothing else from
-  disk (stores stay caller-provided). Single release bundle
-  (`zig_wasm_git.portable.mjs`); `node.mjs` bundle dropped.
+- **`{ wasm }` takes string | Module | typed array | ArrayBuffer** (`{url|bytes}`
+  object forms dropped; anything else fails in `instantiate`). Non-http(s)
+  strings load from disk on Node via the runtime
+  `process.getBuiltinModule("node:fs")` probe (no static/dynamic `node:`
+  import — neutral bundle unaffected); anything else is `fetch()`ed.
+  Omitted: `zig_wasm_git.wasm` next to the module (fixed-name releases ship
+  together; workerd passes its Module explicitly).
 
 ### Added
 

@@ -51,40 +51,39 @@ const toU8 = (v) => (v instanceof Uint8Array ? v : enc.encode(v ?? ""));
 
 /// Node-only fs probe: runtime string lookup, no static `node:` import —
 /// the neutral bundle keeps building and browsers/workers never touch it.
-/// Runtimes without getBuiltinModule (old Node, workerd): pass bytes instead.
+/// old Node: do it yourself (pass bytes).
 function nodeFs() {
-  try {
-    if (typeof process !== "undefined" && typeof process.getBuiltinModule === "function") {
-      return process.getBuiltinModule("node:fs");
-    }
-  } catch { /* non-Node: fall through */ }
+  const g = process?.getBuiltinModule;
+  if (typeof g === "function") {
+    try {
+      return g("node:fs");
+    } catch {}
+  }
   return null;
 }
 
-/// Normalize { wasm } to raw bytes or a precompiled Module.
-/// Accepts bytes | Module | string (http(s) url, else a filesystem path on
-/// Node) | { url | bytes | module }. Runtimes forbidding codegen (workerd)
-/// pass their CompiledWasm Module. The library reads nothing else from disk
-/// — stores stay caller-provided.
+/*
+  Normalize { wasm } to raw bytes. Accepted:
+    - string: http(s) url, else a Node filesystem path
+    - precompiled Module, typed array or ArrayBuffer (passed to instantiate as-is)
+  Omitted: zig_wasm_git.wasm next to this module (fixed-name release files
+  ship together; Node reads it, browsers fetch it). workerd has neither —
+  pass the Module explicitly. Anything else fails in instantiate; figure it out.
+*/
 async function resolveWasmInput(wasmOpt) {
   if (wasmOpt instanceof WebAssembly.Module) return wasmOpt;
-  if (wasmOpt instanceof Uint8Array) return wasmOpt;
-  if (wasmOpt instanceof ArrayBuffer) return new Uint8Array(wasmOpt);
-  if (typeof wasmOpt === "string") {
-    if (/^https?:\/\//.test(wasmOpt)) {
-      const r = await fetch(wasmOpt);
-      if (!r.ok) throw new Error(`wasm fetch http ${r.status}: ${wasmOpt}`);
-      return new Uint8Array(await r.arrayBuffer());
-    }
+  if (wasmOpt == null) wasmOpt = new URL("zig_wasm_git.wasm", import.meta.url).href;
+  if (typeof wasmOpt !== "string") return wasmOpt; // typed array / ArrayBuffer; instantiate validates
+  const href = wasmOpt;
+  // Local file first: non-http(s) string on Node (plain path or file: URL).
+  // Browsers skip this (no getBuiltinModule) and fetch instead.
+  if (!/^https?:\/\//.test(href)) {
     const fs = nodeFs();
-    if (!fs) throw new Error(`wasm path needs Node (process.getBuiltinModule); elsewhere pass bytes | Module | url — got: ${wasmOpt}`);
-    return new Uint8Array(fs.readFileSync(wasmOpt));
+    if (fs) return new Uint8Array(fs.readFileSync(href.startsWith("file:") ? new URL(href) : href));
   }
-  if (wasmOpt?.module instanceof WebAssembly.Module) return wasmOpt.module;
-  if (wasmOpt?.bytes instanceof Uint8Array) return wasmOpt.bytes;
-  if (wasmOpt?.bytes instanceof ArrayBuffer) return new Uint8Array(wasmOpt.bytes);
-  if (typeof wasmOpt?.url === "string") return resolveWasmInput(wasmOpt.url);
-  throw new Error("RemoteGit.open needs { wasm }: bytes | Module | url-or-path string | { url | bytes | module }");
+  const r = await fetch(href);
+  if (!r.ok) throw new Error(`wasm fetch http ${r.status}: ${href}`);
+  return new Uint8Array(await r.arrayBuffer());
 }
 
 export class RemoteGit {

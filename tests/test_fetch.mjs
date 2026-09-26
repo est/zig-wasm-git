@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { RemoteGit, memoryStore } from "../src/host/portable.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const WASM = readFileSync(join(ROOT, "zig-out/bin/zig_wasm_git.wasm"));
+const WASM = join(ROOT, "zig-out/bin/zig_wasm_git.wasm");
 const PORT = 32127;
 const BASE = `http://localhost:${PORT}/fetchtest.git`;
 const SERVER_REPO = join(ROOT, "data/fetchtest.git");
@@ -115,7 +115,7 @@ try {
     execFileSync("git", ["-C", join(tmpd, "repo"), "index-pack", "--stdin"], { input: rdPack });
     const packFile = join(tmpd, "repo", ".git/objects/pack", rs2(join(tmpd, "repo", ".git/objects/pack")).find((f) => f.endsWith(".pack")));
     const { unpackPack, resolveRefDeltas } = await import("../src/host/sync.mjs");
-    const stub = new WebAssembly.Instance(new WebAssembly.Module(WASM), {
+    const stub = new WebAssembly.Instance(new WebAssembly.Module(readFileSync(WASM)), {
       env: { host_emit_bytes() {}, host_log() {}, host_get_object: () => -1, host_put_object: () => -1 },
     });
     const w2 = stub.exports;

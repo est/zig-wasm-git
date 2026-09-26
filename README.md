@@ -50,11 +50,12 @@ async. Single keys go through the Many variants directly.
 ```js
 import { RemoteGit } from "./src/host/portable.mjs";
 
-// { wasm } takes bytes | Module | url-or-path string | { url | bytes | module }.
+// { wasm }: string | Module | typed array | ArrayBuffer.
+// Omitted = zig_wasm_git.wasm next to this module (Node reads it, browsers
+// fetch it; workerd must pass its Module instead).
 const git = await RemoteGit.open("https://user:pass@git.example.com/team/docs.git", {
-  wasm: "https://git.example.com/zig_wasm_git.wasm", // http(s) url (lib fetches),
+  // wasm: "https://git.example.com/zig_wasm_git.wasm", // http(s) url (lib fetches),
   // wasm: "zig_wasm_git.wasm",    // Node path (read via process.getBuiltinModule)
-  // wasm: wasmBytes,              // bytes you loaded yourself
   // wasm: WASM_MODULE,            // workerd CompiledWasm (no runtime codegen)
   ref: "main",                      // one branch == one keyspace
   author: "bot <bot@example.com>",  // optional defaults; per-write options win
