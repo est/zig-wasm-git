@@ -55,7 +55,9 @@ const git = new RemoteGit("https://user:pass@git.example.com/team/docs.git", {
 await git.fetch(); // optional warmup (full pull); reads work without it
 
 await git.readText("some/path/README.md"); // string | null (missing blobs auto-fetched)
-await git.readMany(["a.txt", "d/b.bin"]);  // Map(path -> Uint8Array, missing skipped)
+await git.readMany(["a.txt", "d/b.bin"]);  // Map(path -> Uint8Array, missing skipped; one roundtrip)
+await git.list("docs/");                   // [{path, oid}] key enumeration
+await git.remoteVersion();                 // remote tip oid, store untouched
 const version = git.write({ "a.txt": "hi" }, "update greeting"); // -> commit sha
 await git.push(); // fast-forward only; rejects on non-fast-forward
 
@@ -92,6 +94,10 @@ underlying `want` / `have` negotiation, `delta` handling, and filters actually d
 | Small upload of similar blobs | `delta` encode on push | **Not supported** — push sends full objects (server re-deltifies on `gc`) |
 | Skip bytes, keep versions | `filter blob:none` / `blob:limit=<n>[kmg]` / `tree:0` / `object:type=` / `combine:+` | Supported both sides; `RemoteGit.read` auto-fetches missing blobs on demand (`want=<blob-oid>`, byte-equal to full fetch) |
 | Single-file download | structure fetch (`blob:none`) + `want=<blob-oid>` promisor roundtrip | Supported via `RemoteGit.read/readMany` (unknown paths cost zero RTT; needs `uploadpack.allowTipSHA1InWant` on self-hosted servers, GitHub OK) |
+| Batch multi-file download | `want=[oid...]` multi-want single pack | Supported via `RemoteGit.readMany` (one roundtrip for all missing blobs) |
+| Key enumeration | tree walk (local, post-tip) | Supported via `RemoteGit.list(prefix)` |
+| Remote version probe | `ls-refs` filtered to one ref | Supported via `RemoteGit.remoteVersion()` (no store writes) |
+| Optimistic concurrency | `write(..., { parent })` throws locally on tip mismatch | Supported (no extra RTT; `push` still rejects non-fast-forward as backstop) |
 | Shallow history | `shallow` / `deepen` / `deepen-since` / `deepen-not` | **Not supported** (client never sends `deepen`) |
 | Delete a key | tree-entry removal in `wasm_commit` | **Not supported** — `write` only upserts; full history retained |
 | Concurrent writers | merge / conflict resolution | **None** — last-writer-wins; `push` rejects non-fast-forward, caller re-pulls and rewrites |

@@ -231,7 +231,9 @@ export async function verifyPackTrailer(subtle, pack) {
 /// opts: {fetchImpl, subtle} (required — resolved once by loadFromBytes;
 /// see portable prerequisites), plus {filter="", ref="refs/heads/main",
 /// setRef=true, onProgress}.
-/// Returns {ref, oid, objects, packBytes, shallow}.
+/// want: ref name, raw oid, or an array of raw oids (batch blob fetch —
+/// one roundtrip for N blobs, never touches refs).
+/// Returns {ref, oid, oids, objects, packBytes, shallow}.
 export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   const fetchImpl = opts.fetchImpl;
   const subtle = opts.subtle;
@@ -255,26 +257,32 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   const refs = listRefs(wasm, new Uint8Array(await lsRes.arrayBuffer()));
   if (!refs.length) throw new Error("remote has no refs (empty repo — nothing to fetch)");
 
-  // resolve want: full ref, short name, or raw oid
-  let wantOid = null;
+  // resolve want(s): full ref, short name, raw oid, or raw-oid array
+  let wantOids;
   let wantRef = null;
-  if (/^[0-9a-f]{40}$/i.test(want)) {
-    wantOid = want.toLowerCase();
+  if (Array.isArray(want)) {
+    if (!want.length) throw new Error("empty want list");
+    wantOids = want.map((w) => {
+      if (!/^[0-9a-f]{40}$/i.test(w)) throw new Error(`batch fetch only takes raw oids, got: ${w}`);
+      return w.toLowerCase();
+    });
+  } else if (/^[0-9a-f]{40}$/i.test(want)) {
+    wantOids = [want.toLowerCase()];
     wantRef = refs[0]?.name ?? null;
   } else {
     const full = want.startsWith("refs/") ? want : `refs/heads/${want}`;
     const hit = refs.find((r) => r.name === full) ?? refs.find((r) => r.name === want);
     if (!hit) throw new Error(`remote ref not found: ${want} (have: ${refs.map((r) => r.name).join(", ")})`);
-    wantOid = hit.oid.toLowerCase();
+    wantOids = [hit.oid.toLowerCase()];
     wantRef = hit.name;
   }
 
   // 3. fetch (skip if already present)
-  if (store.get(wantOid)) {
-    if (opts.setRef !== false && wantRef) store.putRef(wantRef, wantOid);
-    return { ref: wantRef, oid: wantOid, objects: 0, packBytes: 0, shallow: [], cached: true, refs };
+  if (wantOids.length === 1 && store.get(wantOids[0])) {
+    if (opts.setRef !== false && wantRef) store.putRef(wantRef, wantOids[0]);
+    return { ref: wantRef, oid: wantOids[0], oids: wantOids, objects: 0, packBytes: 0, shallow: [], cached: true, refs };
   }
-  const fetchBody = buildFetchReq(wasm, [wantOid], filter);
+  const fetchBody = buildFetchReq(wasm, wantOids, filter);
   const fRes = await fetchImpl(joinUrl(url, "/git-upload-pack"), {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/x-git-upload-pack-request" },
@@ -323,10 +331,13 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
     store.put(o.hex, z);
     stored++;
   }
-  // sanity: wantOid must now exist (unless filter omitted it — e.g. blob:none never omits commits)
-  if (!store.get(wantOid)) throw new Error(`fetched pack lacks wanted object ${wantOid} (got ${stored} objects)`);
-  if (opts.setRef !== false && wantRef) store.putRef(wantRef, wantOid);
-  return { ref: wantRef, oid: wantOid, objects: stored, packBytes: pack.length, shallow, refs };
+  // sanity: every want must now exist (filters only ever omit blobs,
+  // and blob:none never omits commits — a missing want here is a real gap)
+  for (const o of wantOids) {
+    if (!store.get(o)) throw new Error(`fetched pack lacks wanted object ${o} (got ${stored} objects)`);
+  }
+  if (opts.setRef !== false && wantRef) store.putRef(wantRef, wantOids[0]);
+  return { ref: wantRef, oid: wantOids[0], oids: wantOids, objects: stored, packBytes: pack.length, shallow, refs };
 }
 
 /// List remote refs without fetching objects (fetchImpl required, see above).

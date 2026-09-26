@@ -18,6 +18,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
   `zig_wasm_git.portable.mjs` (`--platform=neutral`, browser/Worker/Node) and
   `zig_wasm_git.node.mjs` (`--platform=node`); CI smoke-tests bundle/source
   commit-sha parity, and `neutral` doubles as a portability guard.
+- **`RemoteGit` storage ops**: `list(prefix)` key enumeration, batched
+  `readMany` (one `want=[oids]` roundtrip for all missing blobs),
+  `remoteVersion()` store-free tip probe, `write(..., { parent })` local
+  compare-and-swap. `fetchIntoStore` accepts raw-oid arrays (batch blob
+  fetch, never touches refs).
 
 ### Fixed
 

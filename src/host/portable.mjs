@@ -26,11 +26,14 @@ export { memoryStore, withBasicAuth };
 // ── RemoteGit: url-bound versioned blob store ──
 //
 // One branch == one keyspace. URL is bound once; reads auto-materialize
-// missing blobs, writes carry author defaults, push is fast-forward only:
+// missing blobs (batched into one roundtrip), writes carry author defaults
+// and optional CAS parent, push is fast-forward only:
 //
 //   const git = new RemoteGit(url, { wasm: wasmBytes, ref: "main" });
 //   await git.fetch();                       // optional warmup (full pull)
 //   await git.readText("README.md");          // missing blobs fetched on demand
+//   await git.list("docs/");                 // [{path, oid}] key enumeration
+//   await git.remoteVersion();               // remote tip oid, store untouched
 //   git.write({ "a.txt": "hi" }, "msg", { author: "A <a@x>" }); // -> sha
 //   await git.push();
 //
@@ -51,26 +54,24 @@ export { memoryStore, withBasicAuth };
 //   uploadpack.allowFilter=true              // blob:none structure bootstrap
 //   uploadpack.allowTipSHA1InWant / allowReachableSHA1InWant  // blob fetch
 
-/// Walk one commit's trees to the blob oid for path (null = no such blob).
-async function findBlobOid(store, commitSha, path) {
-  const segs = String(path).split("/").filter(Boolean);
-  if (!segs.length) return null;
+/// All file blobs under one commit: [{path, oid}]. Trees walked once;
+/// gitlinks skipped (never materialized as blobs).
+async function collectBlobs(store, commitSha) {
+  const out = [];
   const { body: cbody } = await looseBody(store.get(commitSha));
-  let treeHex = commitParentsAndTree(cbody).tree;
-  for (let i = 0; i < segs.length; i++) {
-    if (!treeHex) return null;
+  const root = commitParentsAndTree(cbody).tree;
+  const stack = root ? [[root, ""]] : [];
+  while (stack.length) {
+    const [treeHex, pre] = stack.pop();
     const loose = store.get(treeHex);
-    if (!loose) return null;
+    if (!loose) continue;
     const { body } = await looseBody(loose);
-    const e = parseTreeEntries(body).find((x) => x.name === segs[i]);
-    if (!e) return null;
-    const last = i === segs.length - 1;
-    const isTree = e.mode === "40000" || e.mode === "040000";
-    if (last) return isTree || e.mode === "160000" ? null : e.oid;
-    if (!isTree) return null;
-    treeHex = e.oid;
+    for (const e of parseTreeEntries(body)) {
+      if (e.mode === "40000" || e.mode === "040000") stack.push([e.oid, pre + e.name + "/"]);
+      else if (e.mode !== "160000") out.push({ path: pre + e.name, oid: e.oid });
+    }
   }
-  return null;
+  return out;
 }
 
 export class RemoteGit {
@@ -138,23 +139,34 @@ export class RemoteGit {
     return tip;
   }
 
-  /// Unlocked single-blob read: memory hit, else on-demand blob fetch,
-  /// else null (unknown path costs zero RTT; gc'd blobs also read null).
-  async _blobBytesInner(path) {
+  /// Unlocked batched read: memory hits first, then ONE `want=[oids]`
+  /// roundtrip for all missing blobs, then re-read. Unknown paths and
+  /// gc'd blobs stay missing (null), never fail the batch.
+  async _readManyInner(paths) {
+    const out = new Map();
     const tip = await this._tipInner();
-    if (!tip) return null;
-    const row = this._repo_().get(this.ref, [path]).find((r) => r.path === path);
-    if (row && !row.error) return row.content;
-    const oid = await findBlobOid(this._store, tip, path);
-    if (!oid) return null;
-    try {
-      // setRef:false — the branch must keep pointing at the commit, not the blob.
-      await this._repo_().fetch(this.url, oid, { setRef: false, ...this._net() });
-    } catch {
-      return null;
+    if (!tip || !paths.length) return out;
+    const rows = this._repo_().get(this.ref, paths);
+    const missing = [];
+    for (const row of rows) {
+      if (!row.error) out.set(row.path, row.content);
+      else missing.push(row.path);
     }
-    const back = this._repo_().get(this.ref, [path]).find((r) => r.path === path);
-    return back && !back.error ? back.content : null;
+    if (!missing.length) return out;
+    const byPath = new Map((await collectBlobs(this._store, tip)).map((e) => [e.path, e.oid]));
+    const oids = [...new Set(missing.map((p) => byPath.get(p)).filter(Boolean))];
+    if (oids.length) {
+      try {
+        // setRef:false: the branch keeps pointing at the commit, not the blobs.
+        await this._repo_().fetch(this.url, oids, { setRef: false, ...this._net() });
+      } catch {
+        /* gc'd blobs stay missing */
+      }
+      for (const row of this._repo_().get(this.ref, missing)) {
+        if (!row.error) out.set(row.path, row.content);
+      }
+    }
+    return out;
   }
 
   async _pullInner(opts = {}) {
@@ -162,38 +174,61 @@ export class RemoteGit {
   }
 
   read(path) {
-    return this._seq(() => this._blobBytesInner(path));
+    return this._seq(async () => (await this._readManyInner([path])).get(path) ?? null);
   }
 
   async readText(path) {
-    const b = await this._seq(() => this._blobBytesInner(path));
+    const b = await this._seq(async () => (await this._readManyInner([path])).get(path) ?? null);
     return b == null ? null : dec.decode(b);
   }
 
   readMany(paths) {
+    return this._seq(() => this._readManyInner(paths ?? []));
+  }
+
+  /// Key enumeration: [{path, oid}], optionally filtered by prefix.
+  /// Local-only once the tip is known (first call bootstraps structure).
+  list(prefix = "") {
     return this._seq(async () => {
-      const out = new Map();
-      for (const p of paths ?? []) {
-        const b = await this._blobBytesInner(p);
-        if (b) out.set(p, b);
+      const tip = await this._tipInner();
+      if (!tip) return [];
+      const all = await collectBlobs(this._store, tip);
+      return prefix ? all.filter((e) => e.path.startsWith(prefix)) : all;
+    });
+  }
+
+  /// Remote tip oid without touching the store (1 ls-refs roundtrip).
+  /// Null when the ref doesn't exist remotely or the network fails.
+  remoteVersion() {
+    return this._seq(async () => {
+      try {
+        const refs = await this._repo_().lsRemote(this.url, { fetchImpl: this._net().fetchImpl });
+        return refs.find((r) => r.name === this.ref)?.oid ?? null;
+      } catch {
+        return null;
       }
-      return out;
     });
   }
 
   /// Author/time plumbing: per-call options win, constructor defaults fill
-  /// the gaps. { author: "Name <mail>", committer, time (unix sec), timezone }.
+  /// the gaps. { author: "Name <mail>", committer, time (unix sec), timezone,
+  /// parent } — parent enables compare-and-swap: the write throws locally
+  /// when the tip moved since you read it, instead of failing at push time.
   write(files, message = "update", options = {}) {
     const entries = {};
     for (const [path, content] of Object.entries(files ?? {})) {
       entries[path] = content instanceof Uint8Array ? content : toU8(content);
     }
-    const parent = this.version() ?? "";
-    return this._repo_().commit(parent, message, entries, this.ref, {
+    const { parent: expected, ...rest } = options;
+    const tip = this.version() ?? "";
+    if (expected != null && tip !== expected) {
+      throw new Error(`CAS mismatch: tip ${tip.slice(0, 7) || "(empty)"} != expected ${String(expected).slice(0, 7)}`);
+    }
+    return this._repo_().commit(expected ?? tip, message, entries, this.ref, {
       ...(this._author != null ? { author: this._author } : null),
       ...(this._committer != null ? { committer: this._committer } : null),
       ...(this._timezone != null ? { timezone: this._timezone } : null),
-      ...options,
+      ...rest,
     });
   }
 
@@ -222,12 +257,7 @@ export class RemoteGit {
   async sync(paths, opts = {}) {
     return this._seq(async () => {
       await this._pullInner(opts.pull ?? {});
-      const out = new Map();
-      for (const p of paths ?? []) {
-        const b = await this._blobBytesInner(p);
-        if (b) out.set(p, b);
-      }
-      return out;
+      return this._readManyInner(paths ?? []);
     });
   }
 }
@@ -437,7 +467,8 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
       });
     },
 
-    /** Fetch/clone a remote ref into this store (smart HTTP v2). */
+    /** Fetch/clone into this store (smart HTTP v2). ref: branch/tag/sha,
+        or an array of blob oids (batch single-roundtrip fetch, no ref update). */
     fetch(url, ref = "main", opts = {}) {
       return fetchIntoStore(wasm, store, url, ref, {
         fetchImpl: opts.fetchImpl ?? lazyFetch(),

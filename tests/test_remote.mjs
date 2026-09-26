@@ -56,6 +56,33 @@ if (typeof RemoteGit !== "function") throw new Error("portable.mjs must export R
   console.log("[ok] author/committer/timezone defaults + override");
 }
 
+// ── 2b. list() + CAS parent (local) ──
+{
+  const git = new RemoteGit("https://example.invalid/r.git", { wasm: WASM, ref: "main" });
+  if ((await git.list()).length !== 0) throw new Error("empty list should be []");
+  git.write({ "a.txt": "1", "docs/b.txt": "2", "docs/c.txt": "3" }, "init");
+  const keys = await git.list();
+  const paths = keys.map((e) => e.path).sort();
+  if (JSON.stringify(paths) !== JSON.stringify(["a.txt", "docs/b.txt", "docs/c.txt"])) {
+    throw new Error("list mismatch: " + JSON.stringify(paths));
+  }
+  if (!keys.every((e) => /^[0-9a-f]{40}$/.test(e.oid))) throw new Error("list entries need oids");
+  const sub = await git.list("docs/");
+  if (sub.length !== 2 || !sub.every((e) => e.path.startsWith("docs/"))) throw new Error("prefix filter broken");
+  // CAS: stale parent throws locally, exact tip succeeds
+  const tip = git.version();
+  const c2 = git.write({ "a.txt": "2" }, "cas-ok", { parent: tip });
+  if (git.version() !== c2) throw new Error("CAS write should move tip");
+  let threw = false;
+  try {
+    git.write({ "a.txt": "3" }, "cas-stale", { parent: tip });
+  } catch (e) {
+    threw = /CAS mismatch/.test(e.message);
+  }
+  if (!threw) throw new Error("stale parent must throw CAS mismatch");
+  console.log("[ok] list (+prefix) and CAS parent");
+}
+
 // ── 3. network: auto on-demand fetch without prior fetch() ──
 const server = spawn("node", ["tests/server.mjs"], {
   cwd: ROOT,
@@ -95,6 +122,37 @@ try {
   })();
   if (tipType !== "commit") throw new Error(`ref clobbered by blob fetch (points at ${tipType})`);
   console.log("[ok] auto on-demand fetch (no warmup, null for unknown, ref intact)");
+
+  // remoteVersion(): no store writes, matches pushed tip
+  const rv = await git.remoteVersion();
+  if (rv !== tip) throw new Error("remoteVersion should equal pushed tip");
+  const freshNoNet = new RemoteGit(BASE, { wasm: WASM, ref: "main" });
+  if (freshNoNet.version() !== null) throw new Error("fresh client has no local tip");
+  if ((await freshNoNet.remoteVersion()) !== tip) throw new Error("remoteVersion works without local state");
+  console.log("[ok] remoteVersion (store untouched, no local state needed)");
+
+  // batched readMany: 3 missing blobs, exactly 1 want-POST after structure fetch
+  let wantPosts = 0;
+  const counting = async (u, init) => {
+    if (typeof u === "string" && u.includes("/git-upload-pack") && init?.method === "POST" && init?.body) {
+      if (Buffer.from(init.body).toString("latin1").includes("want ")) wantPosts++;
+    }
+    return fetch(u, init);
+  };
+  const batched = new RemoteGit(BASE, { wasm: WASM, ref: "main", fetchImpl: counting });
+  await batched.fetch({ filter: "blob:none" }); // structure only; blobs all missing
+  wantPosts = 0;
+  const got = await batched.readMany(["config.json", "big.bin", "nope.txt"]);
+  if (got.size !== 2) throw new Error("batched readMany should return 2 known keys");
+  if (new TextDecoder().decode(got.get("config.json")) !== JSON.stringify({ v: 7 })) {
+    throw new Error("batched content mismatch");
+  }
+  if (wantPosts !== 1) throw new Error(`expected 1 batched want-POST, saw ${wantPosts}`);
+  const keys = (await batched.list()).map((e) => e.path).sort();
+  if (JSON.stringify(keys) !== JSON.stringify(["big.bin", "config.json"])) {
+    throw new Error("list mismatch: " + JSON.stringify(keys));
+  }
+  console.log("[ok] batched readMany (1 roundtrip) + list over network");
 
   // write + push from this client, sync from another
   await git.writeText("config.json", JSON.stringify({ v: 8 }), "bump");
