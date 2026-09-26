@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 
 ## [Unreleased]
 
+### Added
+
+- **`RemoteGit` url-bound facade** (`portable.mjs`, re-exported from `api.mjs`):
+  `new RemoteGit(url, { wasm, ref, filter, author... })` with
+  `read`/`readText`/`readMany`/`write`/`writeText`/`fetch`/`pull`/`push`/`sync`/`version`.
+  Reads auto-materialize missing blobs via `want=<blob-oid>` (byte-equal to a
+  full fetch, verified live against GitHub); unknown paths return `null` with
+  zero RTT. Writes carry author/committer/time/timezone (constructor defaults +
+  per-call override). Covered by `tests/test_remote.mjs`.
+- **Release ships single-file JS** (pinned esbuild in CI, no repo deps):
+  `zig_wasm_git.portable.mjs` (`--platform=neutral`, browser/Worker/Node) and
+  `zig_wasm_git.node.mjs` (`--platform=node`); CI smoke-tests bundle/source
+  commit-sha parity, and `neutral` doubles as a portability guard.
+
 ### Fixed
 
 - **Default commit time is now wall-clock**: `portable.mjs` `commit()` without

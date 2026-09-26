@@ -4,30 +4,35 @@
 
 git engine without `fs` nor `git` command. WASM+JS that speaks directly to any git http. Inspired by [Cloudflare Artifacts](https://blog.cloudflare.com/artifacts-git-for-agents-beta/):
 
-> The entire git protocol engine is written in pure Zig (no libc), compiled to a ~100KB WASM binary ... It implements SHA-1, zlib inflate/deflate, delta encoding/decoding, pack parsing, and the full git smart HTTP protocol — all from scratch, with zero external dependencies.
+> The entire git protocol engine is written in pure Zig (no libc), compiled to a ~69KB WASM binary ... It implements SHA-1, zlib inflate/deflate, delta encoding/decoding, pack parsing, and the full git smart HTTP protocol — all from scratch, with zero external dependencies.
 
 This repo is a minimal reproduction focused on read/write remote blobs over git http.
 
 Project Goal: **use git remote as a versioned blob store, not a dev workspace.**   
 One branch == one keyspace (`path -> bytes`), one commit == one version.   
-There is no workdir, no merge, no checkout — just `read` / `write` / `pull` / `publish`.   
+There is no workdir, no merge, no checkout — just `read` / `write` / `fetch` / `push`.   
 
-## Download 
+## Download
 
-Grab the prebuilt wasm from the latest release — no toolchain needed:
+Grab the prebuilt artifacts from the latest release — no toolchain needed:
 
 ```bash
 curl -LO https://github.com/est/zig-wasm-git/releases/latest/download/zig_wasm_git.wasm
+curl -LO https://github.com/est/zig-wasm-git/releases/latest/download/zig_wasm_git.portable.mjs
 ```
 
-Each release ships a fixed-name `zig_wasm_git.wasm` + `.sha256`, built by CI from the tagged commit (pin a version via the per-tag download path).
+Each release ships fixed-name files + `SHA256SUMS`, built by CI from the tagged commit (pin a version via the per-tag download path):
+
+- `zig_wasm_git.wasm` — the protocol engine (~69KB)
+- `zig_wasm_git.portable.mjs` — single-file JS for browser/CF Worker/Node (`RemoteGit`, `loadFromBytes`, blob service)
+- `zig_wasm_git.node.mjs` — single-file JS for Node (`load`, fileStore, Buffer flavors)
 
 ## Features
 
 - **~69KB** `wasm32-freestanding ReleaseSmall`, no libc, imports only `env.host_*`
 - Division of labor: **protocol weight lifting in wasm** (pkt-line, smart HTTP v1/v2 framing, pack framing/parsing, delta apply, single-pass inflate with exact `consumed`), **IO + platform ABIs in JS** (`fetch`, `CompressionStream`/`DecompressionStream`, `crypto.subtle`, pluggable store)
 - Object-level API: read blobs by path / write commits from `{path: content}` maps / fetch+push over smart HTTP
-- Blob-service facade (in `portable.mjs`): `read`/`readText`/`readMany`/`write`/`writeText`/`pull`/`publish`/`sync` over one branch-keyspace; missing key is `null`, each write is a version, push is fast-forward-only
+- `RemoteGit` facade (in `portable.mjs`, recommended): url-bound, `read`/`readText`/`readMany`/`write`/`writeText`/`fetch`/`push`/`sync` over one branch-keyspace; missing blobs auto-fetched on demand (`want=<blob-oid>`); missing key is `null`, each write is a version (author/time options), push is fast-forward-only
 - SHA-1 / zlib / pack v2 (incl. ofs/ref delta) / pkt-line / smart HTTP (`v1` + `v2 ls-refs/fetch=filter` + receive-pack + upload-pack clients)
 - Partial clone filters: `blob:none`, `blob:limit`, `tree:0`, `object:type`, `combine:+`
 - **No FS, no CLI on the client**: `src/host/{portable,sync,utils}.mjs` run in browsers/CF Workers (zero `node:` imports); Node adds `src/host/api.mjs` (file store + Buffer flavors)
@@ -89,7 +94,7 @@ underlying `want` / `have` negotiation, `delta` handling, and filters actually d
 | Single-file download | structure fetch (`blob:none`) + `want=<blob-oid>` promisor roundtrip | Supported via `RemoteGit.read/readMany` (unknown paths cost zero RTT; needs `uploadpack.allowTipSHA1InWant` on self-hosted servers, GitHub OK) |
 | Shallow history | `shallow` / `deepen` / `deepen-since` / `deepen-not` | **Not supported** (client never sends `deepen`) |
 | Delete a key | tree-entry removal in `wasm_commit` | **Not supported** — `write` only upserts; full history retained |
-| Concurrent writers | merge / conflict resolution | **None** — last-writer-wins; `publish` rejects non-fast-forward, caller re-pulls and rewrites |
+| Concurrent writers | merge / conflict resolution | **None** — last-writer-wins; `push` rejects non-fast-forward, caller re-pulls and rewrites |
 | Single huge blob | wasm 4MB arena per call, whole-pack `arrayBuffer` in JS | No chunked storage; blobs approaching MBs may hit `wasm_alloc` / Worker memory limits |
 | Tags / notes / LFS / submodules | `tag` objects traversable; `gitlink` entries skipped on push; no LFS/notes protocol | Tags readable by oid; LFS/notes unsupported |
 | Platform ABIs | `fetch`, `CompressionStream`/`DecompressionStream`, `crypto.subtle`, `TextEncoder/Decoder` | Required in browser/Worker (no polyfill bundled) |
@@ -151,15 +156,15 @@ SemVer. To cut a release:
 2. Add a section to `CHANGELOG.md`
 3. `git tag vX.Y.Z && git push origin main vX.Y.Z`
 
-CI runs the full test suite on every push/PR. Tagging triggers the release workflow: build → test → publish `zig_wasm_git-vX.Y.Z.wasm` (+sha256) to GitHub Releases.
+CI runs the full test suite on every push/PR. Tagging triggers the release workflow: build → bundle JS (pinned esbuild, no repo deps) → test → publish `zig_wasm_git.wasm` + `zig_wasm_git.portable.mjs` + `zig_wasm_git.node.mjs` (+`SHA256SUMS`) to GitHub Releases.
 
 ## Known limits (see capability boundary above for the full `want`/`have`/`delta` account)
 
 - `write` upserts only — no key deletion yet
-- No merge: concurrent `publish` to the same tip rejects; re-pull and rewrite
+- No merge: concurrent `push` to the same tip rejects; re-pull and rewrite
 - Fetch sends no `have` lines (v2 `want`-only); incremental bandwidth relies on server-side `delta` + cached-tip short-circuit
 - Push sends full objects, no `delta` encode (server re-deltifies on `gc`)
-- `blob:limit` checkout's promisor fetch is best-effort (`--no-checkout` in e2e); omitted blobs read as `null`
+- `blob:limit` checkout omits big blobs; `RemoteGit.read` fetches them on demand, lower-level `repo.get` reports `NotFound`
 - No `shallow`/`deepen`/`notes`/`LFS`, no chunked storage (4MB wasm arena per call)
 - Test-only server (`tests/server.mjs`) shells out to `git`; the client chain never does
 
