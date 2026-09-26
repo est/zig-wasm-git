@@ -1,4 +1,4 @@
-// zig-wasm-git Node API: thin adapter over the portable repo (browser.mjs).
+// zig-wasm-git Node API: thin adapter over the portable repo (portable.mjs).
 //
 // Single source of truth for get/commit/fetch/push lives in the portable
 // chain (same code as browsers/CF Workers). This file only adds what Node
@@ -16,7 +16,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import zlib from "node:zlib";
 import { join, dirname } from "node:path";
-import { loadFromBytes, memoryStore as portableMemoryStore, createBlobService } from "./browser.mjs";
+import { loadFromBytes, memoryStore as portableMemoryStore, createBlobService } from "./portable.mjs";
 
 export { createBlobService };
 export const memoryStore = portableMemoryStore;

@@ -14,16 +14,16 @@ const SERVER_REPO = join(ROOT, "data/blobtest.git");
 rmSync(SERVER_REPO, { recursive: true, force: true });
 
 // Portable assertion: blob facade must stay worker-safe like the rest.
-for (const f of ["store.mjs", "wire.mjs", "fetch.mjs", "browser.mjs", "codec.mjs", "push.mjs", "blob.mjs"]) {
+for (const f of ["store.mjs", "wire.mjs", "fetch.mjs", "portable.mjs", "codec.mjs", "push.mjs", "blob.mjs"]) {
   const src = readFileSync(join(ROOT, "src/host", f), "utf8");
   if (/from\s+["']node:/.test(src) || /require\s*\(/.test(src)) throw new Error(`${f} must stay portable (no node: imports)`);
   if (/child_process|execFile|readFileSync|writeFileSync/.test(src)) throw new Error(`${f} must not touch fs/child_process`);
 }
 console.log("[ok] blob chain portable (no node:/fs/child_process imports)");
 
-const browser = await import("../src/host/browser.mjs");
+const browser = await import("../src/host/portable.mjs");
 const { loadFromBytes, memoryStore } = browser;
-if (typeof browser.createBlobService !== "function") throw new Error("browser.mjs must re-export createBlobService");
+if (typeof browser.createBlobService !== "function") throw new Error("portable.mjs must re-export createBlobService");
 const { createBlobService } = browser;
 
 // ── 1. local blob lifecycle (no network) ──

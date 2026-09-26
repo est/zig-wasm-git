@@ -5,7 +5,7 @@
 //
 // Store interface: { get(hex)->Uint8Array|null, put(hex,loose), getRef, putRef }.
 // Loose bytes stored are zlib("type len\0body") — same layout as git loose objects,
-// so get()/commit() in browser.mjs / api.mjs read them back directly.
+// so get()/commit() in portable.mjs / api.mjs read them back directly.
 //
 // Only platform ABIs used: fetch, CompressionStream, crypto.subtle, TextEncoder/Decoder.
 

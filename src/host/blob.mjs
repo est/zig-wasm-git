@@ -8,7 +8,7 @@
 //   pull(url) / publish(url)          // network sync; no workdir, no merge
 //
 // Git internals (refs/sha1/trees/packs) stay underneath: `repo` from
-// browser.mjs (portable) or api.mjs (Node) is the only dependency.
+// portable.mjs (all runtimes) or api.mjs (Node) is the only dependency.
 // Zero `node:` imports — same file runs in browsers / CF Workers.
 //
 // Keyspace model: one branch == one keyspace (default refs/heads/main).

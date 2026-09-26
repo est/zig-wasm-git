@@ -30,7 +30,7 @@ Each release ships a fixed-name `zig_wasm_git.wasm` + `.sha256`, built by CI fro
 - Blob-service facade (`src/host/blob.mjs`): `read`/`readText`/`readMany`/`write`/`writeText`/`pull`/`publish`/`sync` over one branch-keyspace; missing key is `null`, each write is a version, push is fast-forward-only
 - SHA-1 / zlib / pack v2 (incl. ofs/ref delta) / pkt-line / smart HTTP (`v1` + `v2 ls-refs/fetch=filter` + receive-pack + upload-pack clients)
 - Partial clone filters: `blob:none`, `blob:limit`, `tree:0`, `object:type`, `combine:+`
-- **No FS, no CLI on the client**: `src/host/{store,wire,fetch,browser,codec,push,blob}.mjs` run in browsers/CF Workers (zero `node:` imports)
+- **No FS, no CLI on the client**: `src/host/{store,wire,fetch,portable,codec,push,blob}.mjs` run in browsers/CF Workers (zero `node:` imports)
 
 ## Blob-service API (recommended)
 
@@ -39,7 +39,7 @@ appends a version (a commit) on the current tip; `publish` moves the remote tip
 and rejects on non-fast-forward (last-writer-wins, no merge).
 
 ```js
-import { loadFromBytes, memoryStore, createBlobService } from "./src/host/browser.mjs";
+import { loadFromBytes, memoryStore, createBlobService } from "./src/host/portable.mjs";
 
 const wasmBytes = new Uint8Array(await (await fetch("zig_wasm_git.wasm")).arrayBuffer());
 const blobs = createBlobService(
@@ -65,7 +65,7 @@ partial.version(); // sha present; partial.read(path) -> null until full pull
 ## Browser / Workers
 
 ```js
-import { loadFromBytes, memoryStore } from "./src/host/browser.mjs";
+import { loadFromBytes, memoryStore } from "./src/host/portable.mjs";
 
 const wasmBytes = new Uint8Array(await (await fetch("zig_wasm_git.wasm")).arrayBuffer());
 const repo = loadFromBytes(wasmBytes, { store: memoryStore() });
@@ -136,7 +136,7 @@ Protocol framing/parsing: `wasm_handle_discovery`, `wasm_parse_filter`, `wasm_sh
 `wasm_pktline_encode`, `wasm_build_lsrefs`, `wasm_build_fetch`, `wasm_decode_pack_header`,
 `wasm_list_refs`/`wasm_find_ref`, `wasm_pack_begin|add|end`, `wasm_parse_report_status`,
 `wasm_inflate_one`, `wasm_delta_apply`, plus `wasm_get`/`wasm_commit[2]` and `wasm_alloc/reset`.
-See `src/host/server.mjs` for a working server and `src/host/browser.mjs` for the portable client.
+See `src/host/server.mjs` for a working server and `src/host/portable.mjs` for the portable client (`src/host/browser.mjs` remains as a deprecated re-export shim).
 
 ## Build & test
 

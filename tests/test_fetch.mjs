@@ -15,7 +15,7 @@ const SERVER_REPO = join(ROOT, "data/fetchtest.git");
 rmSync(SERVER_REPO, { recursive: true, force: true });
 
 // ── 0. 可移植断言:客户端链路零 node: 导入 ──
-for (const f of ["store.mjs", "wire.mjs", "fetch.mjs", "browser.mjs", "codec.mjs", "push.mjs", "blob.mjs"]) {
+for (const f of ["store.mjs", "wire.mjs", "fetch.mjs", "portable.mjs", "codec.mjs", "push.mjs", "blob.mjs"]) {
   const src = readFileSync(join(ROOT, "src/host", f), "utf8");
   if (/from\s+["']node:/.test(src) || /require\s*\(/.test(src)) throw new Error(`${f} must stay portable (no node: imports)`);
   if (/child_process|execFile|readFileSync|writeFileSync/.test(src)) throw new Error(`${f} must not touch fs/child_process`);
@@ -164,23 +164,23 @@ try {
   const hist4 = dst3.log("main", 5);
   if (hist4.length !== 2) throw new Error("partial fetch should keep commits");
 
-  // ── 6. browser 入口冒烟 (可移植 loadFromBytes:同 wasm 字节,同协议,无 node: 依赖) ──
+  // ── 6. portable 入口冒烟 (可移植 loadFromBytes:同 wasm 字节,同协议,无 node: 依赖) ──
   {
-    const { loadFromBytes, memoryStore: memStore } = await import("../src/host/browser.mjs");
+    const { loadFromBytes, memoryStore: memStore } = await import("../src/host/portable.mjs");
     const bro = loadFromBytes(readFileSync(WASM), { store: memStore() });
     const bfr = await bro.fetch(BASE, "main");
     const bgot = bro.get("main", ["README.md", "src/app.js"]);
     if (bgot[0].content == null || new TextDecoder().decode(bgot[0].content) !== "hello fetch\n") {
-      throw new Error("browser entry get() mismatch");
+      throw new Error("portable entry get() mismatch");
     }
     if (new TextDecoder().decode(bgot[1].content) !== "console.log(1)\n") throw new Error("browser entry app.js mismatch");
     const bc = bro.commit("main", "from browser", { "browser.txt": "hi worker\n" }, "refs/heads/browser-entry");
-    if (!/^[0-9a-f]{40}$/.test(bc)) throw new Error("browser commit failed");
+    if (!/^[0-9a-f]{40}$/.test(bc)) throw new Error("portable commit failed");
     const bpr = await bro.push(BASE, "refs/heads/browser-entry");
-    if (!bpr.updated) throw new Error("browser push failed");
+    if (!bpr.updated) throw new Error("portable push failed");
     const check = execFileSync("git", ["--git-dir", SERVER_REPO, "cat-file", "-p", `${bpr.new}:browser.txt`]).toString();
-    if (check !== "hi worker\n") throw new Error("browser push content mismatch");
-    console.log(`[ok] browser entry fetch/get/commit/push (${bfr.objects} objs, push ${bpr.objects} objs)`);
+    if (check !== "hi worker\n") throw new Error("portable push content mismatch");
+    console.log(`[ok] portable entry fetch/get/commit/push (${bfr.objects} objs, push ${bpr.objects} objs)`);
   }
 
   console.log("ALL FETCH TESTS PASSED");

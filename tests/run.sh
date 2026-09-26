@@ -24,4 +24,6 @@ echo "== memory store / author options =="
 node tests/test_memory_store.mjs
 echo "== blob-service facade e2e =="
 node tests/test_blob.mjs
+echo "== portable helpers (toModule/withBasicAuth) =="
+node tests/test_codec_auth.mjs
 echo "== ALL TESTS PASSED =="

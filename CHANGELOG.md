@@ -5,10 +5,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 
 ## [Unreleased]
 
+### Fixed
+
+- **Default commit time is now wall-clock**: `portable.mjs` `commit()` without
+  `options.time` used to send `""`, which `wasm_commit2` mapped to `0`
+  (`1970-01-01`). It now defaults to `Math.floor(Date.now() / 1000)` (portable
+  across browsers/workers/node); pass `options.time` explicitly for
+  deterministic hashes in tests. `tests/test_memory_store.mjs` interop case
+  pinned to a fixed time for this reason; `test_codec_auth.mjs` asserts the
+  new default lands near `Date.now()`.
+
+### Changed
+
+- **Rename `browser.mjs` → `portable.mjs`**: the old name suggested
+  browser-only, but the entry runs in browsers, Cloudflare Workers, and Node.
+  `src/host/browser.mjs` remains as a deprecated re-export shim, so existing
+  imports keep working; new code should use `./portable.mjs`. Internal
+  imports, README, and portable-assertion lists updated accordingly.
+
 ### Added
 
+- **Portable runtime helpers**: `codec.mjs` gains `withBasicAuth(fetchImpl)`
+  (URL `user:pass@host` → `Authorization: Basic` header + stripped URL, for
+  runtimes like workerd that drop URL userinfo; re-exported from `portable.mjs`);
+  `wire.mjs` gains `toModule()` accepting wasm bytes or a precompiled
+  `WebAssembly.Module`, used by `bootWasm` and `portable.mjs`, so
+  wrangler-`CompiledWasm` callers can pass the Module straight into
+  `loadFromBytes`. Covered by `tests/test_codec_auth.mjs`.
+
 - **Blob-service facade** (`src/host/blob.mjs`, portable, re-exported from
-  `browser.mjs`/`api.mjs`): `createBlobService(repo, {ref, filter})` ->
+  `portable.mjs`/`api.mjs`): `createBlobService(repo, {ref, filter})` ->
   `read`/`readText`/`readMany`/`write`/`writeText`/`pull`/`publish`/`sync`/`version`.
   One branch == one keyspace, missing key is `null`, each write is a version,
   publish is fast-forward-only (last-writer-wins, no merge). `sync(url, paths)`

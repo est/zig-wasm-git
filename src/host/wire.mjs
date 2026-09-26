@@ -2,15 +2,27 @@
 // Binds the git-protocol weight-lifting exports to JS callables over any
 // WebAssembly.Instance with the 3 storage-free imports used by fetch paths.
 // Object-store paths (get/commit) attach host_get/put_object separately
-// (see browser.mjs / api.mjs); the helpers below only need host_emit_bytes.
+// (see portable.mjs / api.mjs); the helpers below only need host_emit_bytes.
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-export function bootWasm(wasmBytes, extraEnv = {}) {
+/// Accept wasm bytes or a precompiled WebAssembly.Module and return a Module.
+/// Runtimes that forbid runtime codegen (e.g. Cloudflare workerd, where
+/// `new WebAssembly.Module(bytes)` throws "Wasm code generation disallowed
+/// by embedder") precompile at upload time (wrangler `CompiledWasm` rule)
+/// and pass the Module straight in; Node/browsers keep passing bytes.
+export function toModule(wasmBytesOrModule) {
+  if (typeof WebAssembly.Module === "function" && wasmBytesOrModule instanceof WebAssembly.Module) {
+    return wasmBytesOrModule;
+  }
+  return new WebAssembly.Module(wasmBytesOrModule);
+}
+
+export function bootWasm(wasmBytesOrModule, extraEnv = {}) {
   const emitChunks = [];
   let inst;
-  const mod = new WebAssembly.Module(wasmBytes);
+  const mod = toModule(wasmBytesOrModule);
   inst = new WebAssembly.Instance(mod, {
     env: {
       host_emit_bytes(ptr, len) {

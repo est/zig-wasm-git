@@ -84,14 +84,17 @@ const WASM = join(ROOT, "zig-out/bin/zig_wasm_git.wasm");
 
 // ── 5. interop: commits written via memoryStore readable by wasm from disk store too ──
 {
-  // write same content in both stores -> identical oids (content-addressed)
+  // write same content in both stores -> identical oids (content-addressed).
+  // NOTE: explicit time keeps the hash deterministic; omitting time defaults
+  // to Date.now() (wall-clock), which would flake this equality check.
   const memRepo = load(WASM, { store: memoryStore() });
   const fsDir = join(ROOT, "tmp/api_repo/interop.git");
   try { rmSync(fsDir, { recursive: true, force: true }); } catch {}
   const fsRepo = load(WASM, { dir: fsDir });
   const payload = { "inter.txt": "same-bytes" };
-  const m = memRepo.commit("", "interop", payload);
-  const d = fsRepo.commit("", "interop", payload);
+  const fixedOpts = { time: 1755859200, timezone: "+0000" };
+  const m = memRepo.commit("", "interop", payload, "refs/heads/main", fixedOpts);
+  const d = fsRepo.commit("", "interop", payload, "refs/heads/main", fixedOpts);
   assert.equal(m, d, "content addressing must match across stores");
   console.log(`[ok] cross-store oid equality (${m.slice(0, 7)})`);
 }

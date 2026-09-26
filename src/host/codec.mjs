@@ -4,6 +4,7 @@
 // 可移植:只用 Uint8Array + TextEncoder/Decoder,无 node: 导入 (Buffer 是 Uint8Array 子类,
 // Node 调用方照常工作;需要 hex/utf8 字符串处显式编解码,不依赖 Buffer.toString)。
 const _dec = new TextDecoder();
+const _enc = new TextEncoder();
 
 export function hexOfBytes(b) {
   let s = "";
@@ -12,6 +13,39 @@ export function hexOfBytes(b) {
 }
 
 export const joinUrl = (base, path) => base.replace(/\/+$/, "") + path;
+
+/// Wrap a fetch impl so URLs carrying `user:pass@host` credentials are sent
+/// as an `Authorization: Basic` header with the credentials stripped from
+/// the URL. Some runtimes (notably Cloudflare workerd) drop URL userinfo
+/// instead of applying it, so the same URL that works with curl gets a 401
+/// from in-worker discovery; stripping also keeps tokens out of downstream
+/// logs/proxies. URLs without userinfo (and pre-set Authorization headers)
+/// pass through untouched. String-URL call sites (fetch/push/lsRemote).
+export function withBasicAuth(fetchImpl) {
+  return async (url, init) => {
+    const raw = typeof url === "string" ? url : url?.url ?? String(url);
+    let u;
+    try {
+      u = new URL(raw);
+    } catch {
+      return fetchImpl(url, init);
+    }
+    if (!u.username && !u.password) return fetchImpl(url, init);
+    const creds = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
+    const bytes = _enc.encode(creds);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    const basic = btoa(bin);
+    const fromReq = typeof url === "object" && url !== null ? url.headers : undefined;
+    const headers = new Headers(fromReq ?? init?.headers);
+    if (!headers.has("authorization")) headers.set("authorization", `Basic ${basic}`);
+    u.username = "";
+    u.password = "";
+    return fetchImpl(u.toString(), { ...init, headers });
+  };
+}
 
 function needCS() {
   if (typeof CompressionStream === "undefined" || typeof DecompressionStream === "undefined") {
