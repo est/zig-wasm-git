@@ -77,11 +77,6 @@ export function load(wasmPath, opts = {}) {
       return inner.fetch(url, ref, opts);
     },
 
-    /** clone 别名:fetch + 落 ref(语义同 fetch,setRef 默认 true) */
-    clone(url, ref = "main", opts = {}) {
-      return inner.fetch(url, ref, opts);
-    },
-
     lsRemote(url, opts = {}) {
       return inner.lsRemote(url, opts);
     },

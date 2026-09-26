@@ -1,6 +1,6 @@
 // src/host/portable.mjs — portable repo for Browser / CF Workers / Node (no fs, no CLI).
-// Zero node: imports. Only: WebAssembly, fetch, CompressionStream/
-// DecompressionStream, crypto.subtle, TextEncoder/Decoder.
+// Zero node: imports. Requires WebAssembly, fetch, CompressionStream,
+// crypto.subtle, TextEncoder/Decoder (Node 18+/Workers/modern browsers).
 //
 //   import { loadFromBytes, memoryStore } from "./portable.mjs";
 //   const repo = loadFromBytes(wasmBytes, { store: memoryStore() });
@@ -14,7 +14,6 @@
 // remote sync (fetch/push) in sync.mjs; blob facade below in this file.
 
 import { memoryStore, bootWasm, toModule, deflateZlib, joinUrl, withBasicAuth } from "./utils.mjs";
-import * as wire from "./utils.mjs";
 import {
   fetchIntoStore, lsRemote,
   collectObjects, TYPE_NUM, ZERO_OID, decodeRefsTlv, decodeStatusTlv,
@@ -280,9 +279,6 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
     },
 
     resolveRef,
-    _wasm: wasm,
-    _wire: wire,
-    _takeEmit: takeEmit,
 
     async pushPack(objects) {
       wasm.wasm_reset();

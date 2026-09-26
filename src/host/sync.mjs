@@ -1,11 +1,10 @@
 // src/host/sync.mjs — remote sync clients (JS side: IO + enumeration; wire protocol in wasm).
-// Zero node: imports. Only: fetch, CompressionStream/DecompressionStream,
-// crypto.subtle, TextEncoder/Decoder. Sections:
+// Zero node: imports. Requires fetch, CompressionStream, crypto.subtle
+// (present in Node 18+/Workers/modern browsers; no runtime checks).
+// Sections:
 //   fetch: upload-pack v2 (discovery -> ls-refs -> fetch/sideband demux ->
 //          unpack/delta resolve -> store), plus lsRemote
 //   push:  receive-pack (discovery -> collect -> pack -> ref-update -> status)
-// Flow: GET info/refs?service=git-receive-pack -> wasm_find_ref -> JS collect ->
-// CS deflate -> wasm pack session -> wasm ref-update -> POST -> wasm status parse.
 
 import {
   buildLsRefsReq, buildFetchReq, listRefs, decodePackHeaderJS, inflateOne, deltaApply,
@@ -21,13 +20,7 @@ const _utf8 = (b) => dec.decode(b instanceof Uint8Array ? b : new Uint8Array(b))
 
 // ── fetch ──
 
-export const TYPE_NAME = { 1: "commit", 2: "tree", 3: "blob", 4: "tag", 6: "ofs_delta", 7: "ref_delta" };
-
-function needPlatform(fetchImpl, subtle) {
-  if (!fetchImpl) throw new Error("fetch unavailable on this platform (pass fetchImpl)");
-  if (!subtle) throw new Error("crypto.subtle unavailable on this platform");
-  if (typeof CompressionStream === "undefined") throw new Error("CompressionStream unavailable on this platform");
-}
+const TYPE_NAME = { 1: "commit", 2: "tree", 3: "blob", 4: "tag", 6: "ofs_delta", 7: "ref_delta" };
 
 function looseBytes(type, body) {
   const head = enc.encode(`${type} ${body.length}\0`);
@@ -40,25 +33,6 @@ function looseBytes(type, body) {
 async function sha1Hex(subtle, bytes) {
   const d = await subtle.digest("SHA-1", bytes);
   return hexOfBytes(new Uint8Array(d));
-}
-
-/// Split a pkt-line stream into payloads. Returns {lines:[Uint8Array], flushSeen}.
-/// Tolerates flush (0000), delim (0001), response-end (0002).
-export function splitPktLines(body) {
-  const lines = [];
-  let pos = 0;
-  while (pos + 4 <= body.length) {
-    const tag = dec.decode(body.subarray(pos, pos + 4));
-    if (tag === "0000" || tag === "0001" || tag === "0002") {
-      pos += 4;
-      continue;
-    }
-    const len = parseInt(tag, 16);
-    if (!Number.isFinite(len) || len < 4 || pos + len > body.length) throw new Error("bad pkt-line length");
-    lines.push(body.subarray(pos + 4, pos + len));
-    pos += len;
-  }
-  return lines;
 }
 
 /// Demux a v2 fetch response (sideband-64k) into {pack, shallow, progress}.
@@ -259,7 +233,6 @@ export async function verifyPackTrailer(subtle, pack) {
 export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
   const subtle = opts.subtle ?? globalThis.crypto?.subtle;
-  needPlatform(fetchImpl, subtle);
   const filter = opts.filter ?? "";
   const headers = { "Git-Protocol": "version=2" };
 

@@ -1,6 +1,13 @@
 // src/host/utils.mjs — portable helpers shared by the repo entry and sync clients.
 // Zero node: imports. Only: WebAssembly, CompressionStream/DecompressionStream,
-// TextEncoder/Decoder, URL/Headers/btoa. Sections:
+// TextEncoder/Decoder, URL/Headers/btoa.
+//
+// Requires (no runtime checks — callers target Node 18+/CF Workers/modern
+// browsers where these are built in; missing pieces fail naturally at the
+// call site): WebAssembly, CompressionStream/DecompressionStream,
+// crypto.subtle (sync clients), fetch (sync clients).
+//
+// Sections:
 //   store: in-memory object store (same interface as the Node fileStore)
 //   codec: hex/url/auth, zlib, loose/tree/commit parsing
 //   wire:  wasm boot + git-protocol call wrappers (source of truth for pkt shapes)
@@ -55,14 +62,14 @@ export const joinUrl = (base, path) => base.replace(/\/+$/, "") + path;
 /// the URL. Some runtimes (notably Cloudflare workerd) drop URL userinfo
 /// instead of applying it, so the same URL that works with curl gets a 401
 /// from in-worker discovery; stripping also keeps tokens out of downstream
-/// logs/proxies. URLs without userinfo (and pre-set Authorization headers)
-/// pass through untouched. String-URL call sites (fetch/push/lsRemote).
+/// logs/proxies. URLs without userinfo pass through untouched, and anything
+/// that isn't an absolute URL (e.g. a relative path) delegates as-is.
+/// String URLs in, string URLs out (pre-set Authorization wins).
 export function withBasicAuth(fetchImpl) {
   return async (url, init) => {
-    const raw = typeof url === "string" ? url : url?.url ?? String(url);
     let u;
     try {
-      u = new URL(raw);
+      u = new URL(url);
     } catch {
       return fetchImpl(url, init);
     }
@@ -73,23 +80,15 @@ export function withBasicAuth(fetchImpl) {
     for (let i = 0; i < bytes.length; i += 0x8000) {
       bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
     }
-    const basic = btoa(bin);
-    const fromReq = typeof url === "object" && url !== null ? url.headers : undefined;
-    const headers = new Headers(fromReq ?? init?.headers);
-    if (!headers.has("authorization")) headers.set("authorization", `Basic ${basic}`);
+    const headers = new Headers(init?.headers);
+    if (!headers.has("authorization")) headers.set("authorization", `Basic ${btoa(bin)}`);
     u.username = "";
     u.password = "";
     return fetchImpl(u.toString(), { ...init, headers });
   };
 }
 
-function needCS() {
-  if (typeof CompressionStream === "undefined" || typeof DecompressionStream === "undefined") {
-    throw new Error("CompressionStream/DecompressionStream unavailable on this platform");
-  }
-}
-
-export async function streamAll(stream, input) {
+async function streamAll(stream, input) {
   const w = stream.writable.getWriter();
   await w.write(input);
   await w.close();
@@ -110,12 +109,10 @@ export async function streamAll(stream, input) {
 
 /// pack 对象 payload:zlib(body)。直出,无需手工包头/adler。
 export async function deflateZlib(body) {
-  needCS();
   return streamAll(new CompressionStream("deflate"), body);
 }
 
 export async function inflateZlib(zlibBytes) {
-  needCS();
   return streamAll(new DecompressionStream("deflate"), zlibBytes);
 }
 
@@ -178,7 +175,7 @@ export function toModule(wasmBytesOrModule) {
   return new WebAssembly.Module(wasmBytesOrModule);
 }
 
-export function bootWasm(wasmBytesOrModule, extraEnv = {}) {
+export function bootWasm(wasmBytesOrModule) {
   const emitChunks = [];
   let inst;
   const mod = toModule(wasmBytesOrModule);
@@ -194,7 +191,6 @@ export function bootWasm(wasmBytesOrModule, extraEnv = {}) {
       host_put_object() {
         return -1;
       },
-      ...extraEnv,
     },
   });
   const wasm = inst.exports;

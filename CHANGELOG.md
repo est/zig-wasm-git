@@ -26,6 +26,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
   dropped the unused `joinUrl` import in push. Public API unchanged
   (`loadFromBytes`/`memoryStore`/`createBlobService`/`withBasicAuth` from
   `portable.mjs`; `load`/`fileStore` from `api.mjs`).
+- **Assume modern runtimes, cut defensive code**: callers target Node 18+/CF
+  Workers/modern browsers, so runtime capability probes are gone
+  (`needPlatform`/`needCS` → `Requires` header comments; missing pieces fail
+  naturally at the call site). Also cut: unused `splitPktLines`, `bootWasm`
+  `extraEnv`, repo debug fields (`_wasm`/`_wire`/`_takeEmit`), `api.clone()`
+  alias (same as `fetch`), `withBasicAuth` Request-object branch (string URLs
+  in/out); unexported `streamAll`/`TYPE_NAME`.
 
 ### Added
 
