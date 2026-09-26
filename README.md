@@ -4,12 +4,12 @@
 
 git engine without `fs` nor `git` command. WASM+JS that speaks directly to any git http. Inspired by [Cloudflare Artifacts](https://blog.cloudflare.com/artifacts-git-for-agents-beta/):
 
-> The entire git protocol engine is written in pure Zig (no libc), compiled to a ~69KB WASM binary ... It implements SHA-1, zlib inflate/deflate, delta encoding/decoding, pack parsing, and the full git smart HTTP protocol — all from scratch, with zero external dependencies.
+> The entire git protocol engine is written in pure Zig (no libc), compiled to a ~100KB WASM binary ... It implements SHA-1, zlib inflate/deflate, delta encoding/decoding, pack parsing, and the full git smart HTTP protocol — all from scratch, with zero external dependencies.
 
-This repo is a minimal reproduction focused on read/write remote blobs over git http.
-
-Project Goal: **use git remote as a versioned blob store, not a dev workspace.**   
+This repo is a minimal reproduction focused on **read/write a git remote as a versioned blob store, not a dev workspace.**
+   
 One branch == one keyspace (`path -> bytes`), one commit == one version.   
+
 There is no workdir, no merge, no checkout — just `read` / `write` / `fetch` / `push`.   
 
 ## Download
@@ -82,17 +82,6 @@ await git.putMany({ "a.txt": "v2" }, "cas write", { parent: tip });
 
 Instantiation is async (`WebAssembly.instantiate`, off-thread compile).
 
-## Stores
-
-Default is `memoryStore()` (zero FS — Workers/KV backends). Any backend works
-via `{ get(hex){}, put(hex,loose){}, getRef(n){}, putRef(n,s){}, heads(){} }`
-(e.g. SQLite/S3/R2/D1 adapters); point `open(url, { store })` at it:
-
-```js
-await git.putMany({ "src/new.zig": "..." }, "v2",
-  { author: "Alice <a@ex.com>", committer: "CI <ci@ex.com>", time: 1755859200, timezone: "+0800" });
-await git.push();
-```
 
 ## Capability boundary (blob view <-> git terms, kept precise)
 
