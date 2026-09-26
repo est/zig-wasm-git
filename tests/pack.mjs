@@ -1,4 +1,4 @@
-// src/host/pack.mjs — pack v2 组装/解析 (JS 侧,非 delta)
+// tests/pack.mjs — pack v2 组装/解析 (JS 侧,非 delta,测试参考实现)
 // 格式(已用真 git 对照验证):
 //   "PACK" + u32BE(2) + u32BE(n) + per obj[varint(type,size=body.len) + zlib(body)] + sha1(trailer)
 // 注意:payload 是 zlib(body only),不含 "type len\0" 头;size 也是 body.len。

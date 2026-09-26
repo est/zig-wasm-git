@@ -17,24 +17,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 
 ### Changed
 
-- **Rename `browser.mjs` → `portable.mjs`**: the old name suggested
-  browser-only, but the entry runs in browsers, Cloudflare Workers, and Node.
-  `src/host/browser.mjs` remains as a deprecated re-export shim, so existing
-  imports keep working; new code should use `./portable.mjs`. Internal
-  imports, README, and portable-assertion lists updated accordingly.
+- **Host JS consolidation** (`src/host/` 11 files → 4, no back-compat kept):
+  `store`+`codec`+`wire` → `utils.mjs`, `fetch`+`push` → `sync.mjs`,
+  `blob` facade inlined into `portable.mjs`; `api.mjs` stays as the Node-only
+  adapter. Test-only `server.mjs`/`pack.mjs` moved to `tests/`, so `src`
+  holds shipped code only. Also deduped along the way: single `inflateZlib`,
+  single loose-body parser (`looseBody`), single deflate path (`deflateZlib`);
+  dropped the unused `joinUrl` import in push. Public API unchanged
+  (`loadFromBytes`/`memoryStore`/`createBlobService`/`withBasicAuth` from
+  `portable.mjs`; `load`/`fileStore` from `api.mjs`).
 
 ### Added
 
-- **Portable runtime helpers**: `codec.mjs` gains `withBasicAuth(fetchImpl)`
+- **Portable runtime helpers**: `utils.mjs` gains `withBasicAuth(fetchImpl)`
   (URL `user:pass@host` → `Authorization: Basic` header + stripped URL, for
   runtimes like workerd that drop URL userinfo; re-exported from `portable.mjs`);
-  `wire.mjs` gains `toModule()` accepting wasm bytes or a precompiled
+  `utils.mjs` gains `toModule()` accepting wasm bytes or a precompiled
   `WebAssembly.Module`, used by `bootWasm` and `portable.mjs`, so
   wrangler-`CompiledWasm` callers can pass the Module straight into
   `loadFromBytes`. Covered by `tests/test_codec_auth.mjs`.
 
-- **Blob-service facade** (`src/host/blob.mjs`, portable, re-exported from
-  `portable.mjs`/`api.mjs`): `createBlobService(repo, {ref, filter})` ->
+- **Blob-service facade** (in `portable.mjs`, also via `api.mjs`): `createBlobService(repo, {ref, filter})` ->
   `read`/`readText`/`readMany`/`write`/`writeText`/`pull`/`publish`/`sync`/`version`.
   One branch == one keyspace, missing key is `null`, each write is a version,
   publish is fast-forward-only (last-writer-wins, no merge). `sync(url, paths)`
@@ -48,19 +51,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
     `wasm_inflate_one`(单遍拆包,精确 consumed,终结 trial-inflate)/
     `wasm_delta_apply`。体积 63 → ~69KB(预算锁放宽至 72KiB,见 `tests/test_wasm.mjs`)。
   - JS 新增可移植链路 (零 `node:` 导入,断言见 `tests/test_fetch.mjs`):
-    `src/host/store.mjs`(memoryStore) / `wire.mjs`(wasm 调用封装) /
-    `fetch.mjs`(discovery→ls-refs→fetch→sideband 解帧→trailer 校验→unpack:
+    `src/host/utils.mjs`(memoryStore + wasm 调用封装 + 压缩/loose 解析) /
+    `sync.mjs`(discovery→ls-refs→fetch→sideband 解帧→trailer 校验→unpack:
     ofs-delta 位置解析 + ref-delta 两段哈希解析→loose 落盘) /
-    `browser.mjs`(`loadFromBytes`:get/commit/log/fetch/clone/push 全 parity)。
-  - `codec.mjs`/`push.mjs` 从 Buffer 迁到 Uint8Array+TextDecoder (Node 照常兼容),
-    `browser.mjs` 的 push 复用同一 `collectObjects`。
+    `portable.mjs`(`loadFromBytes`:get/commit/log/fetch/clone/push 全 parity)。
+  - `sync.mjs`/`utils.mjs` 用 Uint8Array+TextDecoder (Node 照常兼容),
+    `portable.mjs` 的 push 复用同一 `collectObjects`。
   - `tests/test_fetch.mjs`:全量 fetch→`get()` 读文件;传输中 ofs-delta 内容精确还原;
     `--no-delta-base-offset` 真包 ref-delta 全量逐字节比对;`blob:none` promisor;
-    browser 入口 fetch/get/commit/push 真 git 验收;`git fsck` 交叉验证。
+    portable 入口 fetch/get/commit/push 真 git 验收;`git fsck` 交叉验证。
 - **receive-pack 客户端** (`repo.push(url, ref)`):协议在 wasm、IO/压缩在 JS。
   wasm 新增 `wasm_find_ref`/`wasm_list_refs`/`wasm_build_ref_update`/`wasm_pack_begin|add|end`/
   `wasm_parse_report_status` 导出;对象枚举 + `CompressionStream('deflate')` 压缩 + `fetch`
-  收发在 `src/host/push.mjs`/`codec.mjs`。无 delta(包仍被 git 接受,gc 后服务端自行增量化)。
+  收发在 `src/host/sync.mjs`(push 部分)/`utils.mjs`。无 delta(包仍被 git 接受,gc 后服务端自行增量化)。
   wasm 体积 51,873 → 64,494B(预算锁 64KiB,见 `tests/test_wasm.mjs`)。
 - `tests/test_pack.mjs` / `tests/test_push.mjs`:pack 经 `git index-pack`/`verify-pack` 真验证;
   wasm pack 与 JS 参考实现逐字节 differential 比对;JS 客户端直推本地 host、服务端 `fsck` 验收。
@@ -77,7 +80,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 
 - 服务端 v2 fetch 回退路径此前只在 shallow 时发 `packfile` 段头,非 shallow 的
   filter 包被真 git 以 `expected 'packfile'` 拒绝;现恒发 `packfile` 头
-  (`src/host/server.mjs`),`--filter=blob:none` 真机 clone 已通 (见 `scripts/e2e.sh`)。
+  (`tests/server.mjs`),`--filter=blob:none` 真机 clone 已通 (见 `scripts/e2e.sh`)。
 - `push.zig` pkt 切分/listRefs/findRef 容忍 `0002` response-end (真 git v2
   ls-refs 响应尾部) 与 `version ` caps 行。
 - `pack.zig buildPack` payload 纠正为 `zlib(body)`(此前 `zlib(header+body)` 必被 git 拒,

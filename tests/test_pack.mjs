@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { rmSync, mkdirSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildPack, parsePack } from "../src/host/pack.mjs";
+import { buildPack, parsePack } from "./pack.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TMP = join(ROOT, "tmp/test_pack");

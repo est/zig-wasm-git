@@ -19,9 +19,9 @@ echo "== start host on $HOST_PORT =="
 mkdir -p tmp data
 rm -rf "$VERIFY_TMP" 2>/dev/null || true
 mkdir -p "$VERIFY_TMP"
-pkill -f "node src/host/server.mjs" 2>/dev/null || true
+pkill -f "node tests/server.mjs" 2>/dev/null || true
 sleep 1
-PORT="$HOST_PORT" nohup node src/host/server.mjs > "$HOST_LOG" 2>&1 & echo $! > tmp/host_GIT_HTTP.pid
+PORT="$HOST_PORT" nohup node tests/server.mjs > "$HOST_LOG" 2>&1 & echo $! > tmp/host_GIT_HTTP.pid
 sleep 1
 cat "$HOST_LOG" | tail -10
 

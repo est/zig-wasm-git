@@ -1,7 +1,7 @@
 // tests/test_codec_auth.mjs — portable helper coverage (no network, no server).
-// Covers: wire.toModule (bytes vs precompiled Module) + loadFromBytes(Module)
+// Covers: utils.toModule (bytes vs precompiled Module) + loadFromBytes(Module)
 // for codegen-forbidding runtimes (workerd CompiledWasm), and
-// codec.withBasicAuth (URL userinfo -> Authorization header + stripped URL).
+// utils.withBasicAuth (URL userinfo -> Authorization header + stripped URL).
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,22 +9,15 @@ import { fileURLToPath } from "node:url";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const WASM = join(ROOT, "zig-out/bin/zig_wasm_git.wasm");
 
-// Portable assertion: touched helpers must stay worker-safe.
-for (const f of ["wire.mjs", "codec.mjs", "portable.mjs"]) {
+// Portable assertion: the shipped chain must stay worker-safe.
+for (const f of ["utils.mjs", "sync.mjs", "portable.mjs"]) {
   const src = readFileSync(join(ROOT, "src/host", f), "utf8");
   if (/from\s+["']node:/.test(src) || /require\s*\(/.test(src)) throw new Error(`${f} must stay portable (no node: imports)`);
   if (/child_process|execFile|readFileSync|writeFileSync/.test(src)) throw new Error(`${f} must not touch fs/child_process`);
 }
 console.log("[ok] helpers portable (no node:/fs/child_process imports)");
 
-// Back-compat: browser.mjs stays as a deprecated re-export shim.
-{
-  const shim = readFileSync(join(ROOT, "src/host/browser.mjs"), "utf8");
-  if (!/from\s+["']\.\/portable\.mjs["']/.test(shim)) throw new Error("browser.mjs must re-export portable.mjs");
-}
-
-const { toModule, bootWasm } = await import("../src/host/wire.mjs");
-const { withBasicAuth } = await import("../src/host/codec.mjs");
+const { toModule, bootWasm, withBasicAuth } = await import("../src/host/utils.mjs");
 const browser = await import("../src/host/portable.mjs");
 if (typeof browser.withBasicAuth !== "function") throw new Error("portable.mjs must re-export withBasicAuth");
 
@@ -95,16 +88,6 @@ if (typeof browser.withBasicAuth !== "function") throw new Error("portable.mjs m
   if (!(ts >= before && ts <= after)) throw new Error(`default time ${ts} not in [${before}, ${after}]`);
   if (ts < 1700000000) throw new Error(`default time looks like epoch: ${ts}`);
   console.log(`[ok] default commit time is wall-clock (${ts})`);
-}
-
-// ── 5. browser.mjs shim still works ──
-{
-  const shim = await import("../src/host/browser.mjs");
-  if (typeof shim.loadFromBytes !== "function") throw new Error("browser.mjs shim must re-export loadFromBytes");
-  const repo = shim.loadFromBytes(readFileSync(WASM), { store: shim.memoryStore() });
-  const sha = repo.commit("", "shim", { "s.txt": "y" }, "refs/heads/main", { time: 1755859200 });
-  if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("commit via browser.mjs shim failed");
-  console.log("[ok] browser.mjs shim re-exports portable.mjs");
 }
 
 console.log("ALL CODEC-AUTH TESTS PASSED");

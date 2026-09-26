@@ -14,7 +14,7 @@ const SERVER_REPO = join(ROOT, "data/blobtest.git");
 rmSync(SERVER_REPO, { recursive: true, force: true });
 
 // Portable assertion: blob facade must stay worker-safe like the rest.
-for (const f of ["store.mjs", "wire.mjs", "fetch.mjs", "portable.mjs", "codec.mjs", "push.mjs", "blob.mjs"]) {
+for (const f of ["utils.mjs", "sync.mjs", "portable.mjs"]) {
   const src = readFileSync(join(ROOT, "src/host", f), "utf8");
   if (/from\s+["']node:/.test(src) || /require\s*\(/.test(src)) throw new Error(`${f} must stay portable (no node: imports)`);
   if (/child_process|execFile|readFileSync|writeFileSync/.test(src)) throw new Error(`${f} must not touch fs/child_process`);
@@ -47,7 +47,7 @@ const { createBlobService } = browser;
 }
 
 // ── 2. network sync against test server ──
-const server = spawn("node", ["src/host/server.mjs"], {
+const server = spawn("node", ["tests/server.mjs"], {
   cwd: ROOT,
   env: { ...process.env, PORT: String(PORT) },
   stdio: ["ignore", "pipe", "pipe"],

@@ -38,9 +38,9 @@ rm -rf "$CLEAN_TMP" 2>/dev/null || true
 mkdir -p "$CLEAN_TMP"
 
 # kill old host if any
-pkill -f "node src/host/server.mjs" 2>/dev/null || true
+pkill -f "node tests/server.mjs" 2>/dev/null || true
 sleep 1
-PORT="$HOST_PORT" nohup node src/host/server.mjs > "$HOST_LOG" 2>&1 & echo $! > tmp/host.pid
+PORT="$HOST_PORT" nohup node tests/server.mjs > "$HOST_LOG" 2>&1 & echo $! > tmp/host.pid
 sleep 1
 cat "$HOST_LOG" | tail -10
 

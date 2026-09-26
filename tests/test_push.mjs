@@ -4,9 +4,9 @@ import { rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load, memoryStore } from "../src/host/api.mjs";
-import { collectObjects } from "../src/host/push.mjs";
-import { deflateZlib } from "../src/host/codec.mjs";
-import { buildPack } from "../src/host/pack.mjs";
+import { collectObjects } from "../src/host/sync.mjs";
+import { deflateZlib } from "../src/host/utils.mjs";
+import { buildPack } from "./pack.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const WASM = join(ROOT, "zig-out/bin/zig_wasm_git.wasm");
@@ -15,7 +15,7 @@ const BASE = `http://localhost:${PORT}/pushtest.git`;
 const SERVER_REPO = join(ROOT, "data/pushtest.git");
 rmSync(SERVER_REPO, { recursive: true, force: true });
 
-const server = spawn("node", ["src/host/server.mjs"], {
+const server = spawn("node", ["tests/server.mjs"], {
   cwd: ROOT,
   env: { ...process.env, PORT: String(PORT) },
   stdio: ["ignore", "pipe", "pipe"],
@@ -39,7 +39,7 @@ try {
   const objects = await collectObjects(store, c1, new Set());
   console.log(`collected: ${objects.length} objects (${objects.map((o) => o.type).join(",")})`);
   const wasmPack = await local.pushPack(objects);
-  const { hexOfBytes } = await import("../src/host/codec.mjs");
+  const { hexOfBytes } = await import("../src/host/utils.mjs");
   const devMap = new Map();
   for (const o of objects) devMap.set(hexOfBytes(o.body), await deflateZlib(o.body));
   const refPack = buildPack(objects.map((o) => ({ type: o.type, body: o.body })), {

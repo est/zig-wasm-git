@@ -1,8 +1,167 @@
-// src/host/wire.mjs — portable wasm call wrappers (no node: imports).
-// Binds the git-protocol weight-lifting exports to JS callables over any
-// WebAssembly.Instance with the 3 storage-free imports used by fetch paths.
-// Object-store paths (get/commit) attach host_get/put_object separately
-// (see portable.mjs / api.mjs); the helpers below only need host_emit_bytes.
+// src/host/utils.mjs — portable helpers shared by the repo entry and sync clients.
+// Zero node: imports. Only: WebAssembly, CompressionStream/DecompressionStream,
+// TextEncoder/Decoder, URL/Headers/btoa. Sections:
+//   store: in-memory object store (same interface as the Node fileStore)
+//   codec: hex/url/auth, zlib, loose/tree/commit parsing
+//   wire:  wasm boot + git-protocol call wrappers (source of truth for pkt shapes)
+
+const _dec = new TextDecoder();
+const _enc = new TextEncoder();
+
+// ── store ──
+
+/// Portable in-memory object store (zero FS, zero node: deps).
+/// get(hex) -> Uint8Array|null (loose zlib bytes); put(hex, loose) stores a copy.
+export function memoryStore() {
+  const objs = new Map();
+  const refs = new Map();
+  return {
+    get(hex) {
+      const v = objs.get(String(hex).toLowerCase());
+      return v ? v.slice() : null;
+    },
+    put(hex, loose) {
+      objs.set(String(hex).toLowerCase(), Uint8Array.from(loose));
+    },
+    getRef(name) {
+      return refs.get(name) ?? null;
+    },
+    putRef(name, sha) {
+      refs.set(name, sha);
+    },
+    heads() {
+      const out = [];
+      for (const k of refs.keys()) if (k.startsWith("refs/heads/")) out.push(k.slice("refs/heads/".length));
+      return out;
+    },
+    dump() {
+      return { objects: objs.size, refs: refs.size };
+    },
+  };
+}
+
+// ── codec ──
+
+export function hexOfBytes(b) {
+  let s = "";
+  for (let i = 0; i < b.length; i++) s += b[i].toString(16).padStart(2, "0");
+  return s;
+}
+
+export const joinUrl = (base, path) => base.replace(/\/+$/, "") + path;
+
+/// Wrap a fetch impl so URLs carrying `user:pass@host` credentials are sent
+/// as an `Authorization: Basic` header with the credentials stripped from
+/// the URL. Some runtimes (notably Cloudflare workerd) drop URL userinfo
+/// instead of applying it, so the same URL that works with curl gets a 401
+/// from in-worker discovery; stripping also keeps tokens out of downstream
+/// logs/proxies. URLs without userinfo (and pre-set Authorization headers)
+/// pass through untouched. String-URL call sites (fetch/push/lsRemote).
+export function withBasicAuth(fetchImpl) {
+  return async (url, init) => {
+    const raw = typeof url === "string" ? url : url?.url ?? String(url);
+    let u;
+    try {
+      u = new URL(raw);
+    } catch {
+      return fetchImpl(url, init);
+    }
+    if (!u.username && !u.password) return fetchImpl(url, init);
+    const creds = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
+    const bytes = _enc.encode(creds);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    const basic = btoa(bin);
+    const fromReq = typeof url === "object" && url !== null ? url.headers : undefined;
+    const headers = new Headers(fromReq ?? init?.headers);
+    if (!headers.has("authorization")) headers.set("authorization", `Basic ${basic}`);
+    u.username = "";
+    u.password = "";
+    return fetchImpl(u.toString(), { ...init, headers });
+  };
+}
+
+function needCS() {
+  if (typeof CompressionStream === "undefined" || typeof DecompressionStream === "undefined") {
+    throw new Error("CompressionStream/DecompressionStream unavailable on this platform");
+  }
+}
+
+export async function streamAll(stream, input) {
+  const w = stream.writable.getWriter();
+  await w.write(input);
+  await w.close();
+  const chunks = [];
+  for await (const c of stream.readable) {
+    chunks.push(new Uint8Array(c.buffer, c.byteOffset, c.byteLength));
+  }
+  let n = 0;
+  for (const c of chunks) n += c.length;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const c of chunks) {
+    out.set(c, o);
+    o += c.length;
+  }
+  return out;
+}
+
+/// pack 对象 payload:zlib(body)。直出,无需手工包头/adler。
+export async function deflateZlib(body) {
+  needCS();
+  return streamAll(new CompressionStream("deflate"), body);
+}
+
+export async function inflateZlib(zlibBytes) {
+  needCS();
+  return streamAll(new DecompressionStream("deflate"), zlibBytes);
+}
+
+/// loose("type len\0body" zlib) -> {type, body: Uint8Array (copy)}
+export async function looseBody(loose) {
+  const raw = await inflateZlib(loose instanceof Uint8Array ? loose : new Uint8Array(loose));
+  const nul = raw.indexOf(0);
+  if (nul < 0) throw new Error("bad loose object");
+  const [type, len] = _dec.decode(raw.subarray(0, nul)).split(" ");
+  const body = raw.subarray(nul + 1);
+  if (body.length !== Number(len)) throw new Error("loose length mismatch");
+  return { type, body: body.slice() };
+}
+
+/// tree body -> [{mode, name, oid(hex)}]
+export function parseTreeEntries(body) {
+  const u8 = body instanceof Uint8Array ? body : new Uint8Array(body);
+  const out = [];
+  let i = 0;
+  while (i < u8.length) {
+    const sp = u8.indexOf(0x20, i);
+    const nul = u8.indexOf(0, sp + 1);
+    if (sp < 0 || nul < 0 || nul + 21 > u8.length) throw new Error("bad tree body");
+    out.push({
+      mode: _dec.decode(u8.subarray(i, sp)),
+      name: _dec.decode(u8.subarray(sp + 1, nul)),
+      oid: hexOfBytes(u8.subarray(nul + 1, nul + 21)),
+    });
+    i = nul + 21;
+  }
+  return out;
+}
+
+export function commitParentsAndTree(body) {
+  const parents = [];
+  let tree = null;
+  const text = typeof body === "string" ? body : _dec.decode(body instanceof Uint8Array ? body : new Uint8Array(body));
+  for (const line of text.split("\n")) {
+    if (line.startsWith("parent ")) parents.push(line.slice(7).trim());
+    else if (line.startsWith("tree ") && tree === null) tree = line.slice(5, 45);
+    else if (line === "") break;
+  }
+  return { parents, tree };
+}
+
+// ── wire ──
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();

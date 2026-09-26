@@ -27,10 +27,10 @@ Each release ships a fixed-name `zig_wasm_git.wasm` + `.sha256`, built by CI fro
 - **~69KB** `wasm32-freestanding ReleaseSmall`, no libc, imports only `env.host_*`
 - Division of labor: **protocol weight lifting in wasm** (pkt-line, smart HTTP v1/v2 framing, pack framing/parsing, delta apply, single-pass inflate with exact `consumed`), **IO + platform ABIs in JS** (`fetch`, `CompressionStream`/`DecompressionStream`, `crypto.subtle`, pluggable store)
 - Object-level API: read blobs by path / write commits from `{path: content}` maps / fetch+push over smart HTTP
-- Blob-service facade (`src/host/blob.mjs`): `read`/`readText`/`readMany`/`write`/`writeText`/`pull`/`publish`/`sync` over one branch-keyspace; missing key is `null`, each write is a version, push is fast-forward-only
+- Blob-service facade (in `portable.mjs`): `read`/`readText`/`readMany`/`write`/`writeText`/`pull`/`publish`/`sync` over one branch-keyspace; missing key is `null`, each write is a version, push is fast-forward-only
 - SHA-1 / zlib / pack v2 (incl. ofs/ref delta) / pkt-line / smart HTTP (`v1` + `v2 ls-refs/fetch=filter` + receive-pack + upload-pack clients)
 - Partial clone filters: `blob:none`, `blob:limit`, `tree:0`, `object:type`, `combine:+`
-- **No FS, no CLI on the client**: `src/host/{store,wire,fetch,portable,codec,push,blob}.mjs` run in browsers/CF Workers (zero `node:` imports)
+- **No FS, no CLI on the client**: `src/host/{portable,sync,utils}.mjs` run in browsers/CF Workers (zero `node:` imports); Node adds `src/host/api.mjs` (file store + Buffer flavors)
 
 ## Blob-service API (recommended)
 
@@ -136,7 +136,7 @@ Protocol framing/parsing: `wasm_handle_discovery`, `wasm_parse_filter`, `wasm_sh
 `wasm_pktline_encode`, `wasm_build_lsrefs`, `wasm_build_fetch`, `wasm_decode_pack_header`,
 `wasm_list_refs`/`wasm_find_ref`, `wasm_pack_begin|add|end`, `wasm_parse_report_status`,
 `wasm_inflate_one`, `wasm_delta_apply`, plus `wasm_get`/`wasm_commit[2]` and `wasm_alloc/reset`.
-See `src/host/server.mjs` for a working server and `src/host/portable.mjs` for the portable client (`src/host/browser.mjs` remains as a deprecated re-export shim).
+See `tests/server.mjs` for a working server and `src/host/portable.mjs` for the portable client.
 
 ## Build & test
 
@@ -164,7 +164,7 @@ CI runs the full test suite on every push/PR. Tagging triggers the release workf
 - Push sends full objects, no `delta` encode (server re-deltifies on `gc`)
 - `blob:limit` checkout's promisor fetch is best-effort (`--no-checkout` in e2e); omitted blobs read as `null`
 - No `shallow`/`deepen`/`notes`/`LFS`, no chunked storage (4MB wasm arena per call)
-- Test-only server (`src/host/server.mjs`) shells out to `git`; the client chain never does
+- Test-only server (`tests/server.mjs`) shells out to `git`; the client chain never does
 
 ## License
 

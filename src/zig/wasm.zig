@@ -62,7 +62,7 @@ fn emitAll(bytes: []const u8) void {
 
 // ─── receive-pack client: protocol in wasm, IO/compression in host JS ────────
 //
-// 对象枚举由 JS 做(store 遍历属 IO;见 src/host/push.mjs,算法 spec 见 push.collectObjects).
+// 对象枚举由 JS 做(store 遍历属 IO;见 src/host/sync.mjs push 部分,算法 spec 见 sync.collectObjects).
 // wasm 只做线协议 + 二进制组帧:
 // pack:    wasm_pack_begin(n) / wasm_pack_add(type_num, raw_size, dev_ptr, dev_len)
 //          / wasm_pack_end() — streams pack bytes via host_emit_bytes; big packs

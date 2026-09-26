@@ -15,7 +15,7 @@ const SERVER_REPO = join(ROOT, "data/fetchtest.git");
 rmSync(SERVER_REPO, { recursive: true, force: true });
 
 // ── 0. 可移植断言:客户端链路零 node: 导入 ──
-for (const f of ["store.mjs", "wire.mjs", "fetch.mjs", "portable.mjs", "codec.mjs", "push.mjs", "blob.mjs"]) {
+for (const f of ["utils.mjs", "sync.mjs", "portable.mjs"]) {
   const src = readFileSync(join(ROOT, "src/host", f), "utf8");
   if (/from\s+["']node:/.test(src) || /require\s*\(/.test(src)) throw new Error(`${f} must stay portable (no node: imports)`);
   if (/child_process|execFile|readFileSync|writeFileSync/.test(src)) throw new Error(`${f} must not touch fs/child_process`);
@@ -35,7 +35,7 @@ console.log("[ok] client chain portable (no node:/fs/child_process imports)");
   console.log("[ok] wasm fetch exports present");
 }
 
-const server = spawn("node", ["src/host/server.mjs"], {
+const server = spawn("node", ["tests/server.mjs"], {
   cwd: ROOT,
   env: { ...process.env, PORT: String(PORT) },
   stdio: ["ignore", "pipe", "pipe"],
@@ -126,8 +126,8 @@ try {
     const packFile = join(tmpd, "repo", ".git/objects/pack", rs2(join(tmpd, "repo", ".git/objects/pack")).find((f) => f.endsWith(".pack")));
     const vv = execFileSync("git", ["verify-pack", "-v", packFile]).toString();
     console.log("  " + vv.trim().split("\n").slice(0, 6).join("\n  "));
-    const { bootWasm } = await import("../src/host/wire.mjs");
-    const { unpackPack, resolveRefDeltas } = await import("../src/host/fetch.mjs");
+    const { bootWasm } = await import("../src/host/utils.mjs");
+    const { unpackPack, resolveRefDeltas } = await import("../src/host/sync.mjs");
     const { wasm: w2 } = bootWasm(readFileSync(WASM));
     const { createHash } = await import("node:crypto");
     const sha1hex = (type, body) => createHash("sha1").update(`${type} ${body.length}\0`).update(body).digest("hex");

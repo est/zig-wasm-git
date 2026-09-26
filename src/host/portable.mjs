@@ -10,21 +10,21 @@
 //   repo.get("main", ["README.md"]);      // [{path, oid, content: Uint8Array}]
 //   repo.commit("", "init", {"a.txt": "hi"}); // -> sha (local; push to publish)
 //
-// Wire: git protocol weight lifting in wasm (wire.mjs); IO/compression/hash in JS.
+// Wire: git protocol weight lifting in wasm (utils.mjs); IO/compression/hash in JS;
+// remote sync (fetch/push) in sync.mjs; blob facade below in this file.
 
-import { memoryStore } from "./store.mjs";
-import { bootWasm, toModule } from "./wire.mjs";
-import * as wire from "./wire.mjs";
-import { fetchIntoStore, lsRemote } from "./fetch.mjs";
-import { createBlobService } from "./blob.mjs";
-import { collectObjects, TYPE_NUM, ZERO_OID, decodeRefsTlv, decodeStatusTlv } from "./push.mjs";
-import { deflateZlib, joinUrl, withBasicAuth } from "./codec.mjs";
+import { memoryStore, bootWasm, toModule, deflateZlib, joinUrl, withBasicAuth } from "./utils.mjs";
+import * as wire from "./utils.mjs";
+import {
+  fetchIntoStore, lsRemote,
+  collectObjects, TYPE_NUM, ZERO_OID, decodeRefsTlv, decodeStatusTlv,
+} from "./sync.mjs";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const ERR_NAMES = { 1: "NotFound", 2: "PathIsDir", 3: "NotATree", 4: "NotABlob", 5: "BadCommit" };
 
-export { memoryStore, createBlobService, withBasicAuth };
+export { memoryStore, withBasicAuth };
 
 /// wasmBytesOrModule: Uint8Array bytes, or a precompiled WebAssembly.Module
 /// (workerd `CompiledWasm`; see wire.toModule).
@@ -253,14 +253,14 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
 
     /** Recent history without protocol (reads local store; async inflate). */
     async log(ref, limit = 10) {
-      const { readLooseBody } = await import("./fetch.mjs");
+      const { looseBody } = await import("./utils.mjs");
       const sha0 = resolveRef(ref);
       const out = [];
       let cur = sha0;
       for (let i = 0; i < limit && cur; i++) {
         const loose = store.get(cur);
         if (!loose) break;
-        const { body } = await readLooseBody(loose);
+        const { body } = await looseBody(loose);
         const text = dec.decode(body);
         const lines = text.split("\n");
         const hdrEnd = lines.indexOf("");
@@ -360,4 +360,93 @@ export function loadFromBytes(wasmBytesOrModule, opts = {}) {
     },
   };
   return repo;
+}
+
+// ── blob-service facade ──
+//
+// Standpoint: the remote git repo is a versioned blob store, not a
+// developer workspace. Callers think in keys and bytes:
+//
+//   read(path) -> bytes | null        // missing key is null, not an error
+//   write({path: bytes}, message) -> version (commit sha, ref tip moves)
+//   pull(url) / publish(url)          // network sync; no workdir, no merge
+//
+// Keyspace model: one branch == one keyspace (default refs/heads/main).
+// Each write is a full-snapshot commit of the given keys on top of the
+// current tip (last-writer-wins; push rejects on non-fast-forward).
+
+const toU8 = (v) => (v instanceof Uint8Array ? v : enc.encode(String(v ?? "")));
+
+export function createBlobService(repo, opts = {}) {
+  const shortRef = opts.ref ?? "main";
+  const fullRef = shortRef.startsWith("refs/") ? shortRef : `refs/heads/${shortRef}`;
+  const filter = opts.filter ?? "";
+
+  function version() {
+    try {
+      return repo.resolveRef(fullRef);
+    } catch {
+      return null;
+    }
+  }
+
+  function pickOne(rows, path) {
+    const row = rows.find((r) => r.path === path);
+    if (!row || row.error) return null;
+    return row.content instanceof Uint8Array ? row.content : new Uint8Array(row.content ?? []);
+  }
+
+  function read(path) {
+    const tip = version();
+    if (!tip) return null;
+    return pickOne(repo.get(fullRef, [path]), path);
+  }
+
+  function readText(path) {
+    const b = read(path);
+    return b == null ? null : dec.decode(b);
+  }
+
+  function readMany(paths) {
+    const tip = version();
+    const out = new Map();
+    if (!tip || !paths.length) return out;
+    for (const row of repo.get(fullRef, paths)) {
+      if (!row.error) out.set(row.path, row.content);
+    }
+    return out;
+  }
+
+  function write(files, message = "update", options = {}) {
+    const entries = {};
+    for (const [path, content] of Object.entries(files ?? {})) {
+      entries[path] = content instanceof Uint8Array ? content : toU8(content);
+    }
+    const parent = version() ?? "";
+    return repo.commit(parent, message, entries, fullRef, options);
+  }
+
+  function writeText(path, text, message = "update", options = {}) {
+    return write({ [path]: enc.encode(String(text)) }, message, options);
+  }
+
+  // Network: pull == fetch remote tip into local store (plus ref update).
+  function pull(url, pullOpts = {}) {
+    return repo.fetch(url, fullRef, { filter, ...pullOpts });
+  }
+
+  // Network: publish == push local tip (fast-forward only; rejects otherwise).
+  function publish(url, publishOpts = {}) {
+    return repo.push(url, fullRef, publishOpts);
+  }
+
+  // One-shot blob sync: pull latest, then return the requested keys.
+  // No merge: local unpushed writes must be published first, else the
+  // fetch moves the ref tip underneath them (they stay reachable by sha).
+  async function sync(url, paths, syncOpts = {}) {
+    await pull(url, syncOpts.pull ?? {});
+    return readMany(paths ?? []);
+  }
+
+  return { ref: fullRef, filter, version, read, readText, readMany, write, writeText, pull, publish, sync };
 }

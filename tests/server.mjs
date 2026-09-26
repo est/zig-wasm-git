@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = join(__dirname, "../..");
+const REPO_ROOT = join(__dirname, "..");
 // Simple bare repo in ./data/<repo>.git  (objects + refs)
 const DATA_DIR = join(REPO_ROOT, "data");
 const WASM_PATH = join(REPO_ROOT, "zig-out/bin/zig_wasm_git.wasm");

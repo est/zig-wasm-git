@@ -20,9 +20,9 @@ echo "== host start :$PORT =="
 mkdir -p tmp data
 rm -rf "$TMP_ROOT" 2>/dev/null || true
 mkdir -p "$TMP_ROOT"
-pkill -f "node src/host/server.mjs" 2>/dev/null || true
+pkill -f "node tests/server.mjs" 2>/dev/null || true
 sleep 1
-PORT="$PORT" nohup node src/host/server.mjs > "$LOG" 2>&1 & echo $! > tmp/host_e2e.pid
+PORT="$PORT" nohup node tests/server.mjs > "$LOG" 2>&1 & echo $! > tmp/host_e2e.pid
 sleep 1
 cat "$LOG" | tail -10
 
