@@ -105,12 +105,14 @@ export interface RemoteGitOptions {
    * Where to get the wasm engine.
    *
    * - omitted: `zig_wasm_git.wasm` **next to this module** (true for an npm
-   *   install, where the two files ship together)
+   *   install, where the two files ship together). Needs a filesystem, so on
+   *   Node that means 22.3+ (`process.getBuiltinModule`)
    * - string starting with `http(s)://`: fetched
-   * - any other string: a filesystem path (Node only)
+   * - any other string: a filesystem path (Node 22.3+ only)
    * - `WebAssembly.Module` / bytes: passed straight to `instantiate`
    *
-   * workerd has no filesystem, so pass its `CompiledWasm` explicitly.
+   * workerd has no filesystem, so pass its `CompiledWasm` explicitly. A
+   * filesystem path on a runtime without one throws `BAD_ARG`.
    */
   wasm?: WasmInput;
   /** Branch to bind. A short name (`main`) or a full ref. Default `main`. */

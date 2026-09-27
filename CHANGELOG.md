@@ -5,7 +5,28 @@ Notable changes, written for people using the library. Follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **A too-old Node no longer looks like a network outage.** On a runtime with
+  no filesystem — Node before 22.3, which has no `process.getBuiltinModule` —
+  the default wasm lookup degraded into `fetch("file://…")` and failed with
+  `NETWORK`, the code documented as "offline, DNS, TLS, CORS". A caller
+  following the docs would have retried a connection that was never the
+  problem. It is now `BAD_ARG`, naming the missing capability and the way out
+  (pass bytes, a `WebAssembly.Module`, or an `http(s)` url).
+- `package.json` now requires Node `>=22.3`, matching what the default wasm
+  lookup actually needs.
+- README: Node requirements said 18+, 20+ and 22.3+ in three places. They now
+  agree, and explain why 22.3 is the floor.
+
+### Changed
+
+- README restructured around a reader's path: a runnable quick start, an
+  authentication section (including the browser CORS caveat), and the
+  `custom store` contract promoted out of a comment. Release process, build
+  instructions and the `want`/`have`/`delta` capability matrix moved to
+  `CONTRIBUTING.md` and `docs/CAPABILITIES.md`; content is unchanged, just no
+  longer sitting between a user and the API.
 
 ## [1.6.0] — 2026-09-27
 
@@ -70,7 +91,7 @@ Documentation only.
 
 ## [1.2.0] — 2026-09-25
 
-- Documented the boundary with v1-only git servers (e.g. 腾讯工蜂), verified
+- Documented the boundary with v1-only git servers, verified
   against a live host: reads refuse loudly, `push` works.
 - Test coverage extended to the fetch, push and blob paths.
 

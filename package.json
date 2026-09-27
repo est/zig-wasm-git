@@ -41,11 +41,13 @@
     "dist/zig-wasm-git.mjs",
     "dist/zig-wasm-git.d.mts",
     "dist/zig_wasm_git.wasm",
+    "docs/CAPABILITIES.md",
+    "CONTRIBUTING.md",
     "CHANGELOG.md"
   ],
   "sideEffects": false,
   "engines": {
-    "node": ">=18"
+    "node": ">=22.3"
   },
   "scripts": {
     "build": "./scripts/build-npm.sh",

@@ -91,7 +91,8 @@ function entryPairs(entries) {
 
 /// Node-only fs probe: runtime string lookup, no static `node:` import —
 /// the neutral bundle keeps building and browsers/workers never touch it.
-/// old Node: do it yourself (pass bytes).
+/// Absent before Node 22.3 (process.getBuiltinModule) and in every non-Node
+/// runtime; those callers pass bytes or an http(s) url instead.
 function nodeFs() {
   const g = process?.getBuiltinModule;
   if (typeof g === "function") {
@@ -115,12 +116,27 @@ async function resolveWasmInput(wasmOpt) {
     return wasmOpt; // typed array / ArrayBuffer; instantiate validates
   }
   // falsy, or a string
+  const explicit = typeof wasmOpt === "string";
   const href = wasmOpt?.trim() || new URL("zig_wasm_git.wasm", import.meta.url).href;
   // Local file first: non-http(s) string on Node (plain path or file: URL).
   // Browsers skip this (no getBuiltinModule) and fetch instead.
   if (!/^https?:\/\//.test(href)) {
     const fs = nodeFs();
     if (fs) return new Uint8Array(fs.readFileSync(href.startsWith("file:") ? new URL(href) : href));
+    // No filesystem to read it with, and it is not fetchable either (fetch
+    // rejects file:// and bare paths outright). Falling through would surface a
+    // NETWORK error, which reads as "your connection is down" and invites a
+    // retry that can never succeed. Say what is actually missing.
+    failed(
+      ERR.BAD_ARG,
+      explicit
+        ? `cannot read the wasm from a filesystem path on this runtime (no Node fs): ${href}. ` +
+          `Pass the bytes, a WebAssembly.Module, or an http(s) url instead.`
+        : `cannot read zig_wasm_git.wasm next to this module on this runtime (no Node fs, ` +
+          `so the default location ${href} is unreachable). Node before 22.3 lacks ` +
+          `process.getBuiltinModule; upgrade, or pass { wasm } as bytes / an http(s) url.`,
+      { ref: href },
+    );
   }
   const r = await netFetch(fetch, href, undefined, `wasm fetch ${href}`);
   return new Uint8Array(await r.arrayBuffer());

@@ -84,7 +84,21 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
     threw = /zig_wasm_git\.wasm/.test(e.message);
   }
   if (!threw) throw new Error("omitted wasm should fail on the co-located file");
-  console.log("[ok] wasm inputs (path string, Module, bytes, co-located default)");
+  // A runtime with no filesystem cannot load a path or the co-located default.
+  // That must be BAD_ARG, not NETWORK: "your connection is down" invites a
+  // retry that can never succeed (Node < 22.3 has no process.getBuiltinModule).
+  const noFs = process.getBuiltinModule;
+  delete process.getBuiltinModule;
+  for (const [label, opts] of [["path", { wasm: WASM }], ["default", {}]]) {
+    let code = null, msg = "";
+    try {
+      await RemoteGit.open("https://example.invalid/r.git", opts);
+    } catch (e) { code = e.code; msg = e.message; }
+    if (code !== "BAD_ARG") throw new Error(`no-fs ${label} should be BAD_ARG, got ${code}: ${msg}`);
+    if (/network/i.test(msg)) throw new Error(`no-fs ${label} message implies a network fault: ${msg}`);
+  }
+  process.getBuiltinModule = noFs;
+  console.log("[ok] wasm inputs (path string, Module, bytes, co-located default, no-fs BAD_ARG)");
 
   const { withBasicAuth } = await import("../src/host/utils.mjs");
   const seen = [];

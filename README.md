@@ -7,15 +7,20 @@ git engine without `fs` nor `git` command. WASM+JS that speaks directly to any g
 > The entire git protocol engine is written in pure Zig (no libc), compiled to a ~100KB WASM binary ... It implements SHA-1, zlib inflate/deflate, delta encoding/decoding, pack parsing, and the full git smart HTTP protocol — all from scratch, with zero external dependencies.
 
 This repo is a minimal reproduction focused on **read/write a git remote as a versioned blob store, not a dev workspace.**
-   
-One branch == one keyspace (`path -> bytes`), one commit == one version.   
 
-There is no workdir, no merge, no checkout — just `read` / `write` / `fetch` / `push`.   
+One branch == one keyspace (`path -> bytes`), one commit == one version.
+
+There is no workdir, no merge, no checkout — just `read` / `write` / `fetch` / `push`.
 
 ## Install
 
-Requires Node 18+ or any runtime with `fetch`, `CompressionStream` and
+Requires **Node 22.3+**, or any runtime with `fetch`, `CompressionStream` and
 `crypto.subtle` (browsers, Cloudflare Workers, Deno, Bun).
+
+> Node 22.3 is the floor because the default wasm lookup reads the file next to
+> the JS module via `process.getBuiltinModule`, which does not exist earlier. On
+> older Node, pass the engine yourself — bytes, a `WebAssembly.Module`, or an
+> `http(s)` url — and everything else works unchanged.
 
 ### npm
 
@@ -30,9 +35,8 @@ const git = await RemoteGit.open("https://git.example.com/team/docs.git");
 ```
 
 No build step, no `wasm` option: the package ships the engine next to the JS,
-so `open()` finds it on its own. Needs Node 18+, or any runtime with `fetch`,
-`CompressionStream` and `crypto.subtle` (browsers, Cloudflare Workers, Deno,
-Bun). Bundlers that want the binary as an asset can import it explicitly:
+so `open()` finds it on its own. Bundlers that want the binary as an asset can
+import it explicitly:
 
 ```js
 import wasmUrl from "zig-wasm-git/wasm?url"; // vite
@@ -48,135 +52,178 @@ curl -LO https://github.com/est/zig-wasm-git/releases/latest/download/zig_wasm_g
 curl -LO https://github.com/est/zig-wasm-git/releases/latest/download/zig_wasm_git.portable.mjs
 ```
 
-Each release ships fixed-name files + `SHA256SUMS`, built by CI from the tagged commit (pin a version via the per-tag download path):
+Each release ships fixed-name files + `SHA256SUMS`, built by CI from the tagged
+commit (pin a version via the per-tag download path):
 
 - `zig_wasm_git.wasm` — the protocol engine (~69KB)
 - `zig_wasm_git.portable.mjs` — single-file JS for browser/CF Worker/Node (`RemoteGit` + `memoryStore`)
 
-## Features
-
-- **~69KB** `wasm32-freestanding ReleaseSmall`, no libc, imports only `env.host_*`
-- Division of labor: **protocol weight lifting in wasm** (pkt-line, smart HTTP v1/v2 framing, pack framing/parsing, delta apply, single-pass inflate with exact `consumed`), **IO + platform ABIs in JS** (`fetch`, `CompressionStream`/`DecompressionStream`, `crypto.subtle`, pluggable store)
-- Blob-store API: read blobs by path / write commits from `{path: content}` maps / pull+push over smart HTTP
-- `RemoteGit` (`src/host/portable.mjs`, the only API): url-bound, all-async
-  `open`/`getMany`/`putMany`/`list`/`log`/`version`/`remoteVersion`/`pull`/`push`/`sync`
-  over one branch-keyspace; missing blobs auto-fetched on demand (`want=<blob-oid>`,
-  batched); missing keys are skipped; each `putMany` is a version (message + author/time
-  options, CAS parent); push is fast-forward-only (client-side ancestry check + server backstop)
-- SHA-1 / zlib / pack v2 (incl. ofs/ref delta) / pkt-line / smart HTTP (`v1` + `v2 ls-refs/fetch=filter` + receive-pack + upload-pack clients)
-- Partial clone filters: `blob:none`, `blob:limit`, `tree:0`, `object:type`, `combine:+`
-- **No FS, no CLI on the client**: `src/host/{portable,sync,utils}.mjs` run in browsers/CF Workers/Node (zero `node:` imports); per-platform init is one line (see below)
-- **Fails loudly**: every throw is a `RemoteGitError` with a stable `.code`; network/HTTP errors are never reported as "key not found" (see [Errors](#errors))
-
-## Blob-store API (the only API)
-
-One branch is one keyspace. Missing keys are skipped, not errors. Each `putMany`
-appends a version (a commit) on the current tip; `push` moves the remote tip
-and rejects on non-fast-forward (last-writer-wins, no merge). Every method is
-async, and they all run through one queue so they share a single ordering —
-including `log()`, which is local but queued anyway. Single keys go through the
-Many variants directly (`getMany("a.txt")`).
-
-Four things fail loudly instead of returning something plausible:
-
-- **Network / HTTP errors are thrown**, never reported as an empty result. A
-  dropped connection must not read as "this key does not exist". Only a key
-  genuinely absent from the keyspace is skipped.
-- **A custom `store` must be synchronous** (`{get,put,getRef,putRef,heads}`).
-  It is called from wasm host callbacks that cannot await, so a
-  Promise-returning store would write commits it cannot read back. `open()`
-  probes it and throws `BAD_STORE`.
-- **Keys are validated** before anything is written: relative paths only, no
-  empty segment, no `.` / `..` / `.git`. A malformed key is rejected
-  (`BAD_KEY`) rather than normalized, because the tree layer would turn `""`
-  or `"/a.txt"` into an unnamed entry that silently overwrites a sibling key in
-  the same batch.
-
-Content is a `string` or `Uint8Array`/`ArrayBuffer`; anything else is rejected
-with `BAD_ARG` rather than silently stored as `"[object Object]"`. On the read
-side, `as: "text"` hands back strings instead of bytes, and a bare key string
-works when you only want one:
+## Quick start
 
 ```js
-import { RemoteGit } from "zig-wasm-git"; // or "./src/host/portable.mjs" from a checkout
+import { RemoteGit } from "zig-wasm-git";
 
-// { wasm }: string | Module | typed array | ArrayBuffer.
-const git = await RemoteGit.open("https://user:pass@git.example.com/team/docs.git", {
-  // wasm: "https://git.example.com/zig_wasm_git.wasm", // http(s) url (lib fetches),
-  // wasm: "zig_wasm_git.wasm",    // Node path (read via process.getBuiltinModule)
-  // wasm: WASM_MODULE,            // workerd CompiledWasm (no runtime codegen)
-  //
-  // Omitting `wasm` means "zig_wasm_git.wasm next to this module" — true for a
-  // release pair kept together, but NOT for a clone of this repo (the built
-  // wasm lands in zig-out/bin/). See "Where the wasm comes from" below.
-  ref: "main",                      // one branch == one keyspace
-  author: "bot <bot@example.com>",  // optional defaults; per-write options win
-  // auth: "user:pass",             // explicit Authorization (URL userinfo also works)
-  // store: myStore,                // default memoryStore(); custom: {get,put,getRef,putRef,heads}
-  //                                 //   — must be SYNCHRONOUS (no Promises; see Errors)
+const git = await RemoteGit.open("https://user:token@git.example.com/team/docs.git", {
+  ref: "main",
+  author: "bot <bot@example.com>",
 });
-await git.pull(); // optional warmup (full pull); reads work without it
 
-// reads may hit the network (see "Reads can touch the network"); { local: true } is cache-only
-await git.getMany(["some/path/README.md"]); // Map(path -> Uint8Array), missing skipped
-await git.getMany("a.txt");        // a single key works too
-await git.getMany(["a.txt"], { as: "text" }); // Map(path -> string) for text keys
-await git.getMany(["a.txt"], { local: true }); // cache-only: no I/O at all
+await git.putMany({ "notes/hello.md": "# hello\n" }, "add hello"); // -> commit sha
+await git.push();                                                  // fast-forward only
+
+const blobs = await git.getMany(["notes/hello.md"], { as: "text" });
+console.log(blobs.get("notes/hello.md")); // -> "# hello\n"
+
+await git.close(); // release the ~5MB wasm arena
+```
+
+## What you get
+
+- A **~69KB** `wasm32-freestanding ReleaseSmall` binary with no libc, importing
+  only `env.host_*` — SHA-1, zlib inflate/deflate, pack v2 (incl. ofs/ref
+  delta), delta apply, pkt-line, and smart HTTP (`v1` + `v2 ls-refs/fetch=filter`
+  + receive-pack + upload-pack clients), all in Zig.
+- A **small async JS API** on top. `fetch`, `CompressionStream`,
+  `crypto.subtle` and a pluggable store are the only platform dependencies, so
+  the same JS runs in Node, browsers and Workers with no `node:` imports.
+- **Fails loudly.** Every throw is a `RemoteGitError` with a stable `.code`, and
+  a network or HTTP failure is never reported as "key not found"
+  ([Errors](#errors)).
+
+## API
+
+`RemoteGit` is the whole API. Always construct it with `await RemoteGit.open()`
+— instantiation is async, so it is a factory, not a constructor. Every method is
+async and runs through one queue, so they share a single ordering.
+
+```js
+const git = await RemoteGit.open(url, {
+  ref: "main",                     // one branch == one keyspace
+  author: "bot <bot@example.com>", // default author; per-write options win
+  // auth: "user:token",            // see Authentication
+  // store: myStore,                // default memoryStore(); must be SYNCHRONOUS
+  // wasm: ...,                     // see "Where the wasm comes from"
+});
+```
+
+| method | returns | notes |
+| --- | --- | --- |
+| `getMany(paths, opts?)` | `Map(path -> bytes)` | `paths` is an array or one string. Missing keys are **skipped**, not errors. May hit the network — see [Reads can touch the network](#reads-can-touch-the-network) |
+| `putMany(entries, msg?, opts?)` | commit sha | one version (a commit) on the current tip. Upsert only, no delete. `{ parent }` for CAS |
+| `list(prefix?, opts?)` | `[{path, oid}]` | key enumeration. `""` (default) lists everything |
+| `log(limit = 10)` | `[{sha, tree, parents, author, message}]` | newest first, local only |
+| `version()` | `string \| null` | local tip oid; `null` when the keyspace is empty. Never hits the network |
+| `remoteVersion()` | `string \| null` | remote tip oid, store untouched. Throws on network error |
+| `pull(opts?)` | `PullResult` | refresh from the remote. `{ filter: "blob:none" }` for versions-without-bytes |
+| `push()` | `PushResult` | fast-forward only; rejects on non-fast-forward |
+| `sync(paths, opts?)` | `Map(path -> bytes)` | one-shot: pull latest, then read |
+| `close()` | — | releases the wasm instance. Idempotent. Methods after throw `CLOSED` |
+
+### Read and write
+
+```js
+// Reads
+await git.getMany(["some/path/README.md"]);         // Map(path -> Uint8Array)
+await git.getMany("a.txt");                         // a single key works too
+await git.getMany(["a.txt"], { as: "text" });       // Map(path -> string)
+await git.getMany(["config.json"], { local: true }); // cache-only, never any I/O
+
+// Writes. Keys are relative paths: no empty segment, no `.` / `..` / `.git`; a
+// malformed key is rejected (BAD_KEY) rather than normalized. Content is a
+// string or Uint8Array/ArrayBuffer — anything else is rejected with BAD_ARG
+// rather than stored as "[object Object]".
 await git.putMany({ "a.txt": "hi" }, "update greeting"); // -> commit sha
-await git.list("docs/");        // [{path, oid}] key enumeration
-await git.list("docs/", { local: true }); // cache-only enumeration
-await git.log(5);               // [{sha, tree, parents, author, message}], newest first
-await git.version();            // local tip oid (null when empty)
-await git.remoteVersion();      // remote tip oid, store untouched (throws on network error)
-await git.push(); // fast-forward only; rejects on non-fast-forward (pull first)
+```
 
-// one-shot: pull latest, then return keys (pass { pull: { filter: "blob:none" } } for versions-without-bytes)
-await git.sync(["README.md"]);
+A missing key is simply absent from the Map, so `map.size` is not a health
+check. A transport failure throws instead.
 
-await git.close(); // release the wasm instance (~5MB arena) when done
-git.closed;       // -> true
+**Optimistic concurrency.** `putMany(..., { parent })` throws `CAS_MISMATCH`
+when the tip moved since you read it, at no extra roundtrip:
 
-// keys are validated: relative paths, no empty segment, no . / .. / .git
-await git.putMany({ "docs/a.md": "hi" }, "add a");   // -> commit sha
-
-// optimistic concurrency: throws CAS_MISMATCH when the tip moved since you read it.
-// version() is null on an empty keyspace, so check it — a null parent means
-// "no check", which would turn a CAS write into an unguarded one.
+```js
 const tip = await git.version();
 if (tip) await git.putMany({ "a.txt": "v2" }, "cas write", { parent: tip });
 ```
 
-Instantiation is async (`WebAssembly.instantiate`, off-thread compile), so
-`RemoteGit.open()` is a factory — always `await` it. The constructor is public
-only so the class type-checks; an instance from `new RemoteGit(...)` has no wasm
-and every method throws `CLOSED` with a pointer to `open()`.
+Check `tip` for null — a null parent means "no check", which would turn a CAS
+write into an unguarded one.
 
-### Where the wasm comes from
+## Authentication
+
+Credentials can travel three ways. All of them end up as an `Authorization`
+header; the URL-credential form is also stripped from the request URL, which
+keeps tokens out of downstream logs and works around runtimes that drop URL
+userinfo (notably workerd).
+
+```js
+// 1. in the URL — simplest, and the credentials never reach the URL on the wire
+await RemoteGit.open("https://user:token@git.example.com/team/docs.git");
+
+// 2. explicit "user:pass" — sent as Basic
+await RemoteGit.open(url, { auth: "user:token" });
+
+// 3. a raw header value — tokens, Basic you built yourself
+await RemoteGit.open(url, { auth: "Bearer ghp_xxx" });
+```
+
+A value containing whitespace is sent verbatim; `user:pass` is the only shape
+that gets encoded into Basic for you.
+
+**In the browser, the git server must send CORS headers** for both
+`/info/refs?service=git-upload-pack` and the `POST /git-upload-pack`. GitHub
+and GitLab do not serve smart-HTTP endpoints to arbitrary browser origins, so
+browser use usually means going through a same-origin proxy. Workers have no
+CORS restriction. If a request fails with `NETWORK` and the console mentions
+CORS, that is why.
+
+## Custom store
+
+Objects live behind a five-method interface, in memory by default:
+
+```js
+const git = await RemoteGit.open(url, { store: myStore });
+// { get(hex) -> Uint8Array|null, put(hex, loose), getRef(name), putRef(name, sha), heads() }
+```
+
+**A custom store must be synchronous.** It is called from wasm host callbacks
+that cannot await, so a Promise-returning store would write commits it cannot
+read back — a silent data-loss failure, not an error. `open()` probes the store
+and throws `BAD_STORE` if the contract is broken.
+
+That means you cannot wrap an inherently async backend (IndexedDB, D1, R2)
+directly. Buffer in memory and flush, or prehydrate before `open()`.
+
+## Where the wasm comes from
 
 `{ wasm }` accepts, in order of convenience:
 
 | you pass | how it loads | use when |
 | --- | --- | --- |
-| nothing | `zig_wasm_git.wasm` **next to `portable.mjs`** | you kept a release pair together (both files in one directory) |
-| `"/path/to.wasm"` | `fs.readFileSync` (Node only) | a checkout — the built wasm is at `zig-out/bin/zig_wasm_git.wasm` |
+| nothing | `zig_wasm_git.wasm` **next to `portable.mjs`** | npm install, or a release pair kept in one directory |
+| `"/path/to.wasm"` | `fs.readFileSync` (Node 22.3+ only) | a checkout — the built wasm is at `zig-out/bin/zig_wasm_git.wasm` |
 | `"https://…/x.wasm"` | `fetch` | browsers / Workers, wasm served over HTTP |
 | bytes / `ArrayBuffer` | passed straight to `instantiate` | you already fetched or embedded it |
 | `WebAssembly.Module` | instantiated, no codegen | workerd `CompiledWasm` |
 
-Omitting `wasm` outside a release pair fails with a raw filesystem error:
+Omitting `wasm` **in a clone of this repo** fails with a raw filesystem error:
 
 ```
 Error: ENOENT: no such file or directory, open '.../src/host/zig_wasm_git.wasm'
 ```
 
-That is not a bug in the path — it means the file simply is not there. From a
-clone of this repo, pass the built path:
+That is not a bug in the path — the file simply is not there. The built wasm
+lands in `zig-out/`, so pass it:
 
 ```js
 const git = await RemoteGit.open(url, { wasm: "zig-out/bin/zig_wasm_git.wasm" });
 ```
 
-### Reads can touch the network
+On a runtime with no filesystem *and* no reachable default (Node before 22.3,
+workerd), the default location is unreachable and `open()` says so with
+`BAD_ARG` rather than a misleading `NETWORK` error.
+
+## Reads can touch the network
 
 `getMany`, `list` and `sync` are reads, but on a cold store they do I/O:
 
@@ -197,7 +244,7 @@ await git.getMany(["config.json"], { local: true }); // never any I/O
 await git.list("", { local: true });                 // [] if the tip isn't cached
 ```
 
-### Releasing memory
+## Releasing memory
 
 Each instance holds a wasm linear memory of roughly 5MB (a 4MB arena plus
 growth). That is fine for a long-lived process and worth reclaiming in a
@@ -221,33 +268,6 @@ and every object you pull stays resident, because git history is the point.
 A custom `store` is where you add an eviction policy (TTL, LRU, size cap) if a
 long-lived process needs one — `memoryStore()` has none, so bound its lifetime
 with `close()` rather than reusing one instance forever.
-
-
-## Capability boundary (blob view <-> git terms, kept precise)
-
-The facade hides git, but the wire is still git. This table states what the
-underlying `want` / `have` negotiation, `delta` handling, and filters actually do.
-
-| Blob capability | Git mechanism | Status |
-| --- | --- | --- |
-| Pull one version | `want <tip-oid>` (protocol v2 `fetch`, single ref tip per call) | Supported |
-| Push only new versions | `have` exclusion: `collectObjects` skips everything reachable from the remote tip (`old` oid, or all advertised refs for a new branch) | Supported (push side) |
-| Incremental pull bandwidth | `have` negotiation is **not** sent on pull (v2 `fetch` is `want`-only, stateless); savings come from server-side pack `delta` + local cached-tip short-circuit (`pull` returns `{cached:true}` when `want` is already stored) | Partial: no `have` lines on pull |
-| Small transfer of similar blobs | `ofs-delta` + `ref-delta` decode (`wasm_delta_apply`), incl. thin-pack bases already in local store | Decode supported |
-| Small upload of similar blobs | `delta` encode on push | **Not supported** — push sends full objects (server re-deltifies on `gc`) |
-| Skip bytes, keep versions | `filter blob:none` / `blob:limit=<n>[kmg]` / `tree:0` / `object:type=` / `combine:+` | Supported both sides; `getMany` auto-fetches missing blobs on demand (`want=<blob-oid>`, byte-equal to full fetch) |
-| Single-file download | structure pull (`blob:none`) + `want=<blob-oid>` promisor roundtrip | Supported via `getMany` (unknown paths cost zero RTT; needs `uploadpack.allowTipSHA1InWant` on self-hosted servers, GitHub OK) |
-| Batch multi-file download | `want=[oid...]` multi-want single pack | Supported via `getMany` (one roundtrip for all missing blobs) |
-| Key enumeration | tree walk (local, post-tip) | Supported via `list(prefix)`; `list(prefix, {local:true})` for cache-only |
-| Remote version probe | `ls-refs` filtered to one ref | Supported via `remoteVersion()` (no store writes; throws on network error) |
-| Optimistic concurrency | `putMany(..., { parent })` throws locally on tip mismatch | Supported (no extra RTT; `push` still rejects non-fast-forward as backstop) |
-| Shallow history | `shallow` / `deepen` / `deepen-since` / `deepen-not` | **Not supported** (client never sends `deepen`) |
-| Delete a key | tree-entry removal in `wasm_commit` | **Not supported** — `write` only upserts; full history retained |
-| Concurrent writers | merge / conflict resolution | **None** — last-writer-wins; `push` rejects non-fast-forward, caller re-pulls and rewrites |
-| Single huge blob | wasm 4MB arena per call, whole-pack `arrayBuffer` in JS | No chunked storage; blobs approaching MBs may hit `wasm_alloc` / Worker memory limits |
-| Tags / notes / LFS / submodules | `tag` objects traversable; `gitlink` entries skipped on push; no LFS/notes protocol | Tags readable by oid; LFS/notes unsupported |
-| Platform ABIs | `fetch`, `CompressionStream`/`DecompressionStream`, `crypto.subtle`, `TextEncoder/Decoder` | Required in browser/Worker (no polyfill bundled) |
-| v1-only servers | upload-pack discovery without `version 2` | `fetch`/`lsRemote` refuse loudly (`server lacks protocol v2`); `push` (v1 receive-pack) works — probe branch pushed, `cat-file` byte-exact, branch deleted |
 
 ## Errors
 
@@ -279,82 +299,42 @@ try {
 | `BAD_STORE` | custom `store` is missing methods or returns Promises |
 | `BAD_KEY` | a write key is not a valid relative path |
 | `BAD_REF` | ref cannot be resolved in the local store |
-| `BAD_ARG` | an argument has the wrong shape (e.g. `getMany(42)`, non-string key) |
+| `BAD_ARG` | an argument has the wrong shape (e.g. `getMany(42)`, non-string key) or cannot work on this runtime |
 | `CLOSED` | the instance was never `open()`ed, or `close()` already ran |
 | `CAS_MISMATCH` | `putMany` `parent` != current tip |
 | `NON_FAST_FORWARD` | push target is not a descendant of the remote tip |
 | `PUSH_REJECTED` / `UNPACK_FAILED` | server refused the update / could not unpack |
 | `WASM_ALLOC` / `WASM_RC` / `BAD_TREE_PATH` | 4MB arena exhausted / wasm error / wasm refused a path |
 
-## Internals
+The distinction that matters most: **a missing key is a skip, a transport
+failure is a throw.** A key genuinely absent from the keyspace has no entry in
+the `Map`; a dropped connection raises `NETWORK` or `HTTP`. Only a key that is
+really not there reads as "not there".
 
-Division of labor: **protocol weight lifting in wasm** (`wasm_get` walks
-commit→tree→blob; `wasm_commit` stores blobs, rebuilds affected trees with
-git-correct sort), **IO + platform ABIs in JS** (`fetch`, compression,
-`crypto.subtle`, pluggable store). Storage goes through `host_get_object` /
-`host_put_object` callbacks (in-memory by default; any
-`{get,put,getRef,putRef,heads}` backend). Verified against real `git`:
-`log`/`ls-tree`/`cat-file`/`fsck --strict` all clean.
+## Limits
 
-## Low-level WASM exports
+- **No delete.** `putMany` upserts; there is no way to remove a key, and full history is retained.
+- **No merge.** `push` is fast-forward only. On `NON_FAST_FORWARD`, pull and rewrite — last writer
+  wins, and nobody merges for you.
+- **A custom store must be synchronous**, so it cannot wrap IndexedDB / D1 / R2 directly
+  ([Custom store](#custom-store)).
+- **The store is append-only** with no eviction, so a reused instance grows monotonically. `close()`
+  frees the wasm arena; bounding the store is the job of a custom store.
+- **Blobs are held whole in memory** — a 4MB wasm arena per call, one `arrayBuffer` per pack. Keys
+  approaching megabytes may hit `WASM_ALLOC`.
+- **Pull sends no `have` lines** (protocol v2 `fetch` is `want`-only), so incremental bandwidth
+  relies on server-side `delta` plus a cached-tip short-circuit. **Push sends full objects** — no
+  `delta` encode; the server re-deltifies on `gc`.
+- **No `shallow` / `deepen` / `notes` / `LFS` / submodules**, and no `AbortSignal` or timeout — a
+  hung request cannot be cancelled. `close()` waits for in-flight work, it does not cancel it.
+- **v1-only servers**  can be pushed to but not read from: `pull` and
+  `remoteVersion` refuse with `NO_V2`.
+- **The low-level wasm exports are untyped and unstable.** The shipped declarations cover
+  `RemoteGit` only; use `RemoteGit`.
 
-Protocol framing/parsing: `wasm_handle_discovery`, `wasm_parse_filter`, `wasm_should_omit`,
-`wasm_pktline_encode`, `wasm_build_lsrefs`, `wasm_build_fetch`, `wasm_decode_pack_header`,
-`wasm_list_refs`/`wasm_find_ref`, `wasm_pack_begin|add|end`, `wasm_parse_report_status`,
-`wasm_inflate_one`, `wasm_delta_apply`, plus `wasm_get`/`wasm_commit[2]` and `wasm_alloc/reset`.
-`wasm_commit[2]` returns `-14` for a path that cannot round-trip as a git tree
-entry (empty segment, `.`/`..`/`.git`, NUL/backslash/control char) — checked
-before any blob is stored, so a rejected batch has no side effects.
-These are untyped; the shipped declarations cover the `RemoteGit` API only.
-See `tests/server.mjs` for a working server and `src/host/portable.mjs` for the portable client.
-
-## Build & test
-
-```bash
-./scripts/fetch-deps.sh     # vendor zig 0.16.0 into ./third_party (or use system zig)
-./tests/run.sh              # zig unit + wasm/filter/pull/push/remote e2e (pull: worker-like, delta+filter, git-verified)
-PORT=3002 ./scripts/e2e.sh  # smart HTTP e2e: clone/push/fetch/partial clone (real git client)
-npm run build               # build dist/ (wasm + bundled JS + declarations)
-```
-
-`npm run build` (also wired to `prepack`) assembles `dist/`: the bundle, the
-wasm, and the declarations. The wasm has to land next to the bundle, because
-that is where `RemoteGit` looks when `wasm` is omitted.
-
-## Versioning & release flow
-
-SemVer. `package.json` is the version of record for npm; `build.zig.zon`
-carries the same number. To cut a release:
-
-1. Bump `version` in `package.json` **and** `build.zig.zon` to `X.Y.Z`
-2. Rename the `[Unreleased]` heading in `CHANGELOG.md` to `[X.Y.Z] — <date>`
-3. `git tag vX.Y.Z && git push origin main vX.Y.Z`
-4. `npm publish` (the tag is what CI releases on GitHub; npm is a separate
-   manual step, so the two can be done in either order)
-
-CI runs the full test suite on every push/PR, and additionally packs the npm
-tarball, installs it into a scratch project and exercises it, so a broken
-package fails CI rather than reaching a user. Tagging triggers the release
-workflow: build → bundle JS (pinned esbuild, no repo deps) → test → publish
-`zig_wasm_git.wasm` + `zig_wasm_git.portable.mjs` (+`SHA256SUMS`) to GitHub
-Releases.
-
-npm publishes are **irreversible**: a version, once used, cannot be reused, and
-a name cannot be released again for 72 hours after an unpublish.
-
-## Known limits (see capability boundary above for the full `want`/`have`/`delta` account)
-
-- `putMany` upserts only — no key deletion yet
-- No merge: concurrent `push` to the same tip rejects; re-pull and rewrite
-- Pull sends no `have` lines (v2 `want`-only); incremental bandwidth relies on server-side `delta` + cached-tip short-circuit
-- Push sends full objects, no `delta` encode (server re-deltifies on `gc`)
-- `blob:limit` checkout omits big blobs; `getMany` fetches them on demand
-- No `shallow`/`deepen`/`notes`/`LFS`, no chunked storage (4MB wasm arena per call)
-- No `AbortSignal` / timeout support — a hung request cannot be cancelled (`close()` waits for in-flight work, so it does not cancel it either)
-- The store is append-only with no eviction: a reused instance grows monotonically. `close()` frees the wasm arena; bounding the store is the job of a custom `store`
-- A custom `store` must be synchronous, so it cannot wrap an inherently async backend (IndexedDB, D1, R2) directly — buffer in memory or prehydrate
-- No TypeScript types for the low-level wasm exports — the declarations cover the `RemoteGit` API only
-- Test-only server (`tests/server.mjs`) shells out to `git`; the client chain never does
+The protocol-level detail behind each of these — which `want`/`have`/`delta` mechanism is used, what
+each filter does, and the module map — is in [docs/CAPABILITIES.md](docs/CAPABILITIES.md). Building,
+testing and the release flow are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
