@@ -74,7 +74,7 @@ jobs:
           // back as an empty Map that reads like "no such key"
           const fresh = await RemoteGit.open("https://example.invalid/r.git");
           let code = null, ours = false, kind = null;
-          try { await fresh.getMany(["a"]); } catch (e) { code = e.code; kind = e.kind; ours = GitError.is(e); }
+          try { await fresh.getMany(["a"]); } catch (e) { code = e.code; kind = e.kind; ours = GitError.isIO(e); }
           if (!ours || code !== "NETWORK" || kind !== "io") {
             throw new Error("expected a GitError with kind io / code NETWORK, got ours=" + ours + " kind=" + kind + " code=" + code);
           }
@@ -83,8 +83,8 @@ jobs:
             throw new Error("GitError.isProtocol did not match a code in the set");
           }
           // delete roundtrip through the packaged bundle
-          await git.removeMany(["docs/a.md"], "drop");
-          if (await git.get("docs/a.md") !== null) throw new Error("removeMany failed in packaged bundle");
+          await git.putMany({ "docs/a.md": null }, "drop");
+          if ((await git.getMany(["docs/a.md"])).size !== 0) throw new Error("null delete failed in packaged bundle");
           console.log("npm tarball smoke ok:", sha.slice(0, 7));
           EOF
           node smoke.mjs

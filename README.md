@@ -55,7 +55,7 @@ curl -LO https://github.com/est/zig-wasm-git/releases/latest/download/zig_wasm_g
 Each release ships fixed-name files + `SHA256SUMS`, built by CI from the tagged
 commit (pin a version via the per-tag download path):
 
-- `zig_wasm_git.wasm` — the protocol engine (~65KB)
+- `zig_wasm_git.wasm` — the protocol engine (~60KB)
 - `zig_wasm_git.portable.mjs` — single-file JS for browser/CF Worker/Node (`RemoteGit` + `memoryStore`)
 
 ## Quick start
@@ -76,7 +76,7 @@ console.log(new TextDecoder().decode(blobs.get("notes/hello.md"))); // -> "# hel
 
 ## What you get
 
-- A **~65KB** `wasm32-freestanding ReleaseSmall` binary with no libc, importing
+- A **~60KB** `wasm32-freestanding ReleaseSmall` binary with no libc, importing
   only `env.host_*` — SHA-1, zlib inflate/deflate, pack v2 (incl. ofs/ref
   delta), delta apply, pkt-line, and smart HTTP (`v1` + `v2 ls-refs/fetch=filter`
   + receive-pack + upload-pack clients), all in Zig.
@@ -107,10 +107,7 @@ const git = await RemoteGit.open(url, {
 | method | returns | notes |
 | --- | --- | --- |
 | `getMany(paths, opts?)` | `Map(path -> bytes)` | `paths` is a key or an array. Missing keys are **skipped**, not errors. `opts.as: "text"` decodes to strings. May hit the network — see [Reads can touch the network](#reads-can-touch-the-network) |
-| `get(path, opts?)` | `bytes \| string \| null` | single-key read; `null` when absent. Same `opts` as `getMany` |
-| `readAll(prefix?, opts?)` | `Map(path -> bytes)` | `list` + `getMany` in one call for small keyspaces |
-| `putMany(entries, msg?, parent?)` | commit sha | one version (a commit) on the current tip. Upsert only (see `removeMany`). `parent` oid (or `{ parent }`) for CAS |
-| `removeMany(paths, msg?, parent?)` | commit sha | delete keys as one version. Missing keys are a no-op; empty dirs are pruned. Same CAS contract as `putMany` |
+| `putMany(entries, msg?, opts?)` | commit sha | one version (a commit) on the current tip. A `null` value deletes the key (missing keys are a no-op, empty dirs are pruned), so one call mixes upserts and deletes. `{ parent }` oid for CAS |
 | `list(prefix?, opts?)` | `[{path, oid}]` | key enumeration. `""` (default) lists everything |
 | `log(limit = 10)` | `[{sha, tree, parents, author, message}]` | newest first, local only |
 | `version()` | `string \| null` | local tip oid; `null` when the keyspace is empty. Never hits the network |
@@ -124,17 +121,17 @@ const git = await RemoteGit.open(url, {
 // Reads: a key or an array; missing keys are skipped, never errors.
 // { as: "text" } decodes UTF-8 so small text keyspaces skip TextDecoder.
 await git.getMany(["some/path/README.md"]);         // Map(path -> Uint8Array)
-await git.get("some/path/README.md", { as: "text" }); // string | null
-await git.readAll("some/path/", { as: "text" });      // Map(path -> string)
+await git.getMany(["some/path/README.md"], { as: "text" }); // Map(path -> string)
 await git.getMany(["config.json"], { local: true }); // cache-only, never any I/O
 
 // Writes. Keys are relative paths: no empty segment, no `.` / `..` / `.git`; a
 // malformed key throws TypeError rather than being normalized. Content is a
 // string or Uint8Array/ArrayBuffer — anything else throws TypeError
-// rather than being stored as "[object Object]".
+// rather than being stored as "[object Object]". A `null` value deletes the
+// key (missing keys are a no-op, empty dirs are pruned).
 await git.putMany({ "a.txt": "hi" }, "update greeting"); // -> commit sha
-await git.removeMany(["a.txt"], "drop it");              // -> commit sha
-await git.removeMany("a.txt", "drop one");               // single key works too
+await git.putMany({ "a.txt": null }, "drop it");         // -> commit sha
+await git.putMany({ "old.txt": null, "new.txt": "hi" }, "rename in one version");
 ```
 
 A transport failure throws instead of returning a partial Map, so `map.size`
@@ -272,7 +269,6 @@ try {
 | --- | --- |
 | `GitError.isIO(e)` | transport failed (`NETWORK` / `HTTP`) — retry later |
 | `GitError.isProtocol(e)` | server refused (`CAS_MISMATCH`, `NON_FAST_FORWARD`, `PUSH_REJECTED`, `UNPACK_FAILED`, `NO_V2`, `NO_REMOTE_REF`, `NO_SUCH_OBJECT`, `PROTOCOL_ERROR`) — fix the request |
-| `GitError.is(e)` | either kind |
 
 Programmer mistakes are **not** `GitError` on purpose — catching them as
 "retryable" would loop forever on a bug:
@@ -289,7 +285,13 @@ mistake one for the other.
 
 - **No merge.** `push` is fast-forward only. On `NON_FAST_FORWARD`, pull and rewrite — last writer
   wins, and nobody merges for you.
-- **Oversize values throw `TypeError`.** Blobs are held whole in memory — a 4MB wasm arena per call, one `arrayBuffer` per pack. Keys approaching megabytes should be split into smaller writes.
+- **Oversize writes throw `TypeError`.** One wasm call holds several copies of
+  the data at once, so the measured ceiling is **~768KB per value**
+  (round-trip; reads materialize one extra copy) and **~1MB per `putMany`
+  batch**. Split bigger values across multiple keys, bigger batches across
+  calls. Reads loop key-by-key, so one `getMany` call has no total cap.
+  Packs arrive whole (`arrayBuffer`), so keys approaching megabytes also
+  cost Worker memory per fetch.
 - **A custom store must be synchronous**, so it cannot wrap IndexedDB / D1 / R2 directly
   ([Custom store](#custom-store)).
 - **The store is append-only** with no eviction, so a reused instance grows monotonically. Bounding the store is the job of a custom store (see [Memory](#memory)).

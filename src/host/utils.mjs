@@ -15,6 +15,18 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 export { enc, dec };
 
+/// Measured per-call capacity (not guessed): one wasm call holds several
+/// copies of the data at once (input TLV + raw assembly + deflate output +
+/// trees) out of the 4MB arena. Reads materialize one extra copy, so the
+/// binding constraint is the round-trip: single values are safe under
+/// ~768KB, and each putMany batch must total ~1MB or less. Reads loop
+/// key-by-key so only one blob at a time counts.
+export const SINGLE_BYTES = 768 * 1024;
+export const BATCH_BYTES = 1024 * 1024;
+
+export const fmtSize = (n) =>
+  n >= 1024 * 1024 ? `${(n / 1048576).toFixed(2)}MB` : `${Math.max(1, Math.round(n / 1024))}KB`;
+
 // ── errors ──
 
 /// The one operational error type this library throws. Branch on `.kind`,
@@ -33,10 +45,6 @@ export class GitError extends Error {
     if (extra.status !== undefined) this.status = extra.status;
     if (extra.key !== undefined) this.key = extra.key;
     if (extra.ref !== undefined) this.ref = extra.ref;
-  }
-
-  static is(e) {
-    return e instanceof GitError;
   }
 
   static isIO(e) {
@@ -313,7 +321,7 @@ function dv(wasm) {
 function allocBytes(wasm, b) {
   if (b.length === 0) return { ptr: 0, len: 0 };
   const ptr = wasm.wasm_alloc(b.length);
-  if (!ptr) throwUsage("value too large for the 4MB wasm arena — split it into smaller writes");
+  if (!ptr) throwUsage(`data too large for one wasm call (${fmtSize(b.length)}) — split it into smaller calls`);
   new Uint8Array(wasm.memory.buffer).set(b, ptr);
   return { ptr, len: b.length };
 }

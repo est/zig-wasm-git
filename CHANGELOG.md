@@ -3,6 +3,40 @@
 Notable changes, written for people using the library. Follows
 [Keep a Changelog](https://keepachangelog.com/); versions are [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Breaking
+
+- **One write path: `putMany` takes `null` deletes, `removeMany` is gone.**
+  `putMany({ "a.txt": null }, msg)` deletes (missing keys are a no-op,
+  empty dirs are pruned), so one commit can mix upserts and deletes
+  atomically — previously impossible without two versions. Rename in one
+  version: `putMany({ "old.txt": null, "new.txt": "hi" }, "rename")`.
+- **`get` and `readAll` are gone; `getMany` is the only read.**
+  A single key needs no wrapper: `getMany("a.txt")`. Small keyspaces are
+  `list` + `getMany`, two calls.
+- **`putMany` parent is `{ parent }` only.** A bare oid string throws
+  `TypeError` instead of writing unguarded — a dropped brace fails loudly.
+- **`GitError.is(e)` is gone.** Branch on `GitError.isIO(e)` /
+  `GitError.isProtocol(e, ...codes)`; either matches exactly the errors of
+  its kind.
+- **Smaller engine (~60KB): server-side wasm helpers are out.**
+  `wasm_handle_discovery`, `wasm_parse_filter`, `wasm_should_omit`,
+  `wasm_pktline_encode` and `wasm_find_ref` no longer ship in the binary
+  (`filter`/`partial`/`proto` stay unit-tested but unlinked). The export
+  list is client-only: `wasm_get`/`wasm_commit`, pack build, fetch/ls-refs
+  build, inflate, delta, ref/status parse.
+
+### Fixed
+
+- **Capacity failures are `TypeError` with the failing limit named.**
+  Writes past the measured ceiling used to surface as a bare
+  `Error: wasm_commit rc=-1` (the "report a bug" class). They now say
+  whether one value (`~768KB` round-trip safe) or the whole batch
+  (`~1MB` per `putMany`) overflowed and how to split.
+  Reads loop key-by-key, so a `getMany` larger than the old ~1MB
+  batch cap works as long as each blob fits.
+
 ## [1.7.0] — 2026-09-27
 
 ### Breaking

@@ -8,51 +8,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
 // Simple bare repo in ./data/<repo>.git  (objects + refs)
 const DATA_DIR = join(REPO_ROOT, "data");
-const WASM_PATH = join(REPO_ROOT, "zig-out/bin/zig_wasm_git.wasm");
-
-let wasm = null;
-let wasmMem = null;
-let wasmInstance = null;
-let emitBuf = [];
-
-function loadWasm() {
-  const bytes = readFileSync(WASM_PATH);
-  const imports = {
-    env: {
-      host_emit_bytes: (ptr, len) => {
-        const mem = new Uint8Array(wasmInstance.exports.memory.buffer);
-        emitBuf.push(Buffer.from(mem.slice(ptr, ptr + len)));
-      },
-      host_log: (ptr, len) => {
-        const mem = new Uint8Array(wasmInstance.exports.memory.buffer);
-        console.log("[wasm]", Buffer.from(mem.slice(ptr, ptr + len)).toString());
-      },
-      host_get_object: () => -1, // smart-HTTP host doesn't use object store
-      host_put_object: () => -1,
-    },
-  };
-  const mod = new WebAssembly.Module(bytes);
-  const inst = new WebAssembly.Instance(mod, imports);
-  wasmInstance = inst;
-  wasm = inst.exports;
-  wasmMem = inst.exports.memory;
-  // Make memory available as wasm.exports.memory for wasm callbacks that read via exports
-  // Zig wasm32-freestanding may export memory as "memory" already
-  if (!wasm.memory) wasm.memory = inst.exports.memory;
-}
-
-function wasmAlloc(bytes) {
-  const ptr = wasm.wasm_alloc(bytes.length);
-  if (!ptr) throw new Error("wasm_alloc failed");
-  const mem = new Uint8Array(wasmMem.buffer);
-  mem.set(bytes, ptr);
-  return ptr;
-}
-
-function wasmGetSlice(ptr, len) {
-  const mem = new Uint8Array(wasmMem.buffer);
-  return Buffer.from(mem.slice(ptr, ptr + len));
-}
 
 // --- storage: bare repo on filesystem (data/<name>.git) ---
 function repoPath(name) {
@@ -271,18 +226,7 @@ async function handleDiscovery(url, req, res, service) {
   }
   const refs = listRefs(repo);
   const refsPkt = buildRefsPkt(refs);
-  emitBuf = [];
-  wasm.wasm_reset();
-  const refsBytes = Buffer.from(refsPkt);
-  const ptr = wasmAlloc(refsBytes);
-  const svc = service === "git-upload-pack" ? 0 : 1;
-  wasm.wasm_handle_discovery(svc, ptr, refsBytes.length);
-  let out;
-  if (emitBuf.length > 0) {
-    out = Buffer.concat(emitBuf);
-  } else {
-    out = Buffer.from(pktLine(`# service=${service}\n`) + pktFlush() + refsPkt);
-  }
+  const out = Buffer.from(pktLine(`# service=${service}\n`) + pktFlush() + refsPkt);
   const ct = service === "git-upload-pack"
     ? "application/x-git-upload-pack-advertisement"
     : "application/x-git-receive-pack-advertisement";
@@ -335,14 +279,6 @@ async function handleUploadPackV2(url, req, res) {
     }
     // For ls-refs, never fall through to git upload-pack --stateless-rpc (it speaks v1)
     if (cmd === "fetch") {
-      console.log(`  wasm_should_omit check for fetch filter=${filterSpec}`);
-      if (filterSpec) {
-        wasm.wasm_reset();
-        const fptr = wasmAlloc(Buffer.from(filterSpec));
-        const kptr = wasmAlloc(Buffer.from("blob"));
-        const omit = wasm.wasm_should_omit(kptr, 4, 100, fptr, filterSpec.length);
-        console.log(`  wasm_should_omit(blob,100, filter=${filterSpec}) = ${omit}`);
-      }
       await handleV2Fetch(repo, body, res);
       return;
     }
@@ -509,13 +445,6 @@ async function handleUploadPack(url, req, res) {
 async function handleUploadPackInner(repo, body, res) {
   const filterSpec = wantsFilterFromBody(body);
   console.log(`[upload-pack] repo=${repo} body=${body.length} filter=${filterSpec || "(none)"} ` + body.toString().slice(0, 300).replace(/\0/g, "\\0"));
-  if (filterSpec) {
-    wasm.wasm_reset();
-    const fptr = wasmAlloc(Buffer.from(filterSpec));
-    const kptr = wasmAlloc(Buffer.from("blob"));
-    const omit = wasm.wasm_should_omit(kptr, 4, 100, fptr, filterSpec.length);
-    console.log(`  wasm_should_omit(blob,100, filter=${filterSpec}) = ${omit}`);
-  }
   try {
     const rp = repoPath(repo);
     const out = execFileSync("git", ["upload-pack", "--stateless-rpc", rp], { input: body, maxBuffer: 64 * 1024 * 1024 });
@@ -546,9 +475,6 @@ async function handleReceivePack(url, req, res) {
     res.end(e.stdout || Buffer.from(""));
   }
 }
-
-loadWasm();
-console.log(`[wasm] loaded size=${readFileSync(WASM_PATH).length} exports=${Object.keys(wasm).join(",")}`);
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const server = createServer(async (req, res) => {

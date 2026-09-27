@@ -24,7 +24,7 @@
 // Failures: operational failures throw GitError (kind io/protocol, see
 // utils.mjs); usage mistakes throw TypeError; invariants throw Error.
 
-import { memoryStore, deflateZlib, joinUrl, withBasicAuth, looseBody, enc, dec, hexOfBytes, concatU8, parseCommit, parseTreeEntries, commitParentsAndTree, netFetch, assertSyncStore, assertKeys, keyProblem, throwProtocol, throwUsage, GitError } from "./utils.mjs";
+import { memoryStore, deflateZlib, joinUrl, withBasicAuth, looseBody, enc, dec, hexOfBytes, concatU8, parseCommit, parseTreeEntries, commitParentsAndTree, netFetch, assertSyncStore, assertKeys, keyProblem, throwProtocol, throwUsage, GitError, SINGLE_BYTES, fmtSize } from "./utils.mjs";
 import {
   fetchIntoStore, lsRemote,
   collectObjects, TYPE_NUM, ZERO_OID, decodeRefsTlv, decodeStatusTlv,
@@ -76,16 +76,18 @@ const keyList = (paths) => {
   return [...paths];
 };
 
-/// putMany entries -> [path, bytes] pairs. An object literal is the natural way
-/// to write several named values in JS and stays the documented form; a Map is
-/// accepted because callers often already hold one.
+/// putMany entries -> [path, bytes | null] pairs. An object literal is the
+/// natural way to write several named values in JS and stays the documented
+/// form; a Map is accepted because callers often already hold one. A `null`
+/// value deletes the key (missing keys are a no-op, empty dirs are pruned),
+/// so one commit can mix upserts and deletes atomically.
 function entryPairs(entries) {
   if (entries == null) return [];
-  if (entries instanceof Map) return [...entries].map(([k, v]) => [k, toU8(v)]);
+  if (entries instanceof Map) return [...entries].map(([k, v]) => [k, v == null ? null : toU8(v)]);
   if (typeof entries !== "object" || Array.isArray(entries)) {
     throwUsage(`putMany entries must be an object or Map; got ${typeName(entries)}`);
   }
-  return Object.entries(entries).map(([k, v]) => [k, toU8(v)]);
+  return Object.entries(entries).map(([k, v]) => [k, v == null ? null : toU8(v)]);
 }
 
 function nodeFs() {
@@ -99,6 +101,7 @@ function nodeFs() {
 }
 
 async function resolveWasmInput(wasmOpt) {
+  // hey these few line does many jobs, eliminate them doesn't improve much.
   if (wasmOpt && (wasmOpt instanceof WebAssembly.Module || typeof wasmOpt !== "string")) {
     return wasmOpt; // typed array / ArrayBuffer; instantiate validates
   }
@@ -252,7 +255,7 @@ export class RemoteGit {
       const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
       if (!u8.length) return { ptr: 0, len: 0 };
       const ptr = w.wasm_alloc(u8.length);
-      if (!ptr) throwUsage("value too large for the 4MB wasm arena — split it into smaller writes");
+      if (!ptr) throwUsage(`input too large for one wasm call (${fmtSize(u8.length)}) — split it into smaller putMany batches`);
       mem().set(u8, ptr);
       return { ptr, len: u8.length };
     };
@@ -331,12 +334,38 @@ export class RemoteGit {
       const outPtrAddr = w.wasm_alloc(4);
       const outLenAddr = w.wasm_alloc(4);
       const rc = w.wasm_get(oidHex.ptr, oidHex.len, pj.ptr, pj.len, outPtrAddr, outLenAddr);
+      if (rc === -1) {
+        // Arena OOM inside wasm (the only realistic failure once the inputs
+        // staged fine): a capacity limit, not a corrupt store — say so.
+        throwUsage(paths.length === 1
+          ? `blob too large to materialize ("${paths[0]}" is over the ~768KB single-blob limit — split the value across multiple keys)`
+          : `read batch too large for one wasm call (${paths.length} keys) — read fewer keys per getMany call`);
+      }
       if (rc !== 0) throw new Error(`wasm_get rc=${rc}`);
       const dv = new DataView(w.memory.buffer);
       const tlvPtr = dv.getUint32(outPtrAddr, true);
       const tlvLen = dv.getUint32(outLenAddr, true);
       return this._decodeGetTlv(new Uint8Array(w.memory.buffer.slice(tlvPtr, tlvPtr + tlvLen)));
     });
+  }
+
+  /// One value past the readable ceiling is refused up front: writes have
+  /// ~250KB more arena headroom than reads (reads add a copy), so a reactive
+  /// check would happily store a value that can never be read back.
+  _assertValueSizes(pairs) {
+    for (const [path, content] of pairs) {
+      if (content && content.length > SINGLE_BYTES) {
+        throwUsage(`value too large: "${path}" is ${fmtSize(content.length)} — single values must stay under ~768KB; split the value across multiple keys`);
+      }
+    }
+  }
+
+  /// The reactive form, for a batch that outgrew the per-call buffer. Every
+  /// value is already known to fit, so only the total can be the problem.
+  _batchTooLarge(entriesObj) {
+    let total = 0;
+    for (const content of Object.values(entriesObj)) total += content?.length ?? 0;
+    throwUsage(`write batch too large (${fmtSize(total)} total) — each putMany call must fit ~1MB; use fewer or smaller keys per call`);
   }
 
   _commitInner(parent, message, entriesObj) {
@@ -349,8 +378,9 @@ export class RemoteGit {
       }));
       const ej = ab(this._encodeEntriesTlv(entries));
       const outHex = w.wasm_alloc(40);
-      if (!outHex) throwUsage("write too large for the 4MB wasm arena — split it into smaller commits");
+      if (!outHex) this._batchTooLarge(entriesObj);
       const rc = w.wasm_commit(pHex.ptr, pHex.len, msg.ptr, msg.len, ej.ptr, ej.len, outHex);
+      if (rc === -1) this._batchTooLarge(entriesObj);
       if (rc !== 0) throw new Error(`wasm_commit rc=${rc}`);
       const sha = rs(outHex, 40);
       if (this.ref) this._store.putRef(this.ref, sha);
@@ -379,7 +409,7 @@ export class RemoteGit {
         await this._pullInner({});
       } catch (e2) {
         if (GitError.isProtocol(e2, "NO_REMOTE_REF")) return null; // empty remote — a real answer
-        throw GitError.is(e2) ? e2 : (firstErr ?? e2);
+        throw e2 instanceof GitError ? e2 : (firstErr ?? e2);
       }
     }
     return this._resolveRefOrNull(this.ref);
@@ -389,11 +419,21 @@ export class RemoteGit {
     return this._getManyBytes(paths, opts);
   }
 
+  /// One wasm_get per key: a single call materializes every blob into one
+  /// TLV, so a batched call is bounded by the ~1MB per-call buffer no matter
+  /// how small each value is. Key-by-key keeps the bound at one blob; the
+  /// extra calls are local and cheap (no network).
+  _getRows(paths) {
+    const rows = [];
+    for (const p of paths) rows.push(...this._getInner(this.ref, [p]));
+    return rows;
+  }
+
   async _getManyBytes(paths, opts = {}) {
     const out = new Map();
     const tip = opts.local === true ? this._localTip() : await this._tipInner();
     if (!tip || !paths.length) return out;
-    const rows = this._getInner(this.ref, paths);
+    const rows = this._getRows(paths);
     const missing = [];
     for (const row of rows) {
       if (!row.error) out.set(row.path, row.content);
@@ -411,7 +451,7 @@ export class RemoteGit {
         // rethrown so the caller never reads "network down" as "no such key".
         if (!GitError.isProtocol(e, "NO_SUCH_OBJECT", "NO_REMOTE_REF")) throw e;
       }
-      for (const row of this._getInner(this.ref, missing)) {
+      for (const row of this._getRows(missing)) {
         if (!row.error) out.set(row.path, row.content);
       }
     }
@@ -427,7 +467,7 @@ export class RemoteGit {
     const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
     if (u8.length === 0) return { ptr: 0, len: 0 };
     const ptr = w.wasm_alloc(u8.length);
-    if (!ptr) throwUsage("value too large for the 4MB wasm arena — split it into smaller writes");
+    if (!ptr) throwUsage(`data too large for one wasm call (${fmtSize(u8.length)}) — split it into smaller calls`);
     new Uint8Array(w.memory.buffer).set(u8, ptr);
     return { ptr, len: u8.length };
   }
@@ -582,25 +622,18 @@ throwProtocol("UNPACK_FAILED", `unpack failed: ${status.unpackMsg}`, { ref: this
     return map;
   }
 
-  /// Single-key read: bytes (or string with `{ as: "text" }`), null when absent.
-  async get(path, opts = {}) {
-    if (typeof path !== "string") throwUsage("get(path) takes a single key string");
-    const map = await this.getMany([path], opts);
-    return map.get(path) ?? null;
-  }
-
-  /// Small-keyspace convenience: list + getMany in one call.
-  /// Prefix-filtered server-side by nothing — it pulls structure once, then
-  /// batches missing blobs in one roundtrip like getMany does.
-  async readAll(prefix = "", opts = {}) {
-    const keys = (await this.list(prefix, opts)).map((e) => e.path);
-    return this.getMany(keys, opts);
-  }
-
-  async putMany(entries, message = "update", parentOrOptions) {
-    const expected = typeof parentOrOptions === "string" ? parentOrOptions : parentOrOptions?.parent;
+  /// Write keys as one version (commit); returns the new sha. A `null` value
+  /// deletes the key — missing keys are a no-op, empty dirs are pruned — so
+  /// one call can mix upserts and deletes atomically. Pass `{ parent }` for
+  /// compare-and-swap.
+  async putMany(entries, message = "update", options) {
+    if (typeof options === "string") {
+      throwUsage("putMany parent must be { parent }, not a bare oid string");
+    }
+    const expected = options?.parent;
     const pairs = entryPairs(entries);
     assertKeys(pairs.map(([p]) => p));
+    this._assertValueSizes(pairs);
     const flat = Object.fromEntries(pairs);
     return this._seq(async () => {
       const tip = this._resolveRefOrNull(this.ref);
@@ -610,34 +643,6 @@ throwProtocol("UNPACK_FAILED", `unpack failed: ${status.unpackMsg}`, { ref: this
           `CAS mismatch: tip ${(tip ?? "").slice(0, 7) || "(empty)"} != expected ${String(expected).slice(0, 7)}`,
           { ref: this.ref },
         );
-      }
-      return this._commitInner(expected ?? tip ?? "", message, flat);
-    });
-  }
-
-  /// Delete keys as one version (commit); returns the new sha.
-  /// Missing keys are a no-op (mirrors getMany skip semantics). Empty dirs are
-  /// pruned — git never stores them. Same CAS contract as putMany.
-  async removeMany(paths, message = "remove", parentOrOptions) {
-    const list_ = keyList(paths);
-    if (!list_.length) throwUsage("removeMany(paths) needs at least one key");
-    assertKeys(list_);
-    const expected = typeof parentOrOptions === "string" ? parentOrOptions : parentOrOptions?.parent;
-    const flat = Object.fromEntries(list_.map((p) => [p, null]));
-    return this._seq(async () => {
-      const tip = this._resolveRefOrNull(this.ref);
-      if (expected != null && (tip ?? "") !== expected) {
-        throwProtocol(
-          "CAS_MISMATCH",
-          `CAS mismatch: tip ${(tip ?? "").slice(0, 7) || "(empty)"} != expected ${String(expected).slice(0, 7)}`,
-          { ref: this.ref },
-        );
-      }
-      if (tip == null && expected == null) {
-        // deleting from an empty keyspace: still record one (empty) version so
-        // push/pull/log have something to point at? No — nothing to delete,
-        // return nothing to push. Matches list() == [] on empty.
-        return this._commitInner("", message, flat);
       }
       return this._commitInner(expected ?? tip ?? "", message, flat);
     });

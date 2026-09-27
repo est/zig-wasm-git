@@ -57,8 +57,8 @@ try {
   if (log2.split("\n").length !== 2) throw new Error("server should have 2 commits");
   console.log("server log:\n  " + log2.split("\n").join("\n  "));
 
-  // ── delete push: removeMany -> push -> git-verified ──
-  const c3 = await local.removeMany(["src/a.txt"], "drop a");
+  // ── delete push: putMany null -> push -> git-verified ──
+  const c3 = await local.putMany({ "src/a.txt": null }, "drop a");
   const r3 = await local.push();
   if (!r3.updated) throw new Error("delete push failed");
   try {

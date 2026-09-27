@@ -296,7 +296,7 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
     if (pack.length < 32) throwProtocol("PROTOCOL_ERROR", `fetch response has no pack (${pack.length}B)`);
     await verifyPackTrailer(subtle, pack);
   } catch (e) {
-    if (GitError.is(e)) throw e;
+    if (e instanceof GitError) throw e;
     throwProtocol("PROTOCOL_ERROR", `corrupt fetch reply: ${e?.message ?? e}`, { cause: e });
   }
   if (opts.onProgress && progress.length) opts.onProgress(progress);
@@ -307,7 +307,7 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   try {
     ({ objects, pending } = unpackPack(wasm, pack));
   } catch (e) {
-    if (GitError.is(e)) throw e;
+    if (e instanceof GitError) throw e;
     throwProtocol("PROTOCOL_ERROR", `corrupt pack: ${e?.message ?? e}`, { cause: e });
   }
   const known = new Map(); // hex -> {type, body}
@@ -331,7 +331,7 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
       try {
         return resolveRefDeltas(wasm, pending, known);
       } catch (e) {
-        if (GitError.is(e)) throw e;
+        if (e instanceof GitError) throw e;
         throwProtocol("PROTOCOL_ERROR", `corrupt ref-delta: ${e?.message ?? e}`, { cause: e });
       }
     })();

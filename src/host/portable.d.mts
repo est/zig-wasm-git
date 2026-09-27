@@ -67,7 +67,6 @@ export class GitError<C extends GitErrorCode = GitErrorCode> extends Error {
     message: string,
     extra?: { cause?: unknown; status?: number; key?: string; ref?: string },
   );
-  static is(e: unknown): e is GitError;
   static isIO(e: unknown): e is GitError<GitIOCode>;
   static isProtocol<C2 extends GitProtocolCode>(e: unknown, ...codes: C2[]): e is GitError<C2>;
   static isProtocol(e: unknown): e is GitError<GitProtocolCode>;
@@ -186,33 +185,16 @@ export class RemoteGit {
   /** Read keys as text. Missing keys are skipped. May hit the network. */
   getMany(paths: string | string[] | Iterable<string>, opts: GetOptions & { as: "text" }): Promise<Map<string, string>>;
 
-  /** Single-key read: bytes (or string with `{ as: "text" }`), null when absent. */
-  get(path: string, opts?: GetOptions & { as?: "bytes" }): Promise<Uint8Array | null>;
-  get(path: string, opts: GetOptions & { as: "text" }): Promise<string | null>;
-
-  /** Small-keyspace convenience: list + getMany in one call. */
-  readAll(prefix?: string, opts?: GetOptions & { as?: "bytes" }): Promise<Map<string, Uint8Array>>;
-  readAll(prefix: string, opts: GetOptions & { as: "text" }): Promise<Map<string, string>>;
-
   /**
    * Write keys as one version (commit); returns the new sha.
-   * Upsert only (see {@link RemoteGit.removeMany} for deletes).
-   * Pass a parent oid (or `{ parent }`) for compare-and-swap.
+   * A `null` value deletes the key (missing keys are a no-op, empty dirs
+   * are pruned), so one call can mix upserts and deletes atomically.
+   * Pass `{ parent }` for compare-and-swap.
    */
   putMany(
-    entries: Record<string, string | Uint8Array | ArrayBuffer | ArrayBufferView> | Map<string, string | Uint8Array | ArrayBuffer | ArrayBufferView>,
+    entries: Record<string, string | Uint8Array | ArrayBuffer | ArrayBufferView | null> | Map<string, string | Uint8Array | ArrayBuffer | ArrayBufferView | null>,
     message?: string,
-    parentOrOptions?: string | PutOptions,
-  ): Promise<string>;
-
-  /**
-   * Delete keys as one version (commit); returns the new sha.
-   * Missing keys are a no-op. Empty dirs are pruned. Same CAS contract as putMany.
-   */
-  removeMany(
-    paths: string | string[] | Iterable<string>,
-    message?: string,
-    parentOrOptions?: string | PutOptions,
+    options?: PutOptions,
   ): Promise<string>;
 
   /** Enumerate keys as `[{path, oid}]`, optionally filtered by prefix. */

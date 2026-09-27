@@ -24,9 +24,9 @@ underlying negotiation, delta handling and filters actually do.
 | Remote version probe | `ls-refs` filtered to one ref | Supported via `remoteVersion()` (no store writes; throws on network error) |
 | Optimistic concurrency | `putMany(..., { parent })` throws locally on tip mismatch | Supported (no extra RTT; `push` still rejects non-fast-forward as backstop) |
 | Shallow history | `shallow` / `deepen` / `deepen-since` / `deepen-not` | **Not supported** (client never sends `deepen`) |
-| Delete a key | tree-entry removal in `wasm_commit` (content-len `0xFFFFFFFF` marker) | Supported via `removeMany` (missing keys are a no-op, empty dirs pruned) |
+| Delete a key | tree-entry removal in `wasm_commit` (content-len `0xFFFFFFFF` marker) | Supported via `putMany` with a `null` value (missing keys are a no-op, empty dirs pruned; mixes with upserts in one version) |
 | Concurrent writers | merge / conflict resolution | **None** — last-writer-wins; `push` rejects non-fast-forward, caller re-pulls and rewrites |
-| Single huge blob | wasm 4MB arena per call, whole-pack `arrayBuffer` in JS | No chunked storage; blobs approaching MBs may hit `wasm_alloc` / Worker memory limits |
+| Single huge blob | one wasm call holds several in-flight copies out of the 4MB arena: single values round-trip safely under ~768KB, each commit totals ~1MB or less; reads loop key-by-key (no batch cap); whole-pack `arrayBuffer` in JS | No chunked storage; values over ~768KB must be split across keys by the caller |
 | Tags / notes / LFS / submodules | `tag` objects traversable; `gitlink` entries skipped on push; no LFS/notes protocol | Tags readable by oid; LFS/notes unsupported |
 | Platform ABIs | `fetch`, `CompressionStream`/`DecompressionStream`, `crypto.subtle`, `TextEncoder/Decoder` | Required in browser/Worker (no polyfill bundled) |
 | v1-only servers | upload-pack discovery without `version 2` | `fetch`/`lsRemote` refuse loudly (`server lacks protocol v2`); `push` (v1 receive-pack) works — probe branch pushed, `cat-file` byte-exact, branch deleted |
@@ -46,16 +46,15 @@ git-correct sort), **IO + platform ABIs in JS** (`fetch`, compression,
 | `src/zig/root.zig` | test entry point; pulls in every module's unit tests |
 | `src/zig/wasm.zig` | the `env.host_*` ABI surface: `wasm_get`, `wasm_commit`, alloc/reset |
 | `src/zig/{fetch,push,pack,delta,zlib,sha1,oid,object}.zig` | protocol v2 fetch, receive-pack push, pack v2 framing, delta apply, inflate, SHA-1, object encode/decode |
-| `src/zig/{pktline,proto,filter,partial,enc}.zig` | pkt-line framing, wire shapes, filter parse/apply, negotiated-partial state, hex/base64 |
+| `src/zig/{pktline,proto,filter,partial,enc}.zig` | pkt-line framing, wire shapes, filter parse/apply, negotiated-partial state, hex/base64 (unit-tested via `root.zig`; `proto`/`filter`/`partial` no longer link into the client binary) |
 | `src/host/portable.mjs` | `RemoteGit` — the public API (wasm-touching methods share one queue; `version()`/`log()` are local) |
 | `src/host/sync.mjs` | fetch-into-store, `lsRemote`, `collectObjects`, TLV ref/status decoders |
 | `src/host/utils.mjs` | errors (GitError io/protocol + TypeError usage), key validation, `memoryStore`, zlib, auth, loose/tree/commit parsing |
 
 ## Low-level WASM exports
 
-Protocol framing/parsing: `wasm_handle_discovery`, `wasm_parse_filter`, `wasm_should_omit`,
-`wasm_pktline_encode`, `wasm_build_lsrefs`, `wasm_build_fetch`,
-`wasm_list_refs`/`wasm_find_ref`, `wasm_pack_begin|add|end`, `wasm_parse_report_status`,
+Protocol framing/parsing: `wasm_build_lsrefs`, `wasm_build_fetch`,
+`wasm_list_refs`, `wasm_pack_begin|add|end`, `wasm_parse_report_status`,
 `wasm_inflate_one`, `wasm_delta_apply`, plus `wasm_get`/`wasm_commit` and `wasm_alloc/reset`.
 Path validation lives in JS (`assertKeys`) — wasm trusts its caller.
 

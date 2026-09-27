@@ -29,12 +29,6 @@ export async function positive(): Promise<void> {
   const fromSet: Map<string, Uint8Array> = await git.getMany([...new Set(["a.txt"])]);
   const single: Map<string, Uint8Array> = await git.getMany("a.txt");
   const text: Map<string, string> = await git.getMany(["a.txt"], { as: "text" });
-  const one: Uint8Array | null = await git.get("a.txt");
-  const oneText: string | null = await git.get("a.txt", { as: "text", local: true });
-  const all: Map<string, Uint8Array> = await git.readAll();
-  const allText: Map<string, string> = await git.readAll("docs/", { as: "text", local: true });
-  const dropped: string = await git.removeMany(["a.txt"], "drop");
-  const droppedOne: string = await git.removeMany("b.bin", "drop one", { parent: dropped });
   const store: Store = git.store;
 
   const sha: string = await git.putMany({ "a.txt": "hi", "b.bin": new Uint8Array([1]) });
@@ -43,7 +37,8 @@ export async function positive(): Promise<void> {
     "message",
     { parent: sha },
   );
-  const withParent: string = await git.putMany({ "a.txt": "hi" }, "message", sha);
+  const dropped: string = await git.putMany({ "a.txt": null }, "drop");
+  const droppedOne: string = await git.putMany(new Map([["b.bin", null]]), "drop one", { parent: dropped });
 
   const keys: Entry[] = await git.list();
   const prefixed: Entry[] = await git.list("docs/", { local: true });
@@ -59,7 +54,7 @@ export async function positive(): Promise<void> {
   const protoCode: GitProtocolCode = "NON_FAST_FORWARD";
   const code: GitErrorCode = ioCode;
 
-  void [bytes, offline, fromSet, single, text, one, oneText, all, allText, dropped, droppedOne, store, withOpts, withParent, prefixed, history, tip, remoteTip, pulled.cached, pulled2, pushed.updated, problem, code, protoCode];
+  void [bytes, offline, fromSet, single, text, store, sha, withOpts, dropped, droppedOne, prefixed, history, tip, remoteTip, pulled.cached, pulled2, pushed.updated, problem, code, protoCode];
 }
 
 export async function branching(): Promise<void> {
@@ -68,7 +63,7 @@ export async function branching(): Promise<void> {
     const tip = git.version();
     if (tip) await git.putMany({ "a.txt": "v2" }, "cas", { parent: tip });
   } catch (e) {
-    if (GitError.is(e)) {
+    if (GitError.isIO(e) || GitError.isProtocol(e)) {
       const anyCode: GitErrorCode = e.code;
       void [anyCode, e.kind, e.message, e.cause, e.status, e.ref, e.key];
     }
@@ -110,6 +105,8 @@ export async function rejects(): Promise<void> {
 
   // @ts-expect-error content must be a string or bytes, not a plain object
   await git.putMany({ "a.txt": {} });
+  // @ts-expect-error parent must be { parent }, not a bare oid string
+  await git.putMany({ "a.txt": "hi" }, "m", "0".repeat(40));
   // @ts-expect-error unknown pull option
   await git.pull({ nope: 1 });
   // @ts-expect-error push takes no filter, only fetch injection

@@ -23,7 +23,7 @@ for (const f of ["utils.mjs", "sync.mjs", "portable.mjs"]) {
 }
 const { RemoteGit, memoryStore, GitError } = await import("../src/host/portable.mjs");
 if (typeof RemoteGit?.open !== "function") throw new Error("portable.mjs must export RemoteGit with static open()");
-if (typeof GitError?.is !== "function") throw new Error("portable.mjs must export GitError with static is()");
+if (typeof GitError?.isIO !== "function" || typeof GitError?.isProtocol !== "function") throw new Error("portable.mjs must export GitError with static isIO()/isProtocol()");
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -147,6 +147,13 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   const tip = await git.version();
   const c2 = await git.putMany({ "a.txt": "2" }, "cas-ok", { parent: tip });
   if ((await git.version()) !== c2) throw new Error("CAS putMany should move tip");
+  // a bare oid string is not a parent — { parent } only, so a dropped brace
+  // fails loudly instead of writing unguarded
+  let bareErr = null;
+  try {
+    await git.putMany({ "a.txt": "x" }, "m", tip);
+  } catch (e) { bareErr = e; }
+  if (!(bareErr instanceof TypeError)) throw new Error("bare-string parent should be TypeError");
   let threw = false;
   try {
     await git.putMany({ "a.txt": "3" }, "cas-stale", { parent: tip });
@@ -157,30 +164,32 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   console.log("[ok] list (+prefix) and CAS parent");
 }
 
-// ── 2b2. removeMany (local): delete keys, prune dirs, no-op on missing ──
+// ── 2b2. null deletes (local): delete keys, prune dirs, no-op on missing ──
 {
   const git = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, ref: "main" });
   const LC = { local: true };
   await git.putMany({ "a.txt": "1", "docs/b.txt": "2", "docs/c.txt": "3" }, "init");
   const tip = git.version();
-  const c2 = await git.removeMany(["docs/b.txt"], "drop b");
-  if (git.version() !== c2 || c2 === tip) throw new Error("removeMany should move tip");
-  if ((await git.get("docs/b.txt", LC)) !== null) throw new Error("removed key must read null");
-  if ((await git.get("docs/c.txt", { ...LC, as: "text" })) !== "3") throw new Error("sibling must survive");
+  // mixed upsert + delete in one version
+  const c2 = await git.putMany({ "docs/b.txt": null, "fresh.txt": "new" }, "drop b, add fresh");
+  if (git.version() !== c2 || c2 === tip) throw new Error("putMany null should move tip");
+  if ((await git.getMany(["docs/b.txt"], LC)).has("docs/b.txt")) throw new Error("deleted key must be skipped");
+  if ((await git.getMany(["docs/c.txt"], { ...LC, as: "text" })).get("docs/c.txt") !== "3") throw new Error("sibling must survive");
+  if ((await git.getMany(["fresh.txt"], { ...LC, as: "text" })).get("fresh.txt") !== "new") throw new Error("same-commit upsert must land");
   // last file in a dir prunes the dir itself
-  await git.removeMany("docs/c.txt", "drop c");
+  await git.putMany({ "docs/c.txt": null }, "drop c");
   if ((await git.list("", LC)).some((e) => e.path.startsWith("docs/"))) throw new Error("empty dir should be pruned");
   // missing keys are a no-op for reads (but still one version)
-  await git.removeMany(["nope.txt"], "noop");
-  if ((await git.list("", LC)).map((e) => e.path).join() !== "a.txt") throw new Error("noop remove must not touch survivors");
+  await git.putMany({ "nope.txt": null }, "noop");
+  if ((await git.list("", LC)).map((e) => e.path).sort().join() !== "a.txt,fresh.txt") throw new Error("noop delete must not touch survivors");
   // bad keys rejected, CAS honored
   let ke = null;
-  try { await git.removeMany(["/bad"], "m"); } catch (e) { ke = e; }
-  if (!(ke instanceof TypeError)) throw new Error("bad remove key should be TypeError");
+  try { await git.putMany({ "/bad": null }, "m"); } catch (e) { ke = e; }
+  if (!(ke instanceof TypeError)) throw new Error("bad delete key should be TypeError");
   let ce = null;
-  try { await git.removeMany(["a.txt"], "m", { parent: tip }); } catch (e) { ce = e; }
-  if (!GitError.isProtocol(ce, "CAS_MISMATCH")) throw new Error("stale remove parent must be CAS_MISMATCH");
-  console.log("[ok] removeMany (delete + prune + noop + CAS)");
+  try { await git.putMany({ "a.txt": null }, "m", { parent: tip }); } catch (e) { ce = e; }
+  if (!GitError.isProtocol(ce, "CAS_MISMATCH")) throw new Error("stale delete parent must be CAS_MISMATCH");
+  console.log("[ok] null deletes (delete + prune + noop + CAS, mixed with upsert)");
 }
 
 // ── 2b. the error surface: one GitError (io/protocol), usage is TypeError ──
@@ -194,15 +203,16 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   // 2. branching: kind first, code for protocol detail.
   const io = new GitError("io", "NETWORK", "down", { cause: new Error("x") });
   const proto = new GitError("protocol", "CAS_MISMATCH", "m");
-  if (!GitError.is(io) || !GitError.is(proto)) throw new Error("is(e) must accept any GitError");
-  if (!GitError.isIO(io) || GitError.isIO(proto)) throw new Error("isIO must match kind");
+  if (GitError.isIO(io) && GitError.isProtocol(proto)) { /* both halves recognized */ }
+  else throw new Error("isIO/isProtocol must accept their own kind");
+  if (GitError.isIO(proto)) throw new Error("isIO must reject protocol");
   if (!GitError.isProtocol(proto, "CAS_MISMATCH")) throw new Error("isProtocol(e, code) must accept a match");
   if (GitError.isProtocol(proto, "HTTP")) throw new Error("isProtocol must reject a non-match");
   if (!GitError.isProtocol(proto)) throw new Error("isProtocol(e) must accept any protocol error");
   if (GitError.isProtocol(io)) throw new Error("isProtocol must reject io");
   // usage mistakes are TypeError, never GitError — so a retry loop can't swallow a bug
   for (const other of [new Error("x"), new TypeError("x"), null, undefined, 42, "NETWORK", { kind: "io", code: "NETWORK" }]) {
-    if (GitError.is(other)) throw new Error(`is() must not claim a non-GitError: ${JSON.stringify(other)}`);
+    if (GitError.isIO(other) || GitError.isProtocol(other)) throw new Error(`isIO/isProtocol must not claim a non-GitError: ${JSON.stringify(other)}`);
   }
   // every field the README promises survives
   const rich = new GitError("io", "HTTP", "http 503", { status: 503, ref: "refs/heads/main", key: "a.txt", cause: new Error("upstream") });
@@ -345,17 +355,62 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   }
   // a bare string reads one key (no need to wrap a single read in an array)
   if (text(await sh.getMany("o.txt", { local: true }), "o.txt") !== "1") throw new Error("getMany(single string) should read one key");
-  // { as: "text" } decodes; get() reads one key (null when absent)
+  // { as: "text" } decodes; missing keys are skipped, never errors
   if ((await sh.getMany(["s.txt"], { local: true, as: "text" })).get("s.txt") !== "str") throw new Error("getMany as:text");
-  if ((await sh.get("s.txt", { local: true, as: "text" })) !== "str") throw new Error("get as:text");
-  if ((await sh.get("missing.txt", { local: true })) !== null) throw new Error("get missing should be null");
-  if ((await sh.readAll("", { local: true, as: "text" })).size < 5) throw new Error("readAll should return everything");
+  if ((await sh.getMany(["missing.txt"], { local: true })).size !== 0) throw new Error("getMany should skip missing keys");
+  // small keyspaces: list + getMany, two calls
+  const everything = await sh.getMany((await sh.list("", { local: true })).map((e) => e.path), { local: true, as: "text" });
+  if (everything.size < 5) throw new Error("list + getMany should return everything");
   // oversize values are usage errors (TypeError), not "report a bug" Errors
   let bigErr = null;
   try {
     await sh.putMany({ "big.bin": new Uint8Array(5 * 1024 * 1024) }, "m");
   } catch (e) { bigErr = e; }
   if (!(bigErr instanceof TypeError)) throw new Error("oversize write should be TypeError, got " + bigErr?.constructor?.name);
+  // capacity failures say which limit bit: one oversize value vs an oversize batch
+  let singleErr = null;
+  try {
+    await sh.putMany({ "big1.bin": new Uint8Array(2 * 1024 * 1024) }, "m");
+  } catch (e) { singleErr = e; }
+  if (!(singleErr instanceof TypeError) || !/single value/.test(singleErr.message)) {
+    throw new Error("oversize single value should name the single-value limit: " + singleErr?.message);
+  }
+  // anything writable is readable: the cap is enforced up front, not when
+  // the read later runs out of arena
+  const before = sh.version();
+  let gapErr = null;
+  try {
+    await sh.putMany({ "gap.bin": new Uint8Array(900 * 1024) }, "m");
+  } catch (e) { gapErr = e; }
+  if (!(gapErr instanceof TypeError) || !/768KB/.test(gapErr.message)) {
+    throw new Error("a value past the read ceiling should be refused up front: " + gapErr?.message);
+  }
+  if (sh.version() !== before) throw new Error("a refused value must not move the tip");
+  if ((await sh.getMany(["gap.bin"], { local: true })).has("gap.bin")) throw new Error("a refused value must not be stored");
+  {
+    const rt = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
+    const atCap = new Uint8Array(768 * 1024).fill(6);
+    await rt.putMany({ "cap.bin": atCap }, "m");
+    const back = await rt.getMany(["cap.bin"], { local: true });
+    if (back.get("cap.bin")?.length !== atCap.length) throw new Error("a value at the documented cap must round-trip");
+  }
+  let batchErr = null;
+  try {
+    await sh.putMany(Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`b${i}.bin`, new Uint8Array(256 * 1024)])), "m");
+  } catch (e) { batchErr = e; }
+  if (!(batchErr instanceof TypeError) || !/batch/.test(batchErr.message)) {
+    throw new Error("oversize batch should name the batch limit: " + batchErr?.message);
+  }
+  // reads loop key-by-key: a 1.5MB keyspace reads in one getMany call
+  {
+    const bg = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
+    const quarter = new Uint8Array(256 * 1024).fill(4);
+    const trio = (ks) => Object.fromEntries(ks.map((k) => [`${k}.bin`, quarter]));
+    await bg.putMany(trio(["a", "b", "c"]), "m1");
+    await bg.putMany(trio(["d", "e", "f"]), "m2");
+    const got = await bg.getMany(["a.bin", "b.bin", "c.bin", "d.bin", "e.bin", "f.bin"], { local: true });
+    if (got.size !== 6) throw new Error("key-by-key read should return all 6 keys (1.5MB total)");
+  }
   // the store survives via the public getter; a fresh instance can reuse it
   if (sh.store !== sh._store) throw new Error("store getter should expose the backing store");
   // a non-string, non-bytes value is refused instead of stored as "[object Object]"

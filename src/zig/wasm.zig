@@ -1,10 +1,6 @@
 const std = @import("std");
 const oidmod = @import("oid.zig");
-const pktline = @import("pktline.zig");
-const proto = @import("proto.zig");
 const push = @import("push.zig");
-const filter = @import("filter.zig");
-const partial = @import("partial.zig");
 const object = @import("object.zig");
 const sha1 = @import("sha1.zig");
 const delta = @import("delta.zig");
@@ -66,7 +62,7 @@ fn emitAll(bytes: []const u8) void {
 // pack:    wasm_pack_begin(n) / wasm_pack_add(type_num, raw_size, dev_ptr, dev_len)
 //          / wasm_pack_end() — streams pack bytes via host_emit_bytes; big packs
 //          never sit in the arena. sha1 trailer hashed incrementally.
-// refs:    wasm_find_ref(advert, refname, out40) -> 0 hit / 1 miss / -1 err
+// refs:    wasm_list_refs(advert) -> TLV: u16 n, per: 40B hex, u16 name_len, name
 //          wasm_build_ref_update(old40, new40, ref, caps) -> emits command block
 // status:  wasm_parse_report_status(ptr,len, out_ptr*,out_len*) -> TLV:
 //          u8 unpack_ok, u16 umsg_len, umsg, u16 n, per: u8 ok, u16 ref_len, ref,
@@ -114,16 +110,6 @@ export fn wasm_pack_end() i32 {
     const digest = pack_hasher.final();
     pack_active = false;
     emitAll(&digest);
-    return 0;
-}
-
-export fn wasm_find_ref(adv_ptr: usize, adv_len: usize, ref_ptr: usize, ref_len: usize, out40: [*]u8) i32 {
-    const adv = sliceFromPtr(adv_ptr, adv_len);
-    const ref = sliceFromPtr(ref_ptr, ref_len);
-    const hit = push.findRef(adv, ref) orelse return 1;
-    // 空仓占位行按 ref 名匹配不到真实 ref;零 oid 视为 miss,由调用方按 new-branch 处理
-    if (std.mem.eql(u8, &hit, &push.ZERO_OID_HEX)) return 1;
-    @memcpy(out40[0..40], &hit);
     return 0;
 }
 
@@ -196,85 +182,6 @@ export fn wasm_parse_report_status(st_ptr: usize, st_len: usize, out_ptr: *usize
     out_len.* = out.len;
     if (!st.unpack_ok) return -2;
     for (st.refs) |r| if (!r.ok) return 1;
-    return 0;
-}
-
-// ─── Low-level protocol exports (smart HTTP host) ───────────────────────────
-
-export fn wasm_handle_discovery(service: u32, refs_pkt_ptr: usize, refs_pkt_len: usize) i32 {
-    const alloc = gpa();
-    const refs_pkt = sliceFromPtr(refs_pkt_ptr, refs_pkt_len);
-    const svc: proto.Service = if (service == 0) .upload_pack else .receive_pack;
-    const resp = proto.buildDiscoveryResponse(alloc, svc, refs_pkt) catch return -1;
-    defer alloc.free(resp);
-    host_emit_bytes(resp.ptr, resp.len);
-    return 0;
-}
-
-export fn wasm_parse_filter(pkt_ptr: usize, pkt_len: usize, out_has_filter: *u32, out_filter_spec_ptr: *usize, out_filter_spec_len: *usize) i32 {
-    const alloc = gpa();
-    const pkt = sliceFromPtr(pkt_ptr, pkt_len);
-    var fs = partial.FilterSet.fromPktLines(alloc, pkt) catch return -1;
-    defer fs.deinit();
-    if (fs.specs.len == 0) {
-        out_has_filter.* = 0;
-        out_filter_spec_ptr.* = 0;
-        out_filter_spec_len.* = 0;
-        return 0;
-    }
-    out_has_filter.* = 1;
-    var joined: std.ArrayList(u8) = .empty;
-    for (fs.specs, 0..) |sp, i| {
-        if (i != 0) joined.appendSlice(alloc, "+") catch return -1;
-        joined.appendSlice(alloc, sp.raw) catch return -1;
-    }
-    const slice = joined.toOwnedSlice(alloc) catch return -1;
-    const slen = slice.len;
-    const ptr = wasm_alloc(slen);
-    if (ptr == 0) {
-        alloc.free(slice);
-        return -1;
-    }
-    @memcpy(sliceFromPtrMut(ptr, slen), slice);
-    alloc.free(slice);
-    out_filter_spec_ptr.* = ptr;
-    out_filter_spec_len.* = slen;
-    return 0;
-}
-
-export fn wasm_should_omit(kind_ptr: usize, kind_len: usize, size: usize, filter_ptr: usize, filter_len: usize) u32 {
-    const alloc = gpa();
-    const kind_s = sliceFromPtr(kind_ptr, kind_len);
-    const filter_s = if (filter_len == 0) "" else sliceFromPtr(filter_ptr, filter_len);
-    const kind: object.Kind = object.kindFromStr(kind_s) catch return 0;
-    var specs: []filter.Spec = &.{};
-    if (filter_s.len != 0) {
-        specs = filter.parseCombine(alloc, filter_s) catch return 0;
-        defer {
-            for (specs) |sp| alloc.free(sp.raw);
-            alloc.free(specs);
-        }
-        const omit = filter.shouldOmit(specs, switch (kind) {
-            .blob => .blob,
-            .tree => .tree,
-            .commit => .commit,
-            .tag => .tag,
-        }, size);
-        return if (omit) 1 else 0;
-    }
-    return 0;
-}
-
-export fn wasm_pktline_encode(payload_ptr: usize, payload_len: usize, out_ptr: *usize, out_len: *usize) i32 {
-    const alloc = gpa();
-    const payload = sliceFromPtr(payload_ptr, payload_len);
-    const el = pktline.encodeLine(alloc, payload) catch return -1;
-    const p = wasm_alloc(el.len);
-    if (p == 0) return -1;
-    @memcpy(sliceFromPtrMut(p, el.len), el);
-    alloc.free(el);
-    out_ptr.* = p;
-    out_len.* = el.len;
     return 0;
 }
 

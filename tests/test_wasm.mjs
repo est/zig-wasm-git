@@ -7,9 +7,9 @@ const WASM_PATH = join(__dirname, "..", "zig-out", "bin", "zig_wasm_git.wasm");
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 
 const bytes = readFileSync(WASM_PATH);
-// 体积预算 72KiB:fetch 客户端(delta 展开 + 单遍 inflate + v2 请求构造)后 68~69KB;
-// 仍远小于 CF 参考实现 ~100KB,后续只减不增。
-assert(bytes.length <= 72 * 1024, `wasm size budget blown: ${bytes.length} > 73728`);
+// 体积预算 64KiB:服务端 helper 出二进制后 ~60KB,远小于 CF 参考实现 ~100KB,
+// 后续只减不增。
+assert(bytes.length <= 64 * 1024, `wasm size budget blown: ${bytes.length} > 65536`);
 let inst;
 const imports = {
   env: {
@@ -24,48 +24,15 @@ inst = new WebAssembly.Instance(mod, imports);
 const wasm = inst.exports;
 console.log(`wasm size=${bytes.length} exports=${Object.keys(wasm).join(",")}`);
 
-function allocStr(s) {
-  const b = Buffer.from(s);
-  const ptr = wasm.wasm_alloc(b.length);
-  assert(ptr !== 0, "alloc failed");
-  new Uint8Array(wasm.memory.buffer).set(b, ptr);
-  return { ptr, len: b.length };
+// blob:none / filter omit decisions live in JS now (filter.zig is still unit
+// tested via `zig test`); the client binary only ships client-side protocol,
+// pack framing, inflate and delta. These server-side helpers must stay out:
+// wasm_handle_discovery, wasm_parse_filter, wasm_should_omit,
+// wasm_pktline_encode, wasm_find_ref.
+for (const gone of ["wasm_handle_discovery", "wasm_parse_filter", "wasm_should_omit", "wasm_pktline_encode", "wasm_find_ref"]) {
+  assert(wasm[gone] === undefined, `${gone} must not ship in the client binary`);
 }
-
-// blob:none should omit blob
-{
-  wasm.wasm_reset();
-  const f = allocStr("blob:none");
-  const k = allocStr("blob");
-  const omit = wasm.wasm_should_omit(k.ptr, k.len, 100, f.ptr, f.len);
-  console.log(`wasm_should_omit(blob,100, blob:none) = ${omit}`);
-  assert(omit === 1, "blob:none should omit blob");
-  const k2 = allocStr("tree");
-  const omit2 = wasm.wasm_should_omit(k2.ptr, k2.len, 100, f.ptr, f.len);
-  console.log(`wasm_should_omit(tree,100, blob:none) = ${omit2}`);
-  assert(omit2 === 0, "blob:none should not omit tree");
-}
-
-// blob:limit=1k
-{
-  wasm.wasm_reset();
-  const f = allocStr("blob:limit=1k");
-  const k = allocStr("blob");
-  assert(wasm.wasm_should_omit(k.ptr, k.len, 1024, f.ptr, f.len) === 1, "limit 1024 should omit");
-  assert(wasm.wasm_should_omit(k.ptr, k.len, 1023, f.ptr, f.len) === 0, "limit 1023 should not omit");
-  console.log("blob:limit=1k ok");
-}
-
-// combine
-{
-  wasm.wasm_reset();
-  const f = allocStr("blob:none+object:type=commit");
-  const kBlob = allocStr("blob");
-  const kCommit = allocStr("commit");
-  // combined filter is AND: blob omitted by blob:none, commit rejected by object:type
-  // our shouldOmit returns true if ANY filter rejects -> blob omitted (true), commit not omitted by blob:none but omitted by object:type? object:type=commit means only commit passes, so blob should be omitted
-  console.log("combine test done (parse ok)");
-}
+console.log("server-side helpers absent ok");
 
 // Path validation lives in JS (assertKeys) — wasm trusts its caller.
 {
