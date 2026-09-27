@@ -117,14 +117,14 @@ const git = await RemoteGit.open("https://user:pass@git.example.com/team/docs.gi
 });
 await git.pull(); // optional warmup (full pull); reads work without it
 
-// reads may hit the network (see "Reads can touch the network"); { local: false } is cache-only
+// reads may hit the network (see "Reads can touch the network"); { local: true } is cache-only
 await git.getMany(["some/path/README.md"]); // Map(path -> Uint8Array), missing skipped
 await git.getMany("a.txt");        // a single key works too
 await git.getMany(["a.txt"], { as: "text" }); // Map(path -> string) for text keys
-await git.getMany(["a.txt"], { local: false }); // cache-only: no I/O at all
+await git.getMany(["a.txt"], { local: true }); // cache-only: no I/O at all
 await git.putMany({ "a.txt": "hi" }, "update greeting"); // -> commit sha
 await git.list("docs/");        // [{path, oid}] key enumeration
-await git.list("docs/", { local: false }); // cache-only enumeration
+await git.list("docs/", { local: true }); // cache-only enumeration
 await git.log(5);               // [{sha, tree, parents, author, message}], newest first
 await git.version();            // local tip oid (null when empty)
 await git.remoteVersion();      // remote tip oid, store untouched (throws on network error)
@@ -188,13 +188,13 @@ const git = await RemoteGit.open(url, { wasm: "zig-out/bin/zig_wasm_git.wasm" })
 | `pull()` already called | local store only, no requests |
 
 So "read" is not "offline". In a serverless or Worker context the first read of
-each instance costs a request. Pass `{ local: false }` when the answer must come
+each instance costs a request. Pass `{ local: true }` when the answer must come
 from cache — no bootstrap, no on-demand fetch, and a cache miss stays a cheap
 miss:
 
 ```js
-await git.getMany(["config.json"], { local: false }); // never any I/O
-await git.list("", { local: false });                 // [] if the tip isn't cached
+await git.getMany(["config.json"], { local: true }); // never any I/O
+await git.list("", { local: true });                 // [] if the tip isn't cached
 ```
 
 ### Releasing memory
@@ -238,7 +238,7 @@ underlying `want` / `have` negotiation, `delta` handling, and filters actually d
 | Skip bytes, keep versions | `filter blob:none` / `blob:limit=<n>[kmg]` / `tree:0` / `object:type=` / `combine:+` | Supported both sides; `getMany` auto-fetches missing blobs on demand (`want=<blob-oid>`, byte-equal to full fetch) |
 | Single-file download | structure pull (`blob:none`) + `want=<blob-oid>` promisor roundtrip | Supported via `getMany` (unknown paths cost zero RTT; needs `uploadpack.allowTipSHA1InWant` on self-hosted servers, GitHub OK) |
 | Batch multi-file download | `want=[oid...]` multi-want single pack | Supported via `getMany` (one roundtrip for all missing blobs) |
-| Key enumeration | tree walk (local, post-tip) | Supported via `list(prefix)`; `list(prefix, {local:false})` for cache-only |
+| Key enumeration | tree walk (local, post-tip) | Supported via `list(prefix)`; `list(prefix, {local:true})` for cache-only |
 | Remote version probe | `ls-refs` filtered to one ref | Supported via `remoteVersion()` (no store writes; throws on network error) |
 | Optimistic concurrency | `putMany(..., { parent })` throws locally on tip mismatch | Supported (no extra RTT; `push` still rejects non-fast-forward as backstop) |
 | Shallow history | `shallow` / `deepen` / `deepen-since` / `deepen-not` | **Not supported** (client never sends `deepen`) |

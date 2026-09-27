@@ -152,8 +152,8 @@ export interface PutOptions {
 /** Options for {@link RemoteGit.getMany}. */
 export interface GetOptions {
   /**
-   * Read strictly from the local store: no bootstrap, no on-demand fetch, no
-   * I/O. Use when the answer must come from cache.
+   * `true` reads strictly from the local store: no bootstrap, no on-demand
+   * fetch, no I/O. Default `false`, which lets a read fill a cold store.
    */
   local?: boolean;
 }
@@ -165,7 +165,10 @@ export interface GetTextOptions extends GetOptions {
 
 /** Options for {@link RemoteGit.list}. */
 export interface ListOptions {
-  /** Enumerate strictly from the local store; `[]` if the tip is not cached. */
+  /**
+   * `true` enumerates strictly from the local store (no bootstrap, no I/O) and
+   * returns `[]` when the tip is not cached. Default `false`.
+   */
   local?: boolean;
 }
 
@@ -182,7 +185,7 @@ export interface PullOptions {
 export interface SyncOptions {
   /** Forwarded to the pull step. */
   pull?: PullOptions;
-  /** Forwarded to the read step. */
+  /** Forwarded to the read step: `true` reads from cache only. */
   local?: boolean;
 }
 

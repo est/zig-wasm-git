@@ -427,7 +427,7 @@ export class RemoteGit {
 
   async _getManyBytes(paths, opts = {}) {
     const out = new Map();
-    const tip = opts.local === false ? this._localTip() : await this._tipInner();
+    const tip = opts.local === true ? this._localTip() : await this._tipInner();
     if (!tip || !paths.length) return out;
     const rows = this._getInner(this.ref, paths);
     const missing = [];
@@ -435,7 +435,7 @@ export class RemoteGit {
       if (!row.error) out.set(row.path, row.content);
       else missing.push(row.path);
     }
-    if (!missing.length || opts.local === false) return out;
+    if (!missing.length || opts.local === true) return out;
     const byPath = new Map((await collectBlobs(this._store, tip)).map((e) => [e.path, e.oid]));
     const oids = [...new Set(missing.map((p) => byPath.get(p)).filter(Boolean))];
     if (oids.length) {
@@ -630,7 +630,7 @@ export class RemoteGit {
   ///   - cold store, no tip cached -> bootstraps structure via pull
   ///   - key in the tree but blob not cached -> one `want=[oids]` roundtrip
   ///   - key absent from the tree -> zero requests, skipped
-  /// Pass opts.local === false for a strictly local read (no bootstrap, no
+  /// Pass opts.local === true for a strictly local read (no bootstrap, no
   /// on-demand fetch, never any I/O) — for offline use, or when a cache miss
   /// should stay a cheap miss instead of triggering a fetch.
   ///
@@ -689,11 +689,11 @@ export class RemoteGit {
   /// walk, but the first call on a cold store bootstraps structure from the
   /// remote (a `blob:none` pull, so no blob bytes cross the wire). In a
   /// serverless/Worker context that means one request on the first call per
-  /// instance. Pass opts.local === false to enumerate strictly from the local
+  /// instance. Pass opts.local === true to enumerate strictly from the local
   /// store — no bootstrap, no I/O, [] when the tip is not cached.
   async list(prefix = "", opts = {}) {
     return this._seq(async () => {
-      const tip = opts.local === false ? this._localTip() : await this._tipInner();
+      const tip = opts.local === true ? this._localTip() : await this._tipInner();
       if (!tip) return [];
       const all = await collectBlobs(this._store, tip);
       return prefix ? all.filter((e) => e.path.startsWith(prefix)) : all;

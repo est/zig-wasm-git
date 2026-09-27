@@ -32,9 +32,9 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
 {
   const git = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, ref: "main" });
   if ((await git.version()) !== null) throw new Error("empty version should be null");
-  // { local: false } = cache-only: no bootstrap, no I/O, so an unreachable
+  // { local: true } = cache-only: no bootstrap, no I/O, so an unreachable
   // host is irrelevant here. (Default getMany would legitimately throw NETWORK.)
-  if ((await git.getMany(["a.txt"], { local: false })).size !== 0) {
+  if ((await git.getMany(["a.txt"], { local: true })).size !== 0) {
     throw new Error("empty getMany should be empty (no network touched)");
   }
   const v1 = await git.putMany({ "a.txt": "hello", "d/b.bin": new Uint8Array([1, 2, 3]) }, "init");
@@ -125,7 +125,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
 {
   const git = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, ref: "main" });
   // local-only variant: this block is offline throughout, so cache-only reads.
-  const LC = { local: false };
+  const LC = { local: true };
   if ((await git.list("", LC)).length !== 0) throw new Error("empty list should be []");
   await git.putMany({ "a.txt": "1", "docs/b.txt": "2", "docs/c.txt": "3" }, "init");
   const paths = (await git.list("", LC)).map((e) => e.path).sort();
@@ -194,11 +194,11 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   // ...while cache-only reads stay offline-safe and empty
   const cached = await RemoteGit.open("https://nonexistent.invalid/r.git", { wasm: WASM });
   await cached.putMany({ "k.txt": "v" }, "m");
-  if (text(await cached.getMany(["k.txt"], { local: false }), "k.txt") !== "v") {
-    throw new Error("getMany({local:false}) must read offline");
+  if (text(await cached.getMany(["k.txt"], { local: true }), "k.txt") !== "v") {
+    throw new Error("getMany({local:true}) must read offline");
   }
-  if ((await cached.list("", { local: false })).length !== 1) {
-    throw new Error("list({local:false}) must work offline");
+  if ((await cached.list("", { local: true })).length !== 1) {
+    throw new Error("list({local:true}) must work offline");
   }
   // an HTTP status is preserved on the error
   const denied = await RemoteGit.open("https://example.invalid/r.git", {
@@ -233,12 +233,12 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   if (both?.code !== "BAD_KEY" || !both.message.includes('"/a"') || !both.message.includes('""')) {
     throw new Error("all bad keys should be reported together: " + both?.message);
   }
-  if ((await kv.list("", { local: false })).length !== 0) {
+  if ((await kv.list("", { local: true })).length !== 0) {
     throw new Error("a rejected batch must not write anything");
   }
   // valid keys still round-trip
   await kv.putMany({ "a/b.txt": "1", ".github/w.yml": "2", "üñî.md": "3" }, "m");
-  if ((await kv.getMany(["a/b.txt", ".github/w.yml", "üñî.md"], { local: false })).size !== 3) {
+  if ((await kv.getMany(["a/b.txt", ".github/w.yml", "üñî.md"], { local: true })).size !== 3) {
     throw new Error("valid keys must still round-trip");
   }
   console.log("[ok] fail loudly: BAD_STORE / NETWORK+HTTP / BAD_KEY");
@@ -255,7 +255,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   if (!g.closed || g._wasm !== null) throw new Error("close() should release the wasm instance");
   for (const [name, fn] of [
     ["putMany", () => g.putMany({ "b": "1" }, "m")],
-    ["getMany", () => g.getMany(["a.txt"], { local: false })],
+    ["getMany", () => g.getMany(["a.txt"], { local: true })],
     ["log", () => g.log()],
   ]) {
     let ce;
@@ -269,7 +269,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   await g.close(); // idempotent
   // the store survives; a fresh instance can reuse it
   const g2 = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, store: g._store });
-  if (text(await g2.getMany(["a.txt"], { local: false }), "a.txt")?.length !== 100_000) {
+  if (text(await g2.getMany(["a.txt"], { local: true }), "a.txt")?.length !== 100_000) {
     throw new Error("reopening on the same store should still read");
   }
   await g2.close();
@@ -302,18 +302,18 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   const sh = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
   await sh.putMany({ "o.txt": "1", "a.txt": "2" }, "m");
   await sh.putMany(new Map([["m.txt", "3"]]), "m");
-  const shapes = (await sh.list("", { local: false })).map((e) => e.path).sort();
+  const shapes = (await sh.list("", { local: true })).map((e) => e.path).sort();
   if (JSON.stringify(shapes) !== JSON.stringify(["a.txt", "m.txt", "o.txt"])) {
     throw new Error("entry shapes: " + JSON.stringify(shapes));
   }
   await sh.putMany({ "s.txt": "str", "u.txt": new Uint8Array([1, 2]) }, "m");
-  if (text(await sh.getMany(["s.txt"], { local: false }), "s.txt") !== "str") throw new Error("string content");
-  if ((await sh.getMany(["u.txt"], { local: false })).get("u.txt")?.length !== 2) throw new Error("Uint8Array content");
+  if (text(await sh.getMany(["s.txt"], { local: true }), "s.txt") !== "str") throw new Error("string content");
+  if ((await sh.getMany(["u.txt"], { local: true })).get("u.txt")?.length !== 2) throw new Error("Uint8Array content");
   // getMany takes a single key too, and can decode text
-  if (!(await sh.getMany("o.txt", { local: false })).has("o.txt")) throw new Error("getMany should take one key");
-  const asText = await sh.getMany(["s.txt"], { local: false, as: "text" });
+  if (!(await sh.getMany("o.txt", { local: true })).has("o.txt")) throw new Error("getMany should take one key");
+  const asText = await sh.getMany(["s.txt"], { local: true, as: "text" });
   if (asText.get("s.txt") !== "str") throw new Error("as:'text'");
-  if (!(await sh.getMany(["s.txt"], { local: false })).get("s.txt") instanceof Uint8Array) {
+  if (!(await sh.getMany(["s.txt"], { local: true })).get("s.txt") instanceof Uint8Array) {
     throw new Error("default getMany should stay bytes");
   }
   // a non-string, non-bytes value is refused instead of stored as "[object Object]"
