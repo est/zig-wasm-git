@@ -7,6 +7,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning is [S
 
 ### Added
 
+- **npm package** (`zig-wasm-git`): `npm install zig-wasm-git`, then
+  `import { RemoteGit } from "zig-wasm-git"` — the engine ships next to the JS
+  so `open()` finds it with no `wasm` option and no build step.
+  `zig-wasm-git/wasm` exposes the binary for bundlers that want it as an asset.
+- **TypeScript declarations** (`src/host/portable.d.mts`, shipped next to the
+  bundle so `nodenext` resolution picks them up). `isGitError(e, ERR.X)` narrows
+  the error to that code, so `e.code` is the literal type. `PutOptions.parent`
+  is `string`, not `string | null`: `version()` returns `string | null` and a
+  null parent means "no CAS check", so the type forces the null check.
+- `tests/types/smoke.ts` typechecks the declarations in CI, with
+  `@ts-expect-error` assertions so a type that stops rejecting bad usage fails
+  the build. CI also packs the tarball, installs it into a scratch project and
+  exercises it, so a broken package cannot reach a user.
+
 - **`RemoteGitError` + stable `.code` on every throw.** All failures are now
   branchable without string matching: `NETWORK`, `HTTP` (with `.status`),
   `NO_V2`, `NO_REMOTE_REF`, `NO_SUCH_OBJECT`, `BAD_STORE`, `BAD_KEY`,

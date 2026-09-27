@@ -12,9 +12,36 @@ One branch == one keyspace (`path -> bytes`), one commit == one version.
 
 There is no workdir, no merge, no checkout — just `read` / `write` / `fetch` / `push`.   
 
-## Download
+## Install
 
-Grab the prebuilt artifacts from the latest release — no toolchain needed:
+Requires Node 18+ or any runtime with `fetch`, `CompressionStream` and
+`crypto.subtle` (browsers, Cloudflare Workers, Deno, Bun).
+
+### npm
+
+```bash
+npm install zig-wasm-git
+```
+
+```js
+import { RemoteGit } from "zig-wasm-git"; // TypeScript types included
+
+const git = await RemoteGit.open("https://git.example.com/team/docs.git");
+```
+
+No build step, no `wasm` option: the package ships the engine next to the JS,
+so `open()` finds it on its own. Needs Node 18+, or any runtime with `fetch`,
+`CompressionStream` and `crypto.subtle` (browsers, Cloudflare Workers, Deno,
+Bun). Bundlers that want the binary as an asset can import it explicitly:
+
+```js
+import wasmUrl from "zig-wasm-git/wasm?url"; // vite
+const git = await RemoteGit.open(url, { wasm: wasmUrl });
+```
+
+### GitHub releases (no package manager)
+
+Grab the prebuilt artefacts — no toolchain needed:
 
 ```bash
 curl -LO https://github.com/est/zig-wasm-git/releases/latest/download/zig_wasm_git.wasm
@@ -71,7 +98,7 @@ side, `as: "text"` hands back strings instead of bytes, and a bare key string
 works when you only want one:
 
 ```js
-import { RemoteGit } from "./src/host/portable.mjs";
+import { RemoteGit } from "zig-wasm-git"; // or "./src/host/portable.mjs" from a checkout
 
 // { wasm }: string | Module | typed array | ArrayBuffer.
 const git = await RemoteGit.open("https://user:pass@git.example.com/team/docs.git", {
@@ -112,9 +139,11 @@ git.closed;       // -> true
 // keys are validated: relative paths, no empty segment, no . / .. / .git
 await git.putMany({ "docs/a.md": "hi" }, "add a");   // -> commit sha
 
-// optimistic concurrency: throws CAS_MISMATCH when the tip moved since you read it
+// optimistic concurrency: throws CAS_MISMATCH when the tip moved since you read it.
+// version() is null on an empty keyspace, so check it — a null parent means
+// "no check", which would turn a CAS write into an unguarded one.
 const tip = await git.version();
-await git.putMany({ "a.txt": "v2" }, "cas write", { parent: tip });
+if (tip) await git.putMany({ "a.txt": "v2" }, "cas write", { parent: tip });
 ```
 
 Instantiation is async (`WebAssembly.instantiate`, off-thread compile), so
@@ -227,7 +256,7 @@ in `.cause` where one exists), so callers branch on the code rather than
 matching message text:
 
 ```js
-import { RemoteGit, ERR, isGitError } from "./src/host/portable.mjs";
+import { ERR, isGitError } from "zig-wasm-git";
 
 try {
   await git.putMany({ "a.txt": "v2" }, "cas write", { parent: tip });
@@ -276,6 +305,7 @@ Protocol framing/parsing: `wasm_handle_discovery`, `wasm_parse_filter`, `wasm_sh
 `wasm_commit[2]` returns `-14` for a path that cannot round-trip as a git tree
 entry (empty segment, `.`/`..`/`.git`, NUL/backslash/control char) — checked
 before any blob is stored, so a rejected batch has no side effects.
+These are untyped; the shipped declarations cover the `RemoteGit` API only.
 See `tests/server.mjs` for a working server and `src/host/portable.mjs` for the portable client.
 
 ## Build & test
@@ -284,17 +314,33 @@ See `tests/server.mjs` for a working server and `src/host/portable.mjs` for the 
 ./scripts/fetch-deps.sh     # vendor zig 0.16.0 into ./third_party (or use system zig)
 ./tests/run.sh              # zig unit + wasm/filter/pull/push/remote e2e (pull: worker-like, delta+filter, git-verified)
 PORT=3002 ./scripts/e2e.sh  # smart HTTP e2e: clone/push/fetch/partial clone (real git client)
+npm run build               # build dist/ (wasm + bundled JS + declarations)
 ```
+
+`npm run build` (also wired to `prepack`) assembles `dist/`: the bundle, the
+wasm, and the declarations. The wasm has to land next to the bundle, because
+that is where `RemoteGit` looks when `wasm` is omitted.
 
 ## Versioning & release flow
 
-SemVer. To cut a release:
+SemVer. `package.json` is the version of record for npm; `build.zig.zon`
+carries the same number. To cut a release:
 
-1. Update `version` in `build.zig.zon`
-2. Add a section to `CHANGELOG.md`
+1. Bump `version` in `package.json` **and** `build.zig.zon` to `X.Y.Z`
+2. Rename the `[Unreleased]` heading in `CHANGELOG.md` to `[X.Y.Z] — <date>`
 3. `git tag vX.Y.Z && git push origin main vX.Y.Z`
+4. `npm publish` (the tag is what CI releases on GitHub; npm is a separate
+   manual step, so the two can be done in either order)
 
-CI runs the full test suite on every push/PR. Tagging triggers the release workflow: build → bundle JS (pinned esbuild, no repo deps) → test → publish `zig_wasm_git.wasm` + `zig_wasm_git.portable.mjs` (+`SHA256SUMS`) to GitHub Releases.
+CI runs the full test suite on every push/PR, and additionally packs the npm
+tarball, installs it into a scratch project and exercises it, so a broken
+package fails CI rather than reaching a user. Tagging triggers the release
+workflow: build → bundle JS (pinned esbuild, no repo deps) → test → publish
+`zig_wasm_git.wasm` + `zig_wasm_git.portable.mjs` (+`SHA256SUMS`) to GitHub
+Releases.
+
+npm publishes are **irreversible**: a version, once used, cannot be reused, and
+a name cannot be released again for 72 hours after an unpublish.
 
 ## Known limits (see capability boundary above for the full `want`/`have`/`delta` account)
 
@@ -307,7 +353,7 @@ CI runs the full test suite on every push/PR. Tagging triggers the release workf
 - No `AbortSignal` / timeout support — a hung request cannot be cancelled (`close()` waits for in-flight work, so it does not cancel it either)
 - The store is append-only with no eviction: a reused instance grows monotonically. `close()` frees the wasm arena; bounding the store is the job of a custom `store`
 - A custom `store` must be synchronous, so it cannot wrap an inherently async backend (IndexedDB, D1, R2) directly — buffer in memory or prehydrate
-- No `package.json` / TypeScript declarations: install by downloading the two release files (or importing `src/host/portable.mjs` from a checkout)
+- No TypeScript types for the low-level wasm exports — the declarations cover the `RemoteGit` API only
 - Test-only server (`tests/server.mjs`) shells out to `git`; the client chain never does
 
 ## License

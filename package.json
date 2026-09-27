@@ -1,0 +1,59 @@
+{
+  "name": "zig-wasm-git",
+  "version": "1.6.0",
+  "description": "git remote as a versioned blob store — no fs, no git CLI. Pure-Zig git protocol engine in a ~69KB wasm, with a small async JS API. Runs in Node, browsers and Cloudflare Workers.",
+  "keywords": [
+    "git",
+    "wasm",
+    "webassembly",
+    "zig",
+    "smart-http",
+    "blob-store",
+    "kv",
+    "cloudflare-workers",
+    "edge",
+    "serverless"
+  ],
+  "license": "Apache-2.0",
+  "author": "est",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/est/zig-wasm-git.git"
+  },
+  "homepage": "https://github.com/est/zig-wasm-git#readme",
+  "bugs": {
+    "url": "https://github.com/est/zig-wasm-git/issues"
+  },
+  "type": "module",
+  "main": "./dist/zig-wasm-git.mjs",
+  "module": "./dist/zig-wasm-git.mjs",
+  "types": "./dist/zig-wasm-git.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/zig-wasm-git.d.mts",
+      "import": "./dist/zig-wasm-git.mjs",
+      "default": "./dist/zig-wasm-git.mjs"
+    },
+    "./wasm": "./dist/zig_wasm_git.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/zig-wasm-git.mjs",
+    "dist/zig-wasm-git.d.mts",
+    "dist/zig_wasm_git.wasm",
+    "CHANGELOG.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "./scripts/build-npm.sh",
+    "prepack": "./scripts/build-npm.sh",
+    "test": "./tests/run.sh",
+    "test:e2e": "PORT=3002 ./scripts/e2e.sh"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

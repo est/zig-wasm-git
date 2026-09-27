@@ -50,6 +50,43 @@ jobs:
             if (shas.size !== 1) throw new Error("bundle parity failed");
             console.log("bundle smoke ok:", [...shas][0].slice(0, 7));
           '
+      # The npm tarball is built and installed here, so a broken package fails
+      # CI rather than reaching a user: this catches a bad `files` list, a
+      # .d.mts that no longer matches the source, or a bundle that cannot find
+      # its co-located wasm.
+      - name: Build npm package (dist/ + pack)
+        run: |
+          ./scripts/build-npm.sh
+          npm pack --pack-destination tmp
+      - name: Install the tarball into a scratch project and use it
+        run: |
+          mkdir -p tmp/consumer && cd tmp/consumer
+          npm init -y >/dev/null && npm pkg set type=module >/dev/null
+          npm install ../zig-wasm-git-*.tgz
+          cat > smoke.mjs <<'EOF'
+          import { RemoteGit, ERR, isGitError } from "zig-wasm-git";
+          // no `wasm` option: must resolve the co-located engine
+          const git = await RemoteGit.open("https://example.invalid/r.git");
+          const sha = await git.putMany({ "docs/a.md": "# hi" }, "init");
+          const got = new TextDecoder().decode((await git.getMany(["docs/a.md"])).get("docs/a.md"));
+          if (got !== "# hi") throw new Error("roundtrip failed: " + got);
+          if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("bad sha");
+          const fresh = await RemoteGit.open("https://example.invalid/r.git");
+          let code = null;
+          try { await fresh.getMany(["a"]); } catch (e) { code = e.code; }
+          if (!isGitError(fresh, ERR.CLOSED) && code !== ERR.NETWORK) {
+            throw new Error("a read against an unreachable host must throw NETWORK, got " + code);
+          }
+          await git.close();
+          if (!git.closed) throw new Error("close() did not take effect");
+          console.log("npm tarball smoke ok:", sha.slice(0, 7));
+          EOF
+          node smoke.mjs
+      - name: Typecheck the shipped declarations
+        run: |
+          npx -y -p typescript@5 tsc --noEmit --strict \
+            --target es2022 --module nodenext --moduleResolution nodenext \
+            --lib es2022,dom tests/types/smoke.ts
       - name: Upload dist artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -57,3 +94,4 @@ jobs:
           path: |
             zig-out/bin/zig_wasm_git.wasm
             zig-out/bin/zig_wasm_git.portable.mjs
+            dist/
