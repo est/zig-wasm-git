@@ -11,20 +11,15 @@
 //   await git.getMany(["README.md"]);          // Map(path -> Uint8Array, missing skipped)
 //   await git.putMany({ "a.txt": "hi" }, "update greeting"); // -> commit sha
 //   await git.push();                          // fast-forward only
-//   await git.close();                         // release the wasm instance
 //
 // Model: one branch == one keyspace (path -> bytes), one commit == one version.
-// Missing keys are skipped (getMany) / null, never errors — but a *network*
+// Missing keys are skipped, never errors — but a *network*
 // failure is always thrown, never reported as an empty result. pull/push move
 // the tip; push rejects on non-fast-forward (last-writer-wins, no merge).
 //
-// All public methods are async and run through one serializer, so they share a
-// single ordering. wasm memory is shared too, which is why the queue exists;
-// log() is local and never touches wasm, but is queued all the same so every
-// method has the same ordering guarantee.
-//
-// close() releases the wasm instance and its linear memory. Call it when done;
-// it waits for in-flight work first. After close(), methods throw TypeError.
+// Async methods that touch wasm share one serializer (single shared memory).
+// version()/log() are local and skip the queue: await the preceding write
+// yourself if you need its result.
 //
 // Failures: operational failures throw GitError (kind io/protocol, see
 // utils.mjs); usage mistakes throw TypeError; invariants throw Error.
@@ -73,9 +68,13 @@ function toU8(v) {
 const typeName = (v) =>
   v === null ? "null" : Array.isArray(v) ? "array" : typeof v === "object" ? v.constructor?.name ?? "object" : typeof v;
 
-/// Keys argument -> array. A bare string is accepted as a one-key read, since
-/// reading a single known key is the most common case there is.
-const keyList = (paths) => (paths == null ? [] : typeof paths === "string" ? [paths] : [...paths]);
+/// Keys argument -> array. Callers pass an array; a bare string would
+/// iterate as chars, so reject it loudly instead of reading garbage.
+const keyList = (paths) => {
+  if (typeof paths === "string") throwUsage("getMany(paths) takes an array of keys, got a single string; wrap it: [path]");
+  if (paths == null || typeof paths[Symbol.iterator] !== "function") throwUsage("getMany(paths) takes an array of keys");
+  return [...paths];
+};
 
 /// putMany entries -> [path, bytes] pairs. An object literal is the natural way
 /// to write several named values in JS and stays the documented form; a Map is
@@ -89,10 +88,6 @@ function entryPairs(entries) {
   return Object.entries(entries).map(([k, v]) => [k, toU8(v)]);
 }
 
-/// Node-only fs probe: runtime string lookup, no static `node:` import —
-/// the neutral bundle keeps building and browsers/workers never touch it.
-/// Absent before Node 22.3 (process.getBuiltinModule) and in every non-Node
-/// runtime; those callers pass bytes or an http(s) url instead.
 function nodeFs() {
   const g = process?.getBuiltinModule;
   if (typeof g === "function") {
@@ -103,14 +98,6 @@ function nodeFs() {
   return null;
 }
 
-/*
-  Normalize { wasm } to raw bytes. Accepted:
-    - string: http(s) url, else a Node filesystem path
-    - precompiled Module, typed array or ArrayBuffer (passed to instantiate as-is)
-  Omitted: zig_wasm_git.wasm next to this module (fixed-name release files
-  ship together; Node reads it, browsers fetch it). workerd has neither —
-  pass the Module explicitly. Anything else fails in instantiate; figure it out.
-*/
 async function resolveWasmInput(wasmOpt) {
   if (wasmOpt && (wasmOpt instanceof WebAssembly.Module || typeof wasmOpt !== "string")) {
     return wasmOpt; // typed array / ArrayBuffer; instantiate validates
@@ -123,10 +110,6 @@ async function resolveWasmInput(wasmOpt) {
   if (!/^https?:\/\//.test(href)) {
     const fs = nodeFs();
     if (fs) return new Uint8Array(fs.readFileSync(href.startsWith("file:") ? new URL(href) : href));
-    // No filesystem to read it with, and it is not fetchable either (fetch
-    // rejects file:// and bare paths outright). Falling through would surface a
-    // NETWORK error, which reads as "your connection is down" and invites a
-    // retry that can never succeed. Say what is actually missing.
     throwUsage(
       explicit
         ? `cannot read the wasm from a filesystem path on this runtime (no Node fs): ${href}. ` +
@@ -142,27 +125,26 @@ async function resolveWasmInput(wasmOpt) {
 }
 
 export class RemoteGit {
-  /// Async factory: boots wasm (async instantiate, works under workerd CSP)
-  /// before returning. All instance methods serialize on one wasm memory.
   static async open(url, opts = {}) {
-    const g = new RemoteGit(url, opts);
+    const g = Object.create(RemoteGit.prototype);
+    g._init(url, opts);
     await g._boot(opts.wasm);
     return g;
   }
 
-  constructor(url, opts = {}) {
+  constructor() {
+    throwUsage("use `await RemoteGit.open(url, opts)` (instantiation is async, so the constructor cannot boot wasm)");
+  }
+
+  _init(url, opts = {}) {
     this.url = url;
     this.ref = opts.ref?.startsWith("refs/") ? opts.ref : `refs/heads/${opts.ref ?? "main"}`;
     this._store = opts.store ?? memoryStore();
     this._fetchImplOpt = opts.fetchImpl ?? null;
     this._subtleOpt = opts.subtle ?? null;
     this._auth = opts.auth ?? null;
-    this._author = opts.author;
-    this._committer = opts.committer;
-    this._timezone = opts.timezone;
     this._tail = Promise.resolve();
     this._wasm = null;
-    this._closed = false;
   }
 
   async _boot(wasmOpt) {
@@ -219,10 +201,7 @@ export class RemoteGit {
     let f = withBasicAuth(this._fetchImplOpt ?? globalThis.fetch.bind(globalThis));
     if (this._auth != null) {
       const inner = f;
-      // "user:pass" -> Basic; anything else ("Bearer x", "Basic y") verbatim.
-      const value = typeof this._auth === "string" && !/^\S+\s/.test(this._auth) && this._auth.includes(":")
-        ? `Basic ${btoa(String.fromCharCode(...enc.encode(this._auth)))}`
-        : this._auth;
+      const value = this._auth;
       f = (url, init) => {
         const headers = new Headers(init?.headers);
         if (!headers.has("authorization")) headers.set("authorization", value);
@@ -240,14 +219,7 @@ export class RemoteGit {
     return t;
   }
 
-  /// Guard every operation that needs a live wasm instance. The constructor is
-  /// public (so `new RemoteGit(...)` type-checks), but an unbooted or closed
-  /// instance has no wasm memory — say so instead of failing later with
-  /// "Cannot read properties of null (reading 'wasm_reset')".
   _assertLive() {
-    if (this._closed) {
-      throwUsage("RemoteGit is closed (close() released the wasm instance)");
-    }
     if (!this._wasm) {
       throwUsage(
         "RemoteGit was never opened — use `await RemoteGit.open(url, opts)` " +
@@ -266,19 +238,9 @@ export class RemoteGit {
   }
 
   _resolveRef(ref) {
-    const store = this._store;
     if (/^[0-9a-f]{40}$/i.test(ref)) return ref.toLowerCase();
-    if (ref === "HEAD") {
-      for (const b of store.heads()) {
-        const v = store.getRef(`refs/heads/${b}`);
-        if (v) return v;
-      }
-      throwUsage("HEAD: no branch exists yet", { ref });
-    }
-    for (const p of [`refs/heads/${ref}`, `refs/tags/${ref}`, ref]) {
-      const v = store.getRef(p);
-      if (v) return v;
-    }
+    const v = this._store.getRef(ref);
+    if (v) return v;
     throwUsage(`cannot resolve ref: ${ref}`, { ref });
   }
 
@@ -369,7 +331,7 @@ export class RemoteGit {
     });
   }
 
-  _commitInner(parent, message, entriesObj, options = {}) {
+  _commitInner(parent, message, entriesObj) {
     return this._withStore(({ w, ab, as, rs }) => {
       const pHex = as(parent);
       const msg = as(message);
@@ -379,19 +341,8 @@ export class RemoteGit {
       }));
       const ej = ab(this._encodeEntriesTlv(entries));
       const outHex = w.wasm_alloc(40);
-      const author = options.author != null ? String(options.author) : "";
-      const committer = options.committer != null ? String(options.committer) : author;
-      const timeSec = options.time != null ? String(options.time) : String(Math.floor(Date.now() / 1000));
-      const timezone = options.timezone != null ? String(options.timezone) : "+0000";
-      const rc = w.wasm_commit2
-        ? w.wasm_commit2(pHex.ptr, pHex.len, msg.ptr, msg.len, ej.ptr, ej.len,
-            as(author).ptr, as(author).len, as(committer).ptr, as(committer).len,
-            as(timeSec).ptr, as(timeSec).len, as(timezone).ptr, as(timezone).len, outHex)
-        : w.wasm_commit(pHex.ptr, pHex.len, msg.ptr, msg.len, ej.ptr, ej.len, outHex);
-      if (rc !== 0) {
-        // -14: wasm refused a path (defense in depth behind assertKeys).
-        (() => { if (rc === -14) throwUsage(`wasm_commit refused a path (invalid key): rc=${rc}`); throw new Error(`wasm_commit rc=${rc}`); })();
-      }
+      const rc = w.wasm_commit(pHex.ptr, pHex.len, msg.ptr, msg.len, ej.ptr, ej.len, outHex);
+      if (rc !== 0) throw new Error(`wasm_commit rc=${rc}`);
       const sha = rs(outHex, 40);
       if (this.ref) this._store.putRef(this.ref, sha);
       return sha;
@@ -403,13 +354,9 @@ export class RemoteGit {
     return this._resolveRefOrNull(this.ref);
   }
 
-  /// Local tip, else structure-only bootstrap (blob:none; falls back to a
-  /// full pull on servers without filter support).
-  ///
-  /// Returns null only when the remote genuinely has no such branch (an empty
-  /// keyspace). A network/HTTP/protocol failure propagates: reporting "no
-  /// commits" because the connection dropped would silently turn a transport
-  /// error into "this key does not exist".
+  /// Local tip, else a structure-only bootstrap (blob:none, unfiltered retry).
+  /// Null only when the remote genuinely has no such branch. Failures
+  /// propagate — a dropped connection must never read as "empty keyspace".
   async _tipInner() {
     const cached = this._resolveRefOrNull(this.ref);
     if (cached) return cached;
@@ -429,14 +376,8 @@ export class RemoteGit {
     return this._resolveRefOrNull(this.ref);
   }
 
-  /// Batched read: memory hits first, then ONE `want=[oids]` roundtrip for
-  /// all missing blobs, then re-read. Paths absent from the keyspace, and
-  /// blobs the server declines to send (gc'd / unadvertised), are skipped —
-  /// never fail the batch. Anything else (network, HTTP, protocol) throws.
   async _getManyInner(paths, opts = {}) {
-    const bytes = await this._getManyBytes(paths, opts);
-    if (opts.as !== "text") return bytes;
-    return new Map([...bytes].map(([k, v]) => [k, dec.decode(v)]));
+    return this._getManyBytes(paths, opts);
   }
 
   async _getManyBytes(paths, opts = {}) {
@@ -469,6 +410,7 @@ export class RemoteGit {
   }
 
   _pullInner(opts = {}) {
+    if (typeof opts === "string") opts = { filter: opts };
     return fetchIntoStore(this._wasm, this._store, this.url, this.ref, { ...this._net(), ...opts });
   }
 
@@ -608,13 +550,10 @@ throwProtocol("UNPACK_FAILED", `unpack failed: ${status.unpackMsg}`, { ref: this
 
   // ── public: all async ──
 
-  /// Local tip oid, or null when the keyspace is empty.
-  async version() {
-    return this._seq(async () => this._resolveRefOrNull(this.ref));
+  version() {
+    return this._resolveRefOrNull(this.ref);
   }
 
-  /// Remote tip oid without touching the store. Null when the ref doesn't
-  /// exist remotely; throws NETWORK / HTTP / NO_V2 on failure.
   async remoteVersion() {
     return this._seq(async () => {
       const refs = await lsRemote(this._wasm, this.url, { fetchImpl: this._net().fetchImpl });
@@ -622,48 +561,13 @@ throwProtocol("UNPACK_FAILED", `unpack failed: ${status.unpackMsg}`, { ref: this
     });
   }
 
-  /// Batch read: Map(path -> Uint8Array). `paths` is an array of keys, or a
-  /// single key string.
-  ///
-  /// Keys absent from the keyspace are skipped (no entry in the Map) — that is
-  /// a real answer, not a failure. A network / HTTP / protocol failure is
-  /// *thrown* (NETWORK, HTTP, NO_V2), never reported as an empty Map, so
-  /// `if (!m.size)` cannot mistake a dropped connection for "no such key".
-  ///
-  /// opts.as === "text" decodes each value as UTF-8, returning a
-  /// Map(path -> string) — handy for text keys. Binary keys should use the
-  /// default byte form.
-  ///
-  /// NETWORK SIDE EFFECTS (see also list): a read may hit the network.
-  ///   - cold store, no tip cached -> bootstraps structure via pull
-  ///   - key in the tree but blob not cached -> one `want=[oids]` roundtrip
-  ///   - key absent from the tree -> zero requests, skipped
-  /// Pass opts.local === true for a strictly local read (no bootstrap, no
-  /// on-demand fetch, never any I/O) — for offline use, or when a cache miss
-  /// should stay a cheap miss instead of triggering a fetch.
-  ///
-  /// A blob the server declines to send (gc'd) is skipped as missing; any
-  /// other failure propagates.
   async getMany(paths, opts = {}) {
-    return this._seq(() => this._getManyInner(keyList(paths), opts));
+    const list_ = keyList(paths);
+    return this._seq(() => this._getManyInner(list_, opts));
   }
 
-  /// Batch write (upsert): each call appends one version (commit) on the tip.
-  /// Returns the new version sha. { parent } enables compare-and-swap: throws
-  /// CAS_MISMATCH locally when the tip moved since you read it.
-  ///
-  /// `entries` is an object of { path: content } (a Map works too). Content is
-  /// a string or Uint8Array/ArrayBuffer.
-  ///
-  /// Keys are relative paths ("docs/a.md") and are validated up front: a
-  /// malformed key is rejected (BAD_KEY) rather than normalized, because the
-  /// tree layer would turn e.g. "" or "/a.txt" into an unnamed entry that
-  /// silently overwrites a sibling key in the same batch. All offenders in one
-  /// call are reported together.
-  async putMany(entries, message = "update", options = {}) {
-    const { parent: expected, ...rest } = options;
-    // Normalize and validate before taking the serializer slot, so a bad
-    // argument throws TypeError rather than queueing a doomed commit.
+  async putMany(entries, message = "update", parentOrOptions) {
+    const expected = typeof parentOrOptions === "string" ? parentOrOptions : parentOrOptions?.parent;
     const pairs = entryPairs(entries);
     assertKeys(pairs.map(([p]) => p));
     const flat = Object.fromEntries(pairs);
@@ -676,26 +580,10 @@ throwProtocol("UNPACK_FAILED", `unpack failed: ${status.unpackMsg}`, { ref: this
           { ref: this.ref },
         );
       }
-      return this._commitInner(expected ?? tip ?? "", message, flat, {
-        ...(this._author != null ? { author: this._author } : null),
-        ...(this._committer != null ? { committer: this._committer } : null),
-        ...(this._timezone != null ? { timezone: this._timezone } : null),
-        ...rest,
-      });
+      return this._commitInner(expected ?? tip ?? "", message, flat);
     });
   }
 
-  /// Key enumeration: [{path, oid}], optionally filtered by prefix.
-  ///
-  /// Returns [] for a genuinely empty keyspace and throws NETWORK / HTTP /
-  /// NO_V2 when the remote cannot be reached.
-  ///
-  /// NETWORK SIDE EFFECT: once the tip is cached this is a purely local tree
-  /// walk, but the first call on a cold store bootstraps structure from the
-  /// remote (a `blob:none` pull, so no blob bytes cross the wire). In a
-  /// serverless/Worker context that means one request on the first call per
-  /// instance. Pass opts.local === true to enumerate strictly from the local
-  /// store — no bootstrap, no I/O, [] when the tip is not cached.
   async list(prefix = "", opts = {}) {
     return this._seq(async () => {
       const tip = opts.local === true ? this._localTip() : await this._tipInner();
@@ -705,12 +593,9 @@ throwProtocol("UNPACK_FAILED", `unpack failed: ${status.unpackMsg}`, { ref: this
     });
   }
 
-  /// Recent history: [{sha, tree, parents[], author, message}], newest first.
-  /// Walks commit parents in the local store only — no network, and it does not
-  /// touch wasm memory, but it is still queued through the same serializer so
-  /// every public method shares one ordering.
   async log(limit = 10) {
-    return this._seq(() => this._logInner(limit));
+    this._assertLive();
+    return this._logInner(limit);
   }
 
   async _logInner(limit) {
@@ -728,44 +613,12 @@ throwProtocol("UNPACK_FAILED", `unpack failed: ${status.unpackMsg}`, { ref: this
     return out;
   }
 
-  /// Full pull (explicit refresh). No merge: unpushed writes must be pushed
-  /// first, else the fetch moves the tip underneath them.
   async pull(opts = {}) {
+    if (typeof opts === "string") opts = { filter: opts };
     return this._seq(() => this._pullInner(opts));
   }
 
-  /// Fast-forward publish of the local tip; rejects on non-fast-forward.
   async push(opts = {}) {
     return this._seq(() => this._pushInner({ ...this._net(), ...opts }));
-  }
-
-  /// One-shot: pull latest, then return the requested keys.
-  async sync(paths, opts = {}) {
-    const list_ = keyList(paths);
-    return this._seq(async () => {
-      await this._pullInner(opts.pull ?? {});
-      return this._getManyInner(list_, opts);
-    });
-  }
-
-  /// Release the wasm instance and its linear memory (a 4MB arena plus store
-  /// scratch, held for the lifetime of the instance). Use it when you are done
-  /// with a RemoteGit — in a serverless handler, a Worker, or a long-lived
-  /// process that creates many short-lived instances.
-  ///
-  /// Queued behind in-flight work, so a concurrent operation finishes rather
-  /// than crashing on a freed instance. The store is NOT cleared: pass a
-  /// throwaway `store` if you want its objects collected too. Idempotent.
-  async close() {
-    if (this._closed) return;
-    await this._tail.catch(() => {}); // let queued work drain
-    this._closed = true;
-    this._wasm = null;
-    this._takeEmit = () => new Uint8Array(0);
-  }
-
-  /// True once close() has run.
-  get closed() {
-    return this._closed;
   }
 }

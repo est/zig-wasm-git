@@ -38,28 +38,26 @@ commit→tree→blob; `wasm_commit` stores blobs, rebuilds affected trees with
 git-correct sort), **IO + platform ABIs in JS** (`fetch`, compression,
 `crypto.subtle`, pluggable store). Storage goes through `host_get_object` /
 `host_put_object` callbacks (in-memory by default; any
-`{get,put,getRef,putRef,heads}` backend). Verified against real `git`:
+`{get,put,getRef,putRef}` backend). Verified against real `git`:
 `log`/`ls-tree`/`cat-file`/`fsck --strict` all clean.
 
 | File | Role |
 | --- | --- |
 | `src/zig/root.zig` | test entry point; pulls in every module's unit tests |
-| `src/zig/wasm.zig` | the `env.host_*` ABI surface: `wasm_get`, `wasm_commit2`, alloc/reset |
+| `src/zig/wasm.zig` | the `env.host_*` ABI surface: `wasm_get`, `wasm_commit`, alloc/reset |
 | `src/zig/{fetch,push,pack,delta,zlib,sha1,oid,object}.zig` | protocol v2 fetch, receive-pack push, pack v2 framing, delta apply, inflate, SHA-1, object encode/decode |
 | `src/zig/{pktline,proto,filter,partial,enc}.zig` | pkt-line framing, wire shapes, filter parse/apply, negotiated-partial state, hex/base64 |
-| `src/host/portable.mjs` | `RemoteGit` — the public API, all-async, one queue per instance |
+| `src/host/portable.mjs` | `RemoteGit` — the public API (wasm-touching methods share one queue; `version()`/`log()` are local) |
 | `src/host/sync.mjs` | fetch-into-store, `lsRemote`, `collectObjects`, TLV ref/status decoders |
 | `src/host/utils.mjs` | errors (GitError io/protocol + TypeError usage), key validation, `memoryStore`, zlib, auth, loose/tree/commit parsing |
 
 ## Low-level WASM exports
 
 Protocol framing/parsing: `wasm_handle_discovery`, `wasm_parse_filter`, `wasm_should_omit`,
-`wasm_pktline_encode`, `wasm_build_lsrefs`, `wasm_build_fetch`, `wasm_decode_pack_header`,
+`wasm_pktline_encode`, `wasm_build_lsrefs`, `wasm_build_fetch`,
 `wasm_list_refs`/`wasm_find_ref`, `wasm_pack_begin|add|end`, `wasm_parse_report_status`,
-`wasm_inflate_one`, `wasm_delta_apply`, plus `wasm_get`/`wasm_commit[2]` and `wasm_alloc/reset`.
-`wasm_commit[2]` returns `-14` for a path that cannot round-trip as a git tree
-entry (empty segment, `.`/`..`/`.git`, NUL/backslash/control char) — checked
-before any blob is stored, so a rejected batch has no side effects.
+`wasm_inflate_one`, `wasm_delta_apply`, plus `wasm_get`/`wasm_commit` and `wasm_alloc/reset`.
+Path validation lives in JS (`assertKeys`) — wasm trusts its caller.
 
 These are untyped; the shipped declarations cover the `RemoteGit` API only.
 They are an implementation surface, not a stable public API: nothing outside

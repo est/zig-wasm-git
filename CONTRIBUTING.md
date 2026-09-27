@@ -82,7 +82,7 @@ with what a caller has to change, not with what the diff touched.
 - **A missing key is a skip, a transport failure is a throw.** Never let a
   dropped connection read as "this key does not exist" — that ambiguity is the
   one bug class this library is built to avoid. New error paths go through
-  `failed(GitError.X, ...)` in `src/host/utils.mjs`, never a raw `throw`.
+  `throwIO` / `throwProtocol` in `src/host/utils.mjs`, never a raw `throw`.
 - **Adding an error code means touching two lists.** The statics on `GitError`
   and their mirrors in `src/host/portable.d.mts` are both hand-written, because
   one is runtime and one is types. `tests/test_remote.mjs` parses the `.d.mts`
@@ -94,6 +94,6 @@ with what a caller has to change, not with what the diff touched.
 - **A custom `store` must be synchronous** because it is called from wasm host
   callbacks that cannot await. Making it async is a real feature request, not a
   small refactor — see the limits in the README.
-- **The queue exists because wasm memory is shared.** `RemoteGit` serializes
-  every public method through one tail promise, including the purely local
-  `log()`, so the ordering guarantee is uniform. Keep it that way.
+- **The queue exists because wasm memory is shared.** Async methods that touch
+  wasm serialize through one tail promise. Purely local reads (`version()`,
+  `log()`) skip it — await the preceding write yourself if you need its result.

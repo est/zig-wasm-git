@@ -50,9 +50,8 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   if (text(await git.getMany(["d/b.bin"]), "d/b.bin") == null) throw new Error("untouched key must survive putMany");
   const hist = await git.log(5);
   if (hist.length !== 2 || hist[0].sha !== v2) throw new Error("log should walk newest-first");
-  // every public method shares one ordering: a log queued behind a write sees it
-  await Promise.all([git.putMany({ "c.txt": "3" }, "m3"), git.log(1)]);
-  if ((await git.log(1))[0].sha !== (await git.version())) throw new Error("log should serialize with writes");
+  await git.putMany({ "c.txt": "3" }, "m3");
+  if ((await git.log(1))[0].sha !== git.version()) throw new Error("log should see the latest write");
   if ((await git.log(0)).length !== 0) throw new Error("log(0) should be empty");
   console.log("[ok] local lifecycle (putMany/getMany/version/log, zero network)");
 }
@@ -111,29 +110,22 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   await withBasicAuth(stub)("https://oauth2:abc123@git.example.com/r.git/info/refs?service=git-upload-pack");
   if (seen[0].auth !== `Basic ${Buffer.from("oauth2:abc123").toString("base64")}`) throw new Error("userinfo auth mismatch");
   if (seen[0].url.includes("abc123")) throw new Error("credentials not stripped");
-  // explicit auth option wins the same way
-  const ga = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, fetchImpl: stub, auth: "alice:s3cret" });
+  // explicit auth option is a raw header value, used verbatim
+  const basic = `Basic ${Buffer.from("alice:s3cret").toString("base64")}`;
+  const ga = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, fetchImpl: stub, auth: basic });
   await ga.remoteVersion().catch(() => {});
   const last = seen[seen.length - 1];
-  if (last.auth !== `Basic ${Buffer.from("alice:s3cret").toString("base64")}`) throw new Error("auth option mismatch: " + last.auth);
-  console.log("[ok] auth (userinfo + explicit option)");
+  if (last.auth !== basic) throw new Error("auth option mismatch: " + last.auth);
+  console.log("[ok] auth (userinfo -> Basic, explicit option verbatim)");
 }
 
-// ── 2. author/time plumbing: ctor defaults + per-call override ──
+// ── 2. commit identity is fixed (no author plumbing) ──
 {
-  const T0 = 1755859200;
-  const git = await RemoteGit.open("https://example.invalid/r.git", {
-    wasm: WASM, author: "Default <d@x>", timezone: "+0800",
-  });
-  await git.putMany({ "f.txt": "v1" }, "one", { time: T0 });
+  const git = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
+  await git.putMany({ "f.txt": "v1" }, "one");
   const e1 = (await git.log(1))[0];
-  if (e1.author !== "Default <d@x> 1755859200 +0800") throw new Error("ctor defaults not applied: " + e1.author);
-  const c2 = await git.putMany({ "f.txt": "v2" }, "two", { author: "Override <o@x>", time: T0 });
-  const e2 = (await git.log(1))[0];
-  if (e2.sha !== c2 || e2.author !== "Override <o@x> 1755859200 +0800") {
-    throw new Error("per-call options should win: " + e2.author);
-  }
-  console.log("[ok] author/committer/timezone defaults + override");
+  if (!/zig-wasm-git/.test(e1.author)) throw new Error("fixed author missing: " + e1.author);
+  console.log("[ok] fixed commit identity");
 }
 
 // ── 2b. list() + CAS parent (local) ──
@@ -192,21 +184,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
     throw new Error("GitError must carry kind/status/ref/key/cause");
   }
   if (rich.name !== "GitError") throw new Error("name must be GitError, got: " + rich.name);
-
-  // 3. cross-copy recognition. The npm package and the single-file release
-  //    bundle are separate copies of this class, and an app can load both. A
-  //    query string forces a second evaluation of the module that *defines* the
-  //    class, standing in for that: `instanceof` sees two different classes, the
-  //    brand does not. (Re-importing portable.mjs would not do — it re-exports
-  //    utils.mjs, which Node would still share.)
-  const twin = await import(`../src/host/utils.mjs?copy=${Date.now()}`);
-  if (twin.GitError === GitError) throw new Error("expected a distinct module instance for the cross-copy check");
-  const foreign = new twin.GitError("io", "NETWORK", "from the other copy");
-  if (foreign instanceof GitError) throw new Error("expected instanceof to fail across copies (test is not testing anything)");
-  if (!GitError.is(foreign)) throw new Error("GitError.is must recognize a GitError from another copy of the module");
-  if (!GitError.isIO(foreign)) throw new Error("kind matching must work across copies too");
-  if (GitError.isProtocol(foreign)) throw new Error("cross-copy kind mismatch must still be rejected");
-  console.log("[ok] error surface: GitError(io/protocol), TypeError for usage, cross-copy brand");
+  console.log("[ok] error surface: GitError(io/protocol), TypeError for usage");
 }
 
 // ── 2c. fail loudly instead of silently (store contract / network / keys) ──
@@ -219,7 +197,6 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
     async put(h, b) { return inner.put(h, b); },
     async getRef(n) { return inner.getRef(n); },
     async putRef(n, s) { return inner.putRef(n, s); },
-    async heads() { return inner.heads(); },
   };
   let se;
   try {
@@ -303,58 +280,26 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   console.log("[ok] fail loudly: TypeError for usage, GitError/io for network");
 }
 
-// ── 2d. lifecycle: close(), unopened instances, argument shapes ──
+// ── 2d. lifecycle: constructor guard + argument shapes ──
 {
-  // close() releases the wasm instance and guards later calls
   const g = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
   await g.putMany({ "a.txt": "x".repeat(100_000) }, "m");
-  if (g.closed) throw new Error("closed must start false");
   if (!(g._wasm.memory.buffer.byteLength > 4 * 1024 * 1024)) throw new Error("expected a multi-MB wasm arena");
-  await g.close();
-  if (!g.closed || g._wasm !== null) throw new Error("close() should release the wasm instance");
-  for (const [name, fn] of [
-    ["putMany", () => g.putMany({ "b": "1" }, "m")],
-    ["getMany", () => g.getMany(["a.txt"], { local: true })],
-    ["log", () => g.log()],
-  ]) {
-    let ce;
-    try {
-      await fn();
-    } catch (e) {
-      ce = e;
-    }
-    if (!(ce instanceof TypeError)) throw new Error(`${name} after close should throw TypeError, got ${ce?.constructor?.name ?? "(no throw)"}`);
-  }
-  await g.close(); // idempotent
   // the store survives; a fresh instance can reuse it
   const g2 = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, store: g._store });
   if (text(await g2.getMany(["a.txt"], { local: true }), "a.txt")?.length !== 100_000) {
     throw new Error("reopening on the same store should still read");
   }
-  await g2.close();
-  // close() waits for in-flight work instead of pulling memory out from under it
-  const g3 = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
-  await Promise.all([g3.putMany({ "slow.txt": "y".repeat(50_000) }, "m"), g3.close()]);
-  if (!g3.closed) throw new Error("close() should drain queued work");
 
-  // an unopened instance explains itself instead of throwing a raw TypeError
-  const unopened = new RemoteGit("https://example.invalid/r.git", { wasm: WASM });
-  for (const [name, fn] of [
-    ["putMany", () => unopened.putMany({ "a": "b" }, "m")],
-    ["getMany", () => unopened.getMany(["a"])],
-    ["list", () => unopened.list()],
-    ["log", () => unopened.log()],
-    ["version", () => unopened.version()],
-  ]) {
-    let ue;
-    try {
-      await fn();
-    } catch (e) {
-      ue = e;
-    }
-    if (!(ue instanceof TypeError) || !/RemoteGit\.open/.test(ue.message)) {
-      throw new Error(`${name} on an unopened instance should point at RemoteGit.open (${ue?.constructor?.name}: ${ue?.message})`);
-    }
+  // direct construction is refused — use RemoteGit.open
+  let ctorErr = null;
+  try {
+    new RemoteGit("https://example.invalid/r.git", { wasm: WASM });
+  } catch (e) {
+    ctorErr = e;
+  }
+  if (!(ctorErr instanceof TypeError) || !/RemoteGit\.open/.test(ctorErr.message)) {
+    throw new Error(`constructor should point at RemoteGit.open (${ctorErr?.constructor?.name}: ${ctorErr?.message})`);
   }
 
   // putMany takes an object (or a Map); content is a string or bytes
@@ -368,13 +313,17 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   await sh.putMany({ "s.txt": "str", "u.txt": new Uint8Array([1, 2]) }, "m");
   if (text(await sh.getMany(["s.txt"], { local: true }), "s.txt") !== "str") throw new Error("string content");
   if ((await sh.getMany(["u.txt"], { local: true })).get("u.txt")?.length !== 2) throw new Error("Uint8Array content");
-  // getMany takes a single key too, and can decode text
-  if (!(await sh.getMany("o.txt", { local: true })).has("o.txt")) throw new Error("getMany should take one key");
-  const asText = await sh.getMany(["s.txt"], { local: true, as: "text" });
-  if (asText.get("s.txt") !== "str") throw new Error("as:'text'");
+  if (!(await sh.getMany(["o.txt"], { local: true })).has("o.txt")) throw new Error("getMany should read");
   if (!(await sh.getMany(["s.txt"], { local: true })).get("s.txt") instanceof Uint8Array) {
-    throw new Error("default getMany should stay bytes");
+    throw new Error("getMany should stay bytes (decode with TextDecoder yourself)");
   }
+  let singleErr = null;
+  try {
+    await sh.getMany("o.txt", { local: true });
+  } catch (e) {
+    singleErr = e;
+  }
+  if (!(singleErr instanceof TypeError)) throw new Error("getMany(single string) should be TypeError, wrap it: [path]");
   // a non-string, non-bytes value is refused instead of stored as "[object Object]"
   for (const bad of [{ "z.txt": {} }, { "z.txt": 42 }, "nope", 42, [["a", "b"]]]) {
     let be;
@@ -385,8 +334,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
     }
     if (!(be instanceof TypeError)) throw new Error(`putMany(${JSON.stringify(bad)}) should be TypeError, got ${be?.constructor?.name ?? "(accepted)"}`);
   }
-  await sh.close();
-  console.log("[ok] lifecycle: close(), unopened guard, argument shapes");
+  console.log("[ok] lifecycle: constructor guard, argument shapes");
 }
 
 // ── 3. network: auto on-demand fetch without prior pull() ──
@@ -455,11 +403,12 @@ try {
   }
   console.log("[ok] batched getMany (1 roundtrip) + list over network");
 
-  // put + push from this client, sync from another
+  // put + push from this client, pull + read from another
   await git.putMany({ "config.json": JSON.stringify({ v: 8 }) }, "bump");
   await git.push();
   const other = await RemoteGit.open(BASE, { wasm: WASM, ref: "main" });
-  const synced = await other.sync(["config.json"]);
+  await other.pull();
+  const synced = await other.getMany(["config.json"]);
   if (dec.decode(synced.get("config.json")) !== JSON.stringify({ v: 8 })) {
     throw new Error("sync should return latest");
   }
@@ -479,7 +428,7 @@ try {
     nff = e;
   }
   if (!GitError.isProtocol(nff, "NON_FAST_FORWARD")) throw new Error("stale push should be protocol/NON_FAST_FORWARD, got: " + nff?.kind + "/" + nff?.code);
-  console.log("[ok] put/push/sync across clients + non-fast-forward reject");
+  console.log("[ok] put/push/pull+read across clients + non-fast-forward reject");
 
   execFileSync("git", ["--git-dir", SERVER_REPO, "fsck", "--strict"]);
   console.log("[ok] server fsck clean");

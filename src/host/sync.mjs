@@ -127,7 +127,7 @@ export function unpackPack(wasm, pack) {
       objects.push(rec);
       byOffset.set(objOffset, rec);
     } else if (h.type === 6) {
-      // ofs-delta: 裸 base 距离 varint (pack-format 的 +1 偏置编码,不在 zlib 流内) + zlib(delta 指令)
+      // ofs-delta: base distance varint (pack +1-bias encoding, outside the zlib stream) + zlib(delta ops)
       const { baseDistance, next } = decodeOfsBaseOffset(pack, pos);
       pos = next;
       const { body: inflated, consumed } = inflateOne(wasm, pack, pos);
@@ -135,7 +135,7 @@ export function unpackPack(wasm, pack) {
       if (inflated.length !== h.size) throwProtocol("PROTOCOL_ERROR", `delta size mismatch at offset ${objOffset}`);
       ofsdeltas.push({ offset: objOffset, baseAbs: objOffset - baseDistance, delta: inflated, expectSize: decodeDeltaResultSize(inflated) });
     } else if (h.type === 7) {
-      // ref-delta: 裸 20B base oid + zlib(delta 指令)
+      // ref-delta: raw 20B base oid + zlib(delta ops)
       if (pos + 20 > end) throwProtocol("PROTOCOL_ERROR", "ref-delta base truncated");
       const baseHex = hexOfBytes(pack.subarray(pos, pos + 20));
       pos += 20;
@@ -166,10 +166,9 @@ export function unpackPack(wasm, pack) {
   return { objects, pending, count: n, trailerEnd: end };
 }
 
-/// Resolve pending ref-deltas given hex-> {type, body} map (hashed pass-1
-/// objects + optional store assist). Mutates `known`, returns newly resolved.
-/// 注:会掏空并重排入参 `pending`(当队列用),残留未解的留在其中。
-/// 内部函数,外部调用者勿复用传入数组。
+/// Resolve pending ref-deltas given hex -> {type, body} map (hashed pass-1
+/// objects + optional store assist). Consumes `pending` as a queue — leftovers
+/// stay in it, so callers must not reuse the array afterwards.
 export function resolveRefDeltas(wasm, pending, known) {
   const out = [];
   let guard = pending.length * 2 + 8;
@@ -228,10 +227,7 @@ export async function verifyPackTrailer(subtle, pack) {
   for (let i = 0; i < 20; i++) if (got[i] !== want[i]) throwProtocol("PROTOCOL_ERROR", "pack trailer sha1 mismatch");
 }
 
-/// Full clone/fetch into store (portable).
-/// opts: {fetchImpl, subtle} (required — resolved per call by RemoteGit._net();
-/// see portable prerequisites), plus {filter="", ref="refs/heads/main",
-/// setRef=true, onProgress}.
+/// Full clone/fetch into store. opts.fetchImpl/subtle are required.
 /// want: ref name, raw oid, or an array of raw oids (batch blob fetch —
 /// one roundtrip for N blobs, never touches refs).
 /// Returns {ref, oid, oids, objects, packBytes, shallow}.
@@ -372,7 +368,7 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   return { ref: wantRef, oid: wantOids[0], oids: wantOids, objects: stored, packBytes: pack.length, shallow, refs };
 }
 
-/// List remote refs without fetching objects (fetchImpl required, see above).
+/// List remote refs without fetching objects.
 export async function lsRemote(wasm, url, opts = {}) {
   const fetchImpl = opts.fetchImpl;
   const headers = { "Git-Protocol": "version=2" };
@@ -391,7 +387,8 @@ export async function lsRemote(wasm, url, opts = {}) {
 export const ZERO_OID = "0".repeat(40);
 export const TYPE_NUM = { commit: 1, tree: 2, blob: 3, tag: 4 };
 
-/// 把 haves 可达的全部对象标进 seen(只标不发;缺失则跳过——多发不少发)
+/// Mark everything reachable from haves into seen (excluded from push).
+/// Missing objects are skipped — over-send, never under-send.
 async function markReachable(store, haveHexes, seen) {
   const queue = [...haveHexes].map((h) => h.toLowerCase());
   const tqueue = [];
@@ -424,12 +421,12 @@ async function markReachable(store, haveHexes, seen) {
     for (const e of parseTreeEntries(body)) {
       if (seen.has(e.oid)) continue;
       if (e.mode === "40000" || e.mode === "040000") tqueue.push(e.oid);
-      else if (e.mode !== "160000") seen.add(e.oid); // blob:只标不取,不 inflate
+      else if (e.mode !== "160000") seen.add(e.oid); // blob: mark only, no inflate
     }
   }
 }
 
-/// JS 侧对象枚举(与 wasm push.collectObjects 同算法,见其测试):返回 [{hex, type, body}]
+/// New-object enumeration for push. Returns [{hex, type, body}].
 export async function collectObjects(store, newOid, haves = new Set()) {
   const seen = new Set();
   await markReachable(store, [...haves], seen);
@@ -490,7 +487,7 @@ export async function collectObjects(store, newOid, haves = new Set()) {
     for (const e of parseTreeEntries(body)) {
       if (!want(e.oid)) continue;
       if (e.mode === "40000" || e.mode === "040000") treeRoots.push(e.oid);
-      else if (e.mode === "160000") continue; // gitlink 不打包
+      else if (e.mode === "160000") continue; // gitlink: never packed
       else {
         const l = store.get(e.oid);
         if (!l) throw new Error(`local object missing: ${e.oid}`);
@@ -504,7 +501,7 @@ export async function collectObjects(store, newOid, haves = new Set()) {
   return [...commits, ...tags, ...trees, ...blobs];
 }
 
-/// 解 wasm_parse_report_status 的 TLV:
+/// Decode the wasm_parse_report_status TLV:
 /// u8 unpack_ok, u16 umsg_len, umsg, u16 n, per: u8 ok, u16 ref_len, ref, [ng: u16 msg_len, msg]
 export function decodeStatusTlv(buf) {
   const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);

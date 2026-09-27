@@ -1,10 +1,4 @@
 // Type-level test for the published declarations (src/host/portable.d.mts).
-// Run by CI: `tsc --noEmit --strict`. It imports the source module by relative
-// path so it checks the real declarations, not a copy.
-//
-// This file is never executed — it is compiled and thrown away. Every
-// `@ts-expect-error` is an assertion: if the type stops rejecting that line,
-// tsc fails and CI catches the regression.
 
 import { RemoteGit, memoryStore, GitError, keyProblem } from "../../src/host/portable.mjs";
 import type {
@@ -24,82 +18,68 @@ export async function positive(): Promise<void> {
   const git = await RemoteGit.open("https://git.example.com/team/docs.git", {
     wasm: "zig-out/bin/zig_wasm_git.wasm",
     ref: "main",
-    author: "bot <bot@example.com>",
-    auth: "user:pass",
+    auth: "Bearer token",
     store: memoryStore(),
     fetchImpl: fetch,
     subtle: crypto.subtle,
   });
 
-  // reads: bytes by default, strings with as:"text", one key or many
   const bytes: Map<string, Uint8Array> = await git.getMany(["a.txt", "b.bin"]);
-  const text: Map<string, string> = await git.getMany(["a.txt"], { as: "text" });
-  const single: Map<string, Uint8Array> = await git.getMany("a.txt");
   const offline: Map<string, Uint8Array> = await git.getMany(["a.txt"], { local: true });
-  const fromSet: Map<string, Uint8Array> = await git.getMany(new Set(["a.txt"]));
+  const fromSet: Map<string, Uint8Array> = await git.getMany([...new Set(["a.txt"])]);
 
-  // writes: object or Map, string or bytes, with per-write overrides
   const sha: string = await git.putMany({ "a.txt": "hi", "b.bin": new Uint8Array([1]) });
   const withOpts: string = await git.putMany(
     new Map([["a.txt", "hi"]]),
     "message",
-    { parent: sha, author: "x <x@y>", time: 1755859200, timezone: "+0800" },
+    { parent: sha },
   );
+  const withParent: string = await git.putMany({ "a.txt": "hi" }, "message", sha);
 
   const keys: Entry[] = await git.list();
   const prefixed: Entry[] = await git.list("docs/", { local: true });
   const history: Commit[] = await git.log(5);
-  const tip: string | null = await git.version();
+  const tip: string | null = git.version();
   const remoteTip: string | null = await git.remoteVersion();
   const pulled: PullResult = await git.pull({ filter: "blob:none" });
+  const pulled2: PullResult = await git.pull("blob:none");
   const pushed: PushResult = await git.push();
-  const synced: Map<string, Uint8Array> = await git.sync(["a.txt"], { pull: { filter: "blob:none" } });
 
   const problem: string | null = keyProblem("a/b.txt");
   const ioCode: GitIOCode = "NETWORK";
   const protoCode: GitProtocolCode = "NON_FAST_FORWARD";
   const code: GitErrorCode = ioCode;
-  const closed: boolean = git.closed;
-  await git.close();
 
-  void [bytes, text, single, offline, fromSet, withOpts, prefixed, history, tip, remoteTip, pulled.cached, pushed.updated, synced, problem, code, protoCode, closed];
+  void [bytes, offline, fromSet, withOpts, withParent, prefixed, history, tip, remoteTip, pulled.cached, pulled2, pushed.updated, problem, code, protoCode];
 }
 
 export async function branching(): Promise<void> {
   const git = await RemoteGit.open("https://x/r.git");
   try {
-    // @ts-expect-error version() is `string | null`, and a null parent would
-    // silently disable the compare-and-swap rather than check it
-    await git.putMany({ "a.txt": "v2" }, "cas", { parent: await git.version() });
-    const tip = await git.version();
+    const tip = git.version();
     if (tip) await git.putMany({ "a.txt": "v2" }, "cas", { parent: tip });
   } catch (e) {
-    // any GitError: kind + code stay typed
     if (GitError.is(e)) {
       const anyCode: GitErrorCode = e.code;
       void [anyCode, e.kind, e.message, e.cause, e.status, e.ref, e.key];
     }
-    // io: retry later, status only makes sense here
     if (GitError.isIO(e)) {
       const narrowed: GitIOCode = e.code;
       // @ts-expect-error io codes are NETWORK|HTTP, not a protocol refusal
       const wrong: "CAS_MISMATCH" = e.code;
       void [narrowed, wrong, e.status];
     }
-    // protocol with a code: narrows to that literal
     if (GitError.isProtocol(e, "CAS_MISMATCH")) {
       const narrowed: "CAS_MISMATCH" = e.code;
       // @ts-expect-error narrowed to the one code asked for, not the union
       const asHttp: "HTTP" = e.code;
       void [narrowed, asHttp];
     }
-    // the generic is annotatable when a variable must hold one specific code
     const typed: GitError<"NETWORK"> | null = GitError.isIO(e) && e.code === "NETWORK" ? e : null;
     // @ts-expect-error the default instantiation is not a specific code
     const overNarrowed: GitError<"NETWORK"> = null as unknown as GitError;
     void [typed, overNarrowed];
   }
-  await git.close();
 }
 
 export function stores(): void {
@@ -108,7 +88,6 @@ export function stores(): void {
     put: () => {},
     getRef: () => null,
     putRef: () => {},
-    heads: () => [],
   };
   const opts: RemoteGitOptions = { store: minimal };
   const put: PutOptions = { parent: "0".repeat(40) };
@@ -122,10 +101,10 @@ export async function rejects(): Promise<void> {
   await git.putMany({ "a.txt": {} });
   // @ts-expect-error unknown pull option
   await git.pull({ nope: 1 });
-  // @ts-expect-error as:"text" belongs in the options object
+  // @ts-expect-error second arg must be a message string
   await git.getMany(["a.txt"], "text");
   // @ts-expect-error version() takes no arguments
-  await git.version(1);
+  git.version(1);
   // @ts-expect-error first arg must be unknown, codes must be protocol codes
   GitError.isProtocol(new Error(), "NOPE");
   // @ts-expect-error keyProblem takes a string

@@ -1,11 +1,7 @@
 // src/host/utils.mjs — portable helpers shared by the repo entry and sync clients.
-// Zero node: imports. Only: WebAssembly, CompressionStream/DecompressionStream,
-// TextEncoder/Decoder, URL/Headers/btoa.
-//
-// Requires (no runtime checks — callers target Node 18+/CF Workers/modern
-// browsers where these are built in; missing pieces fail naturally at the
-// call site): WebAssembly, CompressionStream/DecompressionStream,
-// crypto.subtle (sync clients), fetch (sync clients).
+// Zero node: imports. Requires WebAssembly, CompressionStream/DecompressionStream,
+// TextEncoder/Decoder, URL/Headers/btoa, plus fetch and crypto.subtle for sync
+// (no runtime checks — missing pieces fail naturally at the call site).
 //
 // Sections:
 //   errors: GitError + its codes (every throw from the client chain)
@@ -21,86 +17,49 @@ export { enc, dec };
 
 // ── errors ──
 
-// Brand for `GitError.is`, so an error thrown by one *copy* of this module is
-// still recognized by another. `instanceof` cannot do that: the npm package and
-// the single-file GitHub-release bundle are separate copies of this class, and
-// an app can load both (a Worker vendoring the release download alongside its
-// npm install). `Symbol.for` is registry-wide, so the brand crosses the copy
-// boundary where `instanceof` does not.
-const BRAND = Symbol.for("zig-wasm-git.GitError");
-
-/// The one operational error type this library throws.
-///
-/// Only two kinds exist — branch on `.kind`, never on `.message`:
-///
-///   - `io`: transport failed (`code` is `NETWORK` or `HTTP`). Retry later.
-///     HTTP carries `.status`.
-///   - `protocol`: the server answered but refused or confused us (`code`
-///     names the refusal: `CAS_MISMATCH`, `NON_FAST_FORWARD`,
-///     `PUSH_REJECTED`, `UNPACK_FAILED`, `NO_V2`, `NO_REMOTE_REF`,
-///     `NO_SUCH_OBJECT`, or `PROTOCOL_ERROR` for a corrupt pack/sideband).
-///     Fix the request, don't blind-retry.
-///
-/// Anything else is NOT a GitError and must not be caught as one:
-/// programmer mistakes (bad key, bad arg, bad store, use-after-close,
-/// unknown ref locally) throw `TypeError` and crash fast; internal
-/// invariants (wasm rc, corrupt local store) throw plain `Error`.
-/// ```js
-/// import { GitError } from "zig-wasm-git";
-/// try { await git.push(); }
-/// catch (e) {
-///   if (GitError.isIO(e)) retryLater(e.status);
-///   else if (GitError.isProtocol(e, "NON_FAST_FORWARD")) await git.pull();
-///   else throw e; // TypeError / Error: fix the code, don't retry
-/// }
-/// ```
+/// The one operational error type this library throws. Branch on `.kind`,
+/// never on `.message`: `io` (NETWORK / HTTP, retry later; HTTP carries
+/// `.status`) vs `protocol` (server refused — fix the request, don't retry).
+/// Programmer mistakes throw `TypeError`, never GitError: catching a bug as
+/// "retryable" would loop forever. Internal invariants throw plain `Error`.
+/// Full code list lives on the type in portable.d.mts; usage example in README.
 export class GitError extends Error {
   constructor(kind, code, message, extra = {}) {
     super(message);
     this.name = "GitError";
     this.kind = kind;
     this.code = code;
-    this[BRAND] = true;
     if (extra.cause !== undefined) this.cause = extra.cause;
     if (extra.status !== undefined) this.status = extra.status;
     if (extra.key !== undefined) this.key = extra.key;
     if (extra.ref !== undefined) this.ref = extra.ref;
   }
 
-  /// True when `e` is any GitError from any copy of this module.
-  /// Kept brand-based (not `instanceof`) for the npm-vs-bundle dual copy.
   static is(e) {
-    return e?.[BRAND] === true;
+    return e instanceof GitError;
   }
 
-  /// True for transport failures (`NETWORK` / `HTTP`). Retry later.
   static isIO(e) {
-    return e?.[BRAND] === true && e.kind === "io";
+    return e instanceof GitError && e.kind === "io";
   }
 
-  /// True for server refusals. With codes, narrows to those refusals:
-  /// `isProtocol(e, "NON_FAST_FORWARD")`. Without codes, any protocol error.
   static isProtocol(e, ...codes) {
-    if (e?.[BRAND] !== true || e.kind !== "protocol") return false;
+    if (!(e instanceof GitError) || e.kind !== "protocol") return false;
     return codes.length === 0 || codes.includes(e.code);
   }
 }
 
-/// Throw a transport failure. `code` is `NETWORK` (fetch threw, `.cause`
-/// keeps the original) or `HTTP` (non-2xx, `.status` keeps the status).
+/// Throw a transport failure (`NETWORK` with `.cause`, or `HTTP` with `.status`).
 export function throwIO(code, message, extra) {
   throw new GitError("io", code, message, extra);
 }
 
-/// Throw a server refusal or corrupt-protocol reply. `code` is one of
-/// `CAS_MISMATCH`, `NON_FAST_FORWARD`, `PUSH_REJECTED`, `UNPACK_FAILED`,
-/// `NO_V2`, `NO_REMOTE_REF`, `NO_SUCH_OBJECT`, `PROTOCOL_ERROR`.
+/// Throw a server refusal or corrupt-protocol reply (see GitProtocolCode).
 export function throwProtocol(code, message, extra) {
   throw new GitError("protocol", code, message, extra);
 }
 
-/// Throw a programmer mistake. Never a GitError on purpose: catching it as
-/// "retryable" would loop forever on a bug. Message names the fix.
+/// Throw a programmer mistake as TypeError (never GitError — see above).
 export function throwUsage(message, extra) {
   const e = new TypeError(message);
   if (extra?.key !== undefined) e.key = extra.key;
@@ -110,9 +69,8 @@ export function throwUsage(message, extra) {
 
 // ── net ──
 
-/// fetch + failure normalization: a thrown fetch becomes NETWORK (original
-/// kept in .cause), a non-2xx becomes HTTP with .status. Never returns a
-/// non-ok response, so no call site can forget the check.
+/// fetch + failure normalization. Never returns a non-ok response, so no
+/// call site can forget the status check.
 export async function netFetch(fetchImpl, url, init, what) {
   let r;
   try {
@@ -128,12 +86,9 @@ export async function netFetch(fetchImpl, url, init, what) {
 
 /// Why `key` cannot be stored, or null when it is well-formed.
 ///
-/// A key is a relative, slash-separated path whose every segment is non-empty
-/// and is not "." / ".." / ".git". Malformed keys are rejected rather than
-/// normalized: the git tree layer turns an empty segment into an *unnamed*
-/// tree entry, and two keys sharing one ("" and "/a.txt") silently overwrite
-/// each other inside a single putMany batch — a success sha for lost data.
-/// Every key accepted by assertKeys can also be read back by getMany.
+/// Rejected rather than normalized: the git tree layer turns an empty segment
+/// into an *unnamed* entry, and two keys sharing one ("" and "/a.txt") silently
+/// overwrite each other inside a single putMany batch — a success sha for lost data.
 export function keyProblem(key) {
   if (typeof key !== "string") return "not a string";
   if (!key.length) return "empty";
@@ -166,15 +121,8 @@ export function assertKeys(keys) {
 
 // ── store ──
 
-/// Portable in-memory object store (zero FS, zero node: deps).
-/// get(hex) -> Uint8Array|null (loose zlib bytes); put(hex, loose) stores a copy.
-///
-/// The store interface is SYNCHRONOUS: every method must return a value, not a
-/// Promise. It is called from inside wasm host callbacks (host_get_object /
-/// host_put_object) and from ref resolution, neither of which can await, so a
-/// Promise-returning store does not fail loudly — wasm would read a
-/// zero-length object and the instance would write commits it cannot read back.
-/// RemoteGit.open probes the store and throws TypeError instead.
+/// In-memory object store. Synchronous by contract: wasm host callbacks cannot
+/// await, so a Promise-returning store would write commits it cannot read back.
 export function memoryStore() {
   const objs = new Map();
   const refs = new Map();
@@ -192,24 +140,14 @@ export function memoryStore() {
     putRef(name, sha) {
       refs.set(name, sha);
     },
-    heads() {
-      const out = [];
-      for (const k of refs.keys()) if (k.startsWith("refs/heads/")) out.push(k.slice("refs/heads/".length));
-      return out;
-    },
-    dump() {
-      return { objects: objs.size, refs: refs.size };
-    },
   };
 }
 
-const STORE_METHODS = ["get", "put", "getRef", "putRef", "heads"];
+const STORE_METHODS = ["get", "put", "getRef", "putRef"];
 
-/// Verify a custom store satisfies the synchronous interface above, so the
-/// failure is a clear TypeError at open() instead of silently-empty reads
-/// later. Read paths are probed with sentinel keys (no writes, so nothing is
-/// mutated); a probe that throws is not our business and is ignored — we only
-/// care that it did not hand back a thenable.
+/// Fail at open() with TypeError instead of silently-empty reads later.
+/// Read paths are probed with sentinel keys; a probe that throws is ignored —
+/// only a thenable is rejected.
 export function assertSyncStore(store) {
   if (!store || typeof store !== "object") {
     throwUsage(`store must be an object with {${STORE_METHODS.join(", ")}}`);
@@ -223,7 +161,6 @@ export function assertSyncStore(store) {
   const probes = [
     ["get", () => store.get("0".repeat(40))],
     ["getRef", () => store.getRef("refs/heads/zig-wasm-git-probe")],
-    ["heads", () => store.heads()],
   ];
   for (const [name, call] of probes) {
     let v;
@@ -253,14 +190,10 @@ export function hexOfBytes(b) {
 
 export const joinUrl = (base, path) => base.replace(/\/+$/, "") + path;
 
-/// Wrap a fetch impl so URLs carrying `user:pass@host` credentials are sent
-/// as an `Authorization: Basic` header with the credentials stripped from
-/// the URL. Some runtimes (notably Cloudflare workerd) drop URL userinfo
-/// instead of applying it, so the same URL that works with curl gets a 401
-/// from in-worker discovery; stripping also keeps tokens out of downstream
-/// logs/proxies. URLs without userinfo pass through untouched, and anything
-/// that isn't an absolute URL (e.g. a relative path) delegates as-is.
-/// String URLs in, string URLs out (pre-set Authorization wins).
+/// URLs carrying `user:pass@host` are sent as `Authorization: Basic` with the
+/// credentials stripped from the URL. Some runtimes (notably workerd) drop URL
+/// userinfo instead of applying it, so the same URL that works with curl gets
+/// a 401 from in-worker discovery. Pre-set Authorization wins.
 export function withBasicAuth(fetchImpl) {
   return async (url, init) => {
     let u;
@@ -308,7 +241,7 @@ async function streamAll(stream, input) {
   return concatU8(chunks);
 }
 
-/// pack 对象 payload:zlib(body)。直出,无需手工包头/adler。
+/// CompressionStream("deflate") emits zlib format directly — no manual header.
 export async function deflateZlib(body) {
   return streamAll(new CompressionStream("deflate"), body);
 }
@@ -359,8 +292,7 @@ export function commitParentsAndTree(body) {
   return { parents, tree };
 }
 
-/// Parse a commit body into a log row {sha, tree, parents, author, message}.
-/// Shared by portable (async) and Node (sync) log(); keep them in sync.
+/// Commit body -> log row {sha, tree, parents, author, message}.
 export function parseCommit(sha, text) {
   const lines = text.split("\n");
   const hdrEnd = lines.indexOf("");
@@ -449,9 +381,7 @@ export function decodeRefsTlv(buf) {
   return out;
 }
 
-/// Decode one pack object header at pos (mirrors wasm_decode_pack_header).
-/// Returns {type, size, next}. Pure JS (no wasm roundtrip); equivalence with
-/// wasm is asserted in tests.
+/// Decode one pack object header at pos. Returns {type, size, next}.
 export function decodePackHeaderJS(buf, pos = 0) {
   if (pos >= buf.length) throw new Error("pack header truncated");
   let b = buf[pos++];
