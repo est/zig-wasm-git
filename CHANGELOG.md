@@ -3,88 +3,68 @@
 Notable changes, written for people using the library. Follows
 [Keep a Changelog](https://keepachangelog.com/); versions are [SemVer](https://semver.org/).
 
-## [Unreleased]
-
-### Added
-
-- **`removeMany(paths, msg?, parent?)`** deletes keys as one version (commit).
-  Missing keys are a no-op (mirrors `getMany` skip semantics), empty dirs are
-  pruned, history is retained like any other version. Same CAS contract as
-  `putMany`. Wire marker is `content_len == 0xFFFFFFFF` in the `wasm_commit`
-  entries TLV — old readers just see a new commit.
-- **Single-key reads without ceremony.** `getMany` accepts a bare string,
-  `get(path, opts?)` returns `bytes | string | null` (`null` when absent), and
-  both plus `readAll(prefix?, opts?)` accept `{ as: "text" }` for UTF-8 decode.
-  `readAll` is `list` + batched `getMany` in one call for small keyspaces.
-- **`git.store` getter** exposes the backing store (share it across instances
-  without touching `git._store`).
-- **Oversize values throw `TypeError`.** Exceeding the 4MB wasm arena used to
-  throw a bare `Error` ("report a bug"); it now names the limit and the way
-  out (split the write).
-
-### Changed
-
-- **`push()` takes `{ fetchImpl }` only.** The old `Partial<PullOptions>` type
-  implied a `filter` that push never sent; the type now says what it does
-  (test/proxy injection).
+## [1.7.0] — 2026-09-27
 
 ### Breaking
 
-- **Errors are two kinds now: `io` vs `protocol`. Usage mistakes throw `TypeError`.**
-  `GitError` keeps one import but gains `.kind`: `GitError.isIO(e)` means
-  "retry later" (`NETWORK` / `HTTP`, with `.status` on HTTP);
-  `GitError.isProtocol(e, ...codes)` means "fix the request" (`CAS_MISMATCH`,
-  `NON_FAST_FORWARD`, `PUSH_REJECTED`, `UNPACK_FAILED`, `NO_V2`,
-  `NO_REMOTE_REF`, `NO_SUCH_OBJECT`, `PROTOCOL_ERROR`). Branch on `.kind`,
-  use `.code` only for protocol detail.
-  Bad keys, bad args, bad stores, use-after-`close` and never-`open`ed
-  instances throw `TypeError` instead of `GitError` — don't catch them as
-  retryable. Internal invariants (wasm failure, corrupt local store) throw
-  plain `Error`. Corrupt packs/sidebands from the server, previously bare
-  `Error`, now throw `GitError` (`protocol/PROTOCOL_ERROR`) so
-  `GitError.is(e)` is finally a real catch-all for operational failures.
+- **Errors are two kinds: `io` vs `protocol`. Usage mistakes throw `TypeError`.**
+  `RemoteGitError` / `ERR` / `isGitError` are gone; one import remains:
+  `GitError.isIO(e)` means "retry later" (`NETWORK` / `HTTP`, with `.status`
+  on HTTP), `GitError.isProtocol(e, ...codes)` means "fix the request"
+  (`CAS_MISMATCH`, `NON_FAST_FORWARD`, `PUSH_REJECTED`, `UNPACK_FAILED`,
+  `NO_V2`, `NO_REMOTE_REF`, `NO_SUCH_OBJECT`, `PROTOCOL_ERROR`). Bad keys,
+  bad args, oversize values, bad stores and never-`open`ed instances throw
+  `TypeError` — don't catch them as retryable. Corrupt packs/sidebands from
+  the server, previously bare `Error`, now throw `protocol/PROTOCOL_ERROR`,
+  so `GitError.is(e)` catches every operational failure.
 
   ```js
-  // before
-  if (GitError.is(e, "CAS_MISMATCH")) { ... }
-  if (GitError.is(e, "NETWORK", "HTTP")) { ... }
+  // before (1.6)
+  import { isGitError, ERR } from "zig-wasm-git";
+  if (isGitError(e, ERR.CAS_MISMATCH)) { ... }
+  if (isGitError(e) && (e.code === ERR.NETWORK || e.code === ERR.HTTP)) { ... }
 
   // after
+  import { GitError } from "zig-wasm-git";
   if (GitError.isProtocol(e, "CAS_MISMATCH")) { ... }
   if (GitError.isIO(e)) { ... }
   ```
 
+- **Smaller surface: `close()`, `sync()` and per-write identity are gone.**
+  Dropping the instance frees the ~5MB wasm arena, so `close()`/`closed`
+  pulled no weight. `sync()` was redundant — `getMany` already bootstraps a
+  cold store and batch-fetches missing blobs. Author/committer/time/timezone
+  options are gone; every commit uses the fixed identity
+  `zig-wasm-git <zig-wasm-git@localhost>`. The store is four methods
+  (`{get, put, getRef, putRef}`); `heads()` and `dump?()` are removed.
+- **`version()` is sync.** It never touched the network, so it no longer
+  returns a `Promise`. Existing `await git.version()` keeps working (awaiting
+  a string is a no-op); only `.then()` chains break.
+
+### Added
+
+- **`removeMany(paths, msg?, parent?)`** deletes keys as one version (commit).
+  Missing keys are a no-op, empty dirs are pruned, history is retained like
+  any other version. Same CAS contract as `putMany`.
+- **`get(path, opts?)`** reads one key (`bytes | string | null`, `null` when
+  absent) and **`readAll(prefix?, opts?)`** does `list` + batched `getMany`
+  in one call. Both accept `{ as: "text" }` for UTF-8 decode, as `getMany` does.
+- **`git.store` getter** exposes the backing store, for sharing across instances.
+- **`pull()` accepts a bare filter string** (`pull("blob:none")` === `pull({ filter: "blob:none" })`).
+
 ### Fixed
 
-- **`GitError.is` now recognizes an error from another copy of the module.** The
-  npm package and the single-file release bundle each contain their own copy of
-  the class, and an app can load both — a Worker vendoring the release download
-  next to its npm install. `instanceof` returns `false` across that boundary, so
-  a genuine `GitError` was rejected as a stranger. Detection is now a
-  `Symbol.for` brand, which is registry-wide and crosses the copy boundary.
-- **A too-old Node no longer looks like a network outage.** On a runtime with
-  no filesystem — Node before 22.3, which has no `process.getBuiltinModule` —
-  the default wasm lookup degraded into `fetch("file://…")` and failed with
-  `NETWORK`, the code documented as "offline, DNS, TLS, CORS". A caller
-  following the docs would have retried a connection that was never the
-  problem. It is now `BAD_ARG`, naming the missing capability and the way out
-  (pass bytes, a `WebAssembly.Module`, or an `http(s)` url).
-- `package.json` now requires Node `>=22.3`, matching what the default wasm
-  lookup actually needs.
-- README: Node requirements said 18+, 20+ and 22.3+ in three places. They now
-  agree, and explain why 22.3 is the floor.
+- `GitError.is*` recognizes errors from another copy of the module (npm
+  package next to the single-file bundle) via a `Symbol.for` brand instead
+  of `instanceof`.
+- A runtime without a filesystem (Node before 22.3) throws `TypeError` naming
+  the missing capability — no longer a misleading `io/NETWORK`. `package.json`
+  requires Node `>=22.3`, matching what the default wasm lookup needs.
 
 ### Changed
 
-- README restructured around a reader's path: a runnable quick start, an
-  authentication section (including the browser CORS caveat), and the
-  `custom store` contract promoted out of a comment. Release process, build
-  instructions and the `want`/`have`/`delta` capability matrix moved to
-  `CONTRIBUTING.md` and `docs/CAPABILITIES.md`; content is unchanged, just no
-  longer sitting between a user and the API.
-- The Errors section now shows the three ways to handle a failure in the order
-  you are likely to need them — `e.code ===` for one known code, `GitError.is`
-  for a set, and an exhaustive `switch` with `never` for all of them.
+- **`push()` takes `{ fetchImpl }` only.** The old `Partial<PullOptions>`
+  type implied a `filter` that push never sent.
 
 ## [1.6.0] — 2026-09-27
 

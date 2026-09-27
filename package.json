@@ -1,6 +1,6 @@
 {
   "name": "zig-wasm-git",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "git remote as a versioned blob store — no fs, no git CLI. Pure-Zig git protocol engine in a ~69KB wasm, with a small async JS API. Runs in Node, browsers and Cloudflare Workers.",
   "keywords": [
     "git",
