@@ -64,18 +64,24 @@ jobs:
           npm init -y >/dev/null && npm pkg set type=module >/dev/null
           npm install ../zig-wasm-git-*.tgz
           cat > smoke.mjs <<'EOF'
-          import { RemoteGit, ERR, isGitError } from "zig-wasm-git";
+          import { RemoteGit, GitError } from "zig-wasm-git";
           // no `wasm` option: must resolve the co-located engine
           const git = await RemoteGit.open("https://example.invalid/r.git");
           const sha = await git.putMany({ "docs/a.md": "# hi" }, "init");
           const got = new TextDecoder().decode((await git.getMany(["docs/a.md"])).get("docs/a.md"));
           if (got !== "# hi") throw new Error("roundtrip failed: " + got);
           if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("bad sha");
+          // a read against an unreachable host must fail loudly, never come
+          // back as an empty Map that reads like "no such key"
           const fresh = await RemoteGit.open("https://example.invalid/r.git");
-          let code = null;
-          try { await fresh.getMany(["a"]); } catch (e) { code = e.code; }
-          if (!isGitError(fresh, ERR.CLOSED) && code !== ERR.NETWORK) {
-            throw new Error("a read against an unreachable host must throw NETWORK, got " + code);
+          let code = null, ours = false;
+          try { await fresh.getMany(["a"]); } catch (e) { code = e.code; ours = GitError.is(e); }
+          if (!ours || code !== GitError.NETWORK) {
+            throw new Error("expected a GitError with code NETWORK, got ours=" + ours + " code=" + code);
+          }
+          // the error surface must survive packaging: one export, variadic is()
+          if (!GitError.is(new GitError("HTTP", "x", { status: 500 }), "HTTP", "NETWORK")) {
+            throw new Error("GitError.is did not match a code in the set");
           }
           await git.close();
           if (!git.closed) throw new Error("close() did not take effect");

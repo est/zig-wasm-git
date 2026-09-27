@@ -8,7 +8,7 @@
 // crypto.subtle (sync clients), fetch (sync clients).
 //
 // Sections:
-//   errors: RemoteGitError + ERR codes (every throw from the client chain)
+//   errors: GitError + its codes (every throw from the client chain)
 //   net:    netFetch — fetch + failure normalization (NETWORK / HTTP)
 //   keys:   key validation (a key that cannot round-trip is rejected)
 //   store:  in-memory object store (same interface as any custom backend)
@@ -21,34 +21,59 @@ export { enc, dec };
 
 // ── errors ──
 
-/// Stable failure codes. Every throw from the client chain is a
-/// RemoteGitError carrying one of these, so callers branch on `code`
-/// instead of matching message text.
-export const ERR = {
-  BAD_STORE: "BAD_STORE", // store does not satisfy the synchronous interface
-  BAD_KEY: "BAD_KEY", // a write key cannot round-trip
-  BAD_REF: "BAD_REF", // ref unresolvable in the local store
-  CAS_MISMATCH: "CAS_MISMATCH", // putMany parent != current tip
-  NON_FAST_FORWARD: "NON_FAST_FORWARD", // push target is not a descendant of the remote tip
-  PUSH_REJECTED: "PUSH_REJECTED", // server refused the ref update
-  UNPACK_FAILED: "UNPACK_FAILED", // server could not unpack the pushed pack
-  NO_REMOTE_REF: "NO_REMOTE_REF", // ref/branch does not exist on the remote
-  NO_SUCH_OBJECT: "NO_SUCH_OBJECT", // server accepted the want but did not send the object
-  NO_V2: "NO_V2", // server lacks protocol v2 (pull / ls-refs require it)
-  HTTP: "HTTP", // non-2xx response; see .status
-  NETWORK: "NETWORK", // fetch threw (offline, DNS, TLS, CORS); see .cause
-  WASM_ALLOC: "WASM_ALLOC", // wasm arena exhausted
-  WASM_RC: "WASM_RC", // a wasm export returned non-zero
-  BAD_TREE_PATH: "BAD_TREE_PATH", // wasm refused a path (defense in depth)
-  BAD_ARG: "BAD_ARG", // argument has the wrong shape/type
-  CLOSED: "CLOSED", // method called on a closed instance
-};
+// Brand for `GitError.is`, so an error thrown by one *copy* of this module is
+// still recognized by another. `instanceof` cannot do that: the npm package and
+// the single-file GitHub-release bundle are separate copies of this class, and
+// an app can load both (a Worker vendoring the release download alongside its
+// npm install). `Symbol.for` is registry-wide, so the brand crosses the copy
+// boundary where `instanceof` does not.
+const BRAND = Symbol.for("zig-wasm-git.GitError");
 
-export class RemoteGitError extends Error {
+/// The one error type this library throws, and the namespace for its codes —
+/// one export, so a caller needs a single import:
+///
+///   import { GitError } from "zig-wasm-git";
+///   if (GitError.is(e, "CAS_MISMATCH")) { ... }          // narrows to that code
+///   if (GitError.is(e, "NETWORK", "HTTP")) { ... }       // narrows to the union
+///   if (GitError.is(e)) { ... }                          // any GitError
+///
+/// The static codes below are the single source of truth for the vocabulary:
+/// the client chain throws via `failed()`, and the shipped `.d.mts` mirrors the
+/// list (a test asserts the two agree). Branch on `.code`, never on `.message`.
+export class GitError extends Error {
+  // ── codes ──
+  static BAD_STORE = "BAD_STORE"; // store does not satisfy the synchronous interface
+  static BAD_KEY = "BAD_KEY"; // a write key cannot round-trip
+  static BAD_REF = "BAD_REF"; // ref unresolvable in the local store
+  static CAS_MISMATCH = "CAS_MISMATCH"; // putMany parent != current tip
+  static NON_FAST_FORWARD = "NON_FAST_FORWARD"; // push target is not a descendant of the remote tip
+  static PUSH_REJECTED = "PUSH_REJECTED"; // server refused the ref update
+  static UNPACK_FAILED = "UNPACK_FAILED"; // server could not unpack the pushed pack
+  static NO_REMOTE_REF = "NO_REMOTE_REF"; // ref/branch does not exist on the remote
+  static NO_SUCH_OBJECT = "NO_SUCH_OBJECT"; // server accepted the want but did not send the object
+  static NO_V2 = "NO_V2"; // server lacks protocol v2 (pull / ls-refs require it)
+  static HTTP = "HTTP"; // non-2xx response; see .status
+  static NETWORK = "NETWORK"; // fetch threw (offline, DNS, TLS, CORS); see .cause
+  static WASM_ALLOC = "WASM_ALLOC"; // wasm arena exhausted
+  static WASM_RC = "WASM_RC"; // a wasm export returned non-zero
+  static BAD_TREE_PATH = "BAD_TREE_PATH"; // wasm refused a path (defense in depth)
+  static BAD_ARG = "BAD_ARG"; // argument has the wrong shape/type, or cannot work here
+  static CLOSED = "CLOSED"; // method called on a closed instance
+
+  /// True when `e` is a GitError, optionally restricted to one or more codes.
+  /// Variadic on purpose: no codes means "any GitError", one code narrows the
+  /// type to that literal, several narrow it to the union — so callers get one
+  /// name instead of a separate `is` and `anyOf`.
+  static is(e, ...codes) {
+    if (e?.[BRAND] !== true) return false;
+    return codes.length === 0 || codes.includes(e.code);
+  }
+
   constructor(code, message, extra = {}) {
     super(message);
-    this.name = "RemoteGitError";
+    this.name = "GitError";
     this.code = code;
+    this[BRAND] = true;
     if (extra.cause !== undefined) this.cause = extra.cause;
     if (extra.status !== undefined) this.status = extra.status;
     if (extra.key !== undefined) this.key = extra.key;
@@ -56,14 +81,10 @@ export class RemoteGitError extends Error {
   }
 }
 
-/// True when `e` is a RemoteGitError, optionally of one specific code.
-export const isGitError = (e, code) =>
-  e instanceof RemoteGitError && (code === undefined || e.code === code);
-
-/// Throw a RemoteGitError. Exported so the client chain never writes a bare
+/// Throw a GitError. Exported so the client chain never writes a bare
 /// `new Error` for a condition a caller may need to branch on.
 export function failed(code, message, extra) {
-  throw new RemoteGitError(code, message, extra);
+  throw new GitError(code, message, extra);
 }
 
 // ── net ──
@@ -76,9 +97,9 @@ export async function netFetch(fetchImpl, url, init, what) {
   try {
     r = await fetchImpl(url, init);
   } catch (e) {
-    failed(ERR.NETWORK, `${what}: ${e?.message ?? e}`, { cause: e });
+    failed(GitError.NETWORK, `${what}: ${e?.message ?? e}`, { cause: e });
   }
-  if (!r?.ok) failed(ERR.HTTP, `${what} http ${r?.status ?? 0}`, { status: r?.status });
+  if (!r?.ok) failed(GitError.HTTP, `${what} http ${r?.status ?? 0}`, { status: r?.status });
   return r;
 }
 
@@ -117,7 +138,7 @@ export function assertKeys(keys) {
   }
   if (bad.length) {
     failed(
-      ERR.BAD_KEY,
+      GitError.BAD_KEY,
       `invalid key(s): ${bad.join("; ")} — keys are relative paths like "docs/a.md"`,
     );
   }
@@ -171,12 +192,12 @@ const STORE_METHODS = ["get", "put", "getRef", "putRef", "heads"];
 /// care that it did not hand back a thenable.
 export function assertSyncStore(store) {
   if (!store || typeof store !== "object") {
-    failed(ERR.BAD_STORE, `store must be an object with {${STORE_METHODS.join(", ")}}`);
+    failed(GitError.BAD_STORE, `store must be an object with {${STORE_METHODS.join(", ")}}`);
   }
   const missing = STORE_METHODS.filter((k) => typeof store[k] !== "function");
   if (missing.length) {
     failed(
-      ERR.BAD_STORE,
+      GitError.BAD_STORE,
       `store is missing ${missing.join(", ")} — it must implement {${STORE_METHODS.join(", ")}}`,
     );
   }
@@ -194,7 +215,7 @@ export function assertSyncStore(store) {
     }
     if (v && typeof v.then === "function") {
       failed(
-        ERR.BAD_STORE,
+        GitError.BAD_STORE,
         `store.${name}() returned a Promise — the store interface is synchronous ` +
           `(it is called from wasm host callbacks that cannot await). Buffer the ` +
           `value yourself, or use memoryStore().`,
@@ -342,7 +363,7 @@ function dv(wasm) {
 function allocBytes(wasm, b) {
   if (b.length === 0) return { ptr: 0, len: 0 };
   const ptr = wasm.wasm_alloc(b.length);
-  if (!ptr) failed(ERR.WASM_ALLOC, "wasm_alloc failed (heap full; call reset between ops)");
+  if (!ptr) failed(GitError.WASM_ALLOC, "wasm_alloc failed (heap full; call reset between ops)");
   new Uint8Array(wasm.memory.buffer).set(b, ptr);
   return { ptr, len: b.length };
 }

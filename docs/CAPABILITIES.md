@@ -49,7 +49,7 @@ git-correct sort), **IO + platform ABIs in JS** (`fetch`, compression,
 | `src/zig/{pktline,proto,filter,partial,enc}.zig` | pkt-line framing, wire shapes, filter parse/apply, negotiated-partial state, hex/base64 |
 | `src/host/portable.mjs` | `RemoteGit` — the public API, all-async, one queue per instance |
 | `src/host/sync.mjs` | fetch-into-store, `lsRemote`, `collectObjects`, TLV ref/status decoders |
-| `src/host/utils.mjs` | errors (`ERR`), key validation, `memoryStore`, zlib, auth, loose/tree/commit parsing |
+| `src/host/utils.mjs` | errors (`GitError` + its codes), key validation, `memoryStore`, zlib, auth, loose/tree/commit parsing |
 
 ## Low-level WASM exports
 

@@ -6,7 +6,7 @@
 // `@ts-expect-error` is an assertion: if the type stops rejecting that line,
 // tsc fails and CI catches the regression.
 
-import { RemoteGit, memoryStore, ERR, isGitError, keyProblem } from "../../src/host/portable.mjs";
+import { RemoteGit, memoryStore, GitError, keyProblem } from "../../src/host/portable.mjs";
 import type {
   Store,
   Entry,
@@ -15,8 +15,7 @@ import type {
   PushResult,
   RemoteGitOptions,
   PutOptions,
-  ErrCode,
-  RemoteGitErrorOf,
+  GitErrorCode,
 } from "../../src/host/portable.mjs";
 
 export async function positive(): Promise<void> {
@@ -55,7 +54,7 @@ export async function positive(): Promise<void> {
   const synced: Map<string, Uint8Array> = await git.sync(["a.txt"], { pull: { filter: "blob:none" } });
 
   const problem: string | null = keyProblem("a/b.txt");
-  const code: ErrCode = ERR.NETWORK;
+  const code: GitErrorCode = GitError.NETWORK;
   const closed: boolean = git.closed;
   await git.close();
 
@@ -71,17 +70,35 @@ export async function branching(): Promise<void> {
     const tip = await git.version();
     if (tip) await git.putMany({ "a.txt": "v2" }, "cas", { parent: tip });
   } catch (e) {
-    // a specific code narrows the error to that code
-    if (isGitError(e, ERR.CAS_MISMATCH)) {
-      const narrowed: "CAS_MISMATCH" = e.code;
-      void narrowed;
-    }
-    if (isGitError(e)) {
-      const anyCode: ErrCode = e.code;
+    // no codes: any GitError, code stays the full union
+    if (GitError.is(e)) {
+      const anyCode: GitErrorCode = e.code;
       void [anyCode, e.message, e.cause, e.status, e.ref, e.key];
     }
-    const typed: RemoteGitErrorOf<"NETWORK"> | null = isGitError(e, ERR.NETWORK) ? e : null;
-    void typed;
+    // one code: narrows to that literal
+    if (GitError.is(e, "CAS_MISMATCH")) {
+      const narrowed: "CAS_MISMATCH" = e.code;
+      // @ts-expect-error narrowed to the one code asked for, not the union
+      const asHttp: "HTTP" = e.code;
+      void [narrowed, asHttp];
+    }
+    // several codes: narrows to their union, not to one of them
+    if (GitError.is(e, "NETWORK", "HTTP")) {
+      const narrowed: "NETWORK" | "HTTP" = e.code;
+      // @ts-expect-error neither of the codes asked for
+      const wrong: "CAS_MISMATCH" = e.code;
+      void [narrowed, wrong, e.status];
+    }
+    // the generic is annotatable when a variable must hold one specific code
+    const typed: GitError<"NETWORK"> | null = GitError.is(e, "NETWORK") ? e : null;
+    // @ts-expect-error the default instantiation is not a specific code
+    const overNarrowed: GitError<"NETWORK"> = null as unknown as GitError;
+    void [typed, overNarrowed];
+    // statics are the codes themselves, usable where a literal is expected
+    const fromStatic: "CAS_MISMATCH" = GitError.CAS_MISMATCH;
+    void fromStatic;
+    // @ts-expect-error a static is not callable — use GitError.is
+    void GitError.CAS_MISMATCH();
   }
   await git.close();
 }
@@ -110,13 +127,15 @@ export async function rejects(): Promise<void> {
   await git.getMany(["a.txt"], "text");
   // @ts-expect-error version() takes no arguments
   await git.version(1);
-  // @ts-expect-error not an ErrCode
-  isGitError(new Error(), "NOPE");
+  // @ts-expect-error not a GitErrorCode
+  GitError.is(new Error(), "NOPE");
   // @ts-expect-error keyProblem takes a string
   keyProblem(1);
   // @ts-expect-error list() takes a prefix, not a number
   await git.list(5);
   // @ts-expect-error unknown error code in the union
-  const bad: ErrCode = "BAD_STORE_TYPO";
+  const bad: GitErrorCode = "BAD_STORE_TYPO";
+  // @ts-expect-error GitError takes a code and a message
+  void new GitError();
   void bad;
 }

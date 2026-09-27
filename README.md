@@ -86,7 +86,7 @@ await git.close(); // release the ~5MB wasm arena
 - A **small async JS API** on top. `fetch`, `CompressionStream`,
   `crypto.subtle` and a pluggable store are the only platform dependencies, so
   the same JS runs in Node, browsers and Workers with no `node:` imports.
-- **Fails loudly.** Every throw is a `RemoteGitError` with a stable `.code`, and
+- **Fails loudly.** Every throw is a `GitError` with a stable `.code`, and
   a network or HTTP failure is never reported as "key not found"
   ([Errors](#errors)).
 
@@ -271,23 +271,62 @@ with `close()` rather than reusing one instance forever.
 
 ## Errors
 
-Every throw is a `RemoteGitError` with a stable `.code` (and the original error
-in `.cause` where one exists), so callers branch on the code rather than
-matching message text:
+Every throw is a `GitError` with a stable `.code`. Branch on the code, never on
+the message text. One import covers the class and its codes:
 
 ```js
-import { ERR, isGitError } from "zig-wasm-git";
+import { GitError } from "zig-wasm-git";
 
 try {
   await git.putMany({ "a.txt": "v2" }, "cas write", { parent: tip });
 } catch (e) {
-  if (isGitError(e, ERR.CAS_MISMATCH)) { /* someone else wrote; re-read */ }
-  else if (isGitError(e, ERR.NON_FAST_FORWARD)) { /* pull, then rewrite */ }
-  else if (isGitError(e, ERR.NETWORK) || isGitError(e, ERR.HTTP)) {
+  if (GitError.is(e, "CAS_MISMATCH")) { /* someone else wrote; re-read */ }
+  else if (GitError.is(e, "NON_FAST_FORWARD")) { /* pull, then rewrite */ }
+  else if (GitError.is(e, "NETWORK", "HTTP")) {
     retryLater(e.status);          // .status is set for HTTP
   } else throw e;
 }
 ```
+
+`GitError.is` is variadic, and that is the whole API — no separate `anyOf`:
+
+| you write | it means | `.code` narrows to |
+| --- | --- | --- |
+| `GitError.is(e)` | is this one of ours? | the full union |
+| `GitError.is(e, "NETWORK")` | that one code | `"NETWORK"` |
+| `GitError.is(e, "NETWORK", "HTTP")` | any of these | `"NETWORK" \| "HTTP"` |
+
+In TypeScript that narrowing is real, so `e.status` and `e.cause` stay typed
+and the code is checked against the real list:
+
+```ts
+if (GitError.is(e, "HTTP")) console.log(e.status);   // number | undefined
+if (GitError.is(e, "TYPO")) { }                      // compile error
+```
+
+Three ways to handle errors, in the order you are likely to need them:
+
+```js
+// 1. one known code — plain equality is fine
+if (e instanceof GitError && e.code === "CLOSED") reopen();
+
+// 2. a set of codes — GitError.is
+if (GitError.is(e, "NETWORK", "HTTP")) retryLater();
+
+// 3. every code — switch, with `never` so a new code fails the build
+if (e instanceof GitError) {
+  switch (e.code) {
+    case "CAS_MISMATCH": return reRead();
+    case "NON_FAST_FORWARD": return pullAndRewrite();
+    default: { const _exhaustive: never = e; throw e; }
+  }
+}
+```
+
+`GitError.is` also recognizes a `GitError` thrown by a *different copy* of this
+module — the npm package and the single-file release bundle are separate
+classes, and an app can load both. `instanceof` cannot do that, which is the
+one place the two differ.
 
 | code | raised when |
 | --- | --- |

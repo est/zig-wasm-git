@@ -37,57 +37,93 @@ export interface Store {
 /** In-memory store. Append-only: objects are never evicted. */
 export function memoryStore(): Store;
 
-/** Stable failure codes; see `RemoteGitError.code`. */
-export const ERR: {
-  readonly BAD_STORE: "BAD_STORE";
-  readonly BAD_KEY: "BAD_KEY";
-  readonly BAD_REF: "BAD_REF";
-  readonly CAS_MISMATCH: "CAS_MISMATCH";
-  readonly NON_FAST_FORWARD: "NON_FAST_FORWARD";
-  readonly PUSH_REJECTED: "PUSH_REJECTED";
-  readonly UNPACK_FAILED: "UNPACK_FAILED";
-  readonly NO_REMOTE_REF: "NO_REMOTE_REF";
-  readonly NO_SUCH_OBJECT: "NO_SUCH_OBJECT";
-  readonly NO_V2: "NO_V2";
-  readonly HTTP: "HTTP";
-  readonly NETWORK: "NETWORK";
-  readonly WASM_ALLOC: "WASM_ALLOC";
-  readonly WASM_RC: "WASM_RC";
-  readonly BAD_TREE_PATH: "BAD_TREE_PATH";
-  readonly BAD_ARG: "BAD_ARG";
-  readonly CLOSED: "CLOSED";
-};
-
-/** One of the `ERR` values. */
-export type ErrCode = (typeof ERR)[keyof typeof ERR];
+/** One of the `GitError` codes. Also spelled `GitError["code"]`. */
+export type GitErrorCode =
+  | "BAD_STORE"
+  | "BAD_KEY"
+  | "BAD_REF"
+  | "CAS_MISMATCH"
+  | "NON_FAST_FORWARD"
+  | "PUSH_REJECTED"
+  | "UNPACK_FAILED"
+  | "NO_REMOTE_REF"
+  | "NO_SUCH_OBJECT"
+  | "NO_V2"
+  | "HTTP"
+  | "NETWORK"
+  | "WASM_ALLOC"
+  | "WASM_RC"
+  | "BAD_TREE_PATH"
+  | "BAD_ARG"
+  | "CLOSED";
 
 /**
- * Every failure raised by the client chain. Branch on `.code` rather than
- * matching `.message`; the original error is kept in `.cause`.
+ * Every failure raised by the client chain, and the namespace for its codes —
+ * one export, so a caller needs a single import.
+ *
+ * ```ts
+ * import { GitError } from "zig-wasm-git";
+ *
+ * if (GitError.is(e, "CAS_MISMATCH")) { ... }        // narrowed to that code
+ * if (GitError.is(e, "NETWORK", "HTTP")) { ... }     // narrowed to the union
+ * if (GitError.is(e)) { ... }                        // any GitError
+ * ```
+ *
+ * The generic parameter is the narrowing mechanism and is normally inferred;
+ * write `GitError<"HTTP">` only to annotate a variable that must hold one
+ * specific code. Branch on `.code`, never on `.message`; the original error is
+ * kept in `.cause`.
  */
-export class RemoteGitError extends Error {
-  readonly name: "RemoteGitError";
-  readonly code: ErrCode;
+export class GitError<C extends GitErrorCode = GitErrorCode> extends Error {
+  readonly name: "GitError";
+  readonly code: C;
   /** Original error, when this one wraps something (`NETWORK`). */
   readonly cause?: unknown;
-  /** HTTP status, when `code === ERR.HTTP`. */
+  /** HTTP status, when `code === "HTTP"`. */
   readonly status?: number;
   /** Ref or key the failure concerns, when relevant. */
   readonly ref?: string;
   readonly key?: string;
   constructor(
-    code: ErrCode,
+    code: C,
     message: string,
     extra?: { cause?: unknown; status?: number; key?: string; ref?: string },
   );
+
+  // ── codes ──
+  // Mirrors the statics in src/host/utils.mjs. A test asserts the two agree, so
+  // a code added on one side and forgotten on the other fails the suite.
+  static readonly BAD_STORE: "BAD_STORE";
+  static readonly BAD_KEY: "BAD_KEY";
+  static readonly BAD_REF: "BAD_REF";
+  static readonly CAS_MISMATCH: "CAS_MISMATCH";
+  static readonly NON_FAST_FORWARD: "NON_FAST_FORWARD";
+  static readonly PUSH_REJECTED: "PUSH_REJECTED";
+  static readonly UNPACK_FAILED: "UNPACK_FAILED";
+  static readonly NO_REMOTE_REF: "NO_REMOTE_REF";
+  static readonly NO_SUCH_OBJECT: "NO_SUCH_OBJECT";
+  static readonly NO_V2: "NO_V2";
+  static readonly HTTP: "HTTP";
+  static readonly NETWORK: "NETWORK";
+  static readonly WASM_ALLOC: "WASM_ALLOC";
+  static readonly WASM_RC: "WASM_RC";
+  static readonly BAD_TREE_PATH: "BAD_TREE_PATH";
+  static readonly BAD_ARG: "BAD_ARG";
+  static readonly CLOSED: "CLOSED";
+
+  /**
+   * True when `e` is a GitError, optionally restricted to one or more codes.
+   *
+   * Variadic on purpose: no codes means "any GitError", one code narrows `e` to
+   * that literal, several narrow it to the union. That is why there is no
+   * separate `anyOf` — one name covers all three cases.
+   *
+   * Recognizes a GitError thrown by a *different copy* of this module (the npm
+   * package and the single-file release bundle), where `instanceof` would not.
+   */
+  static is<C2 extends GitErrorCode>(e: unknown, ...codes: C2[]): e is GitError<C2>;
+  static is(e: unknown): e is GitError;
 }
-
-/** A {@link RemoteGitError} narrowed to one code. */
-export type RemoteGitErrorOf<C extends ErrCode> = RemoteGitError & { readonly code: C };
-
-/** True when `e` is a RemoteGitError, optionally of one specific code. */
-export function isGitError<C extends ErrCode>(e: unknown, code: C): e is RemoteGitErrorOf<C>;
-export function isGitError(e: unknown): e is RemoteGitError;
 
 /**
  * Why `key` cannot be stored, or null when it is a well-formed key.

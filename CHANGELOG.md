@@ -5,8 +5,40 @@ Notable changes, written for people using the library. Follows
 
 ## [Unreleased]
 
+### Breaking
+
+- **The error surface is now one export.** `RemoteGitError` is `GitError`, the
+  `isGitError` function is `GitError.is`, and the `ERR` object is gone — its
+  codes are statics on the class.
+
+  ```js
+  // before
+  import { ERR, isGitError } from "zig-wasm-git";
+  if (isGitError(e, ERR.CAS_MISMATCH)) { ... }
+  if (isGitError(e, ERR.NETWORK) || isGitError(e, ERR.HTTP)) { ... }
+
+  // after
+  import { GitError } from "zig-wasm-git";
+  if (GitError.is(e, "CAS_MISMATCH")) { ... }
+  if (GitError.is(e, "NETWORK", "HTTP")) { ... }
+  ```
+
+  `GitError.is` is variadic, so one name covers "any GitError", one code and a
+  set of codes — there is no separate `anyOf`. Bare string literals work
+  everywhere the statics do, and TypeScript autocompletes them from the real
+  code list, so `ERR` no longer needs to be exported at all.
+
+  The error type is now generic in its code: `GitError<"HTTP">` is the old
+  `RemoteGitErrorOf<"HTTP">`, and `GitErrorCode` is the old `ErrCode`.
+
 ### Fixed
 
+- **`GitError.is` now recognizes an error from another copy of the module.** The
+  npm package and the single-file release bundle each contain their own copy of
+  the class, and an app can load both — a Worker vendoring the release download
+  next to its npm install. `instanceof` returns `false` across that boundary, so
+  a genuine `GitError` was rejected as a stranger. Detection is now a
+  `Symbol.for` brand, which is registry-wide and crosses the copy boundary.
 - **A too-old Node no longer looks like a network outage.** On a runtime with
   no filesystem — Node before 22.3, which has no `process.getBuiltinModule` —
   the default wasm lookup degraded into `fetch("file://…")` and failed with
@@ -27,6 +59,9 @@ Notable changes, written for people using the library. Follows
   instructions and the `want`/`have`/`delta` capability matrix moved to
   `CONTRIBUTING.md` and `docs/CAPABILITIES.md`; content is unchanged, just no
   longer sitting between a user and the API.
+- The Errors section now shows the three ways to handle a failure in the order
+  you are likely to need them — `e.code ===` for one known code, `GitError.is`
+  for a set, and an exhaustive `switch` with `never` for all of them.
 
 ## [1.6.0] — 2026-09-27
 

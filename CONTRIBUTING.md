@@ -82,7 +82,11 @@ with what a caller has to change, not with what the diff touched.
 - **A missing key is a skip, a transport failure is a throw.** Never let a
   dropped connection read as "this key does not exist" — that ambiguity is the
   one bug class this library is built to avoid. New error paths go through
-  `failed(ERR.X, ...)` in `src/host/utils.mjs`, never a raw `throw`.
+  `failed(GitError.X, ...)` in `src/host/utils.mjs`, never a raw `throw`.
+- **Adding an error code means touching two lists.** The statics on `GitError`
+  and their mirrors in `src/host/portable.d.mts` are both hand-written, because
+  one is runtime and one is types. `tests/test_remote.mjs` parses the `.d.mts`
+  and diffs it against the class, so forgetting one fails the suite.
 - **Validate before you write.** `putMany` checks every key up front so a
   rejected batch has no side effects; `open()` probes a custom store's sync
   contract before instantiating wasm. Same reasoning: fail before the expensive

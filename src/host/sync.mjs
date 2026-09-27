@@ -10,7 +10,7 @@
 import {
   buildLsRefsReq, buildFetchReq, listRefs, decodePackHeaderJS, inflateOne, deltaApply,
   decodeRefsTlv, looseBody, parseTreeEntries, commitParentsAndTree,
-  deflateZlib, hexOfBytes, joinUrl, enc, dec, netFetch, failed, ERR,
+  deflateZlib, hexOfBytes, joinUrl, enc, dec, netFetch, failed, GitError,
 } from "./utils.mjs";
 
 export { decodeRefsTlv };
@@ -244,7 +244,7 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   const discRes = await netFetch(fetchImpl, joinUrl(url, "/info/refs?service=git-upload-pack"), { headers }, "discovery");
   const disc = new Uint8Array(await discRes.arrayBuffer());
   if (!dec.decode(disc).includes("version 2")) {
-    failed(ERR.NO_V2, "server lacks protocol v2 (need version 2 advertisement)");
+    failed(GitError.NO_V2, "server lacks protocol v2 (need version 2 advertisement)");
   }
 
   // 2. ls-refs
@@ -255,15 +255,15 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
     body: lsBody,
   }, "ls-refs");
   const refs = listRefs(wasm, new Uint8Array(await lsRes.arrayBuffer()));
-  if (!refs.length) failed(ERR.NO_REMOTE_REF, "remote has no refs (empty repo — nothing to fetch)");
+  if (!refs.length) failed(GitError.NO_REMOTE_REF, "remote has no refs (empty repo — nothing to fetch)");
 
   // resolve want(s): full ref, short name, raw oid, or raw-oid array
   let wantOids;
   let wantRef = null;
   if (Array.isArray(want)) {
-    if (!want.length) failed(ERR.BAD_KEY, "empty want list");
+    if (!want.length) failed(GitError.BAD_KEY, "empty want list");
     wantOids = want.map((w) => {
-      if (!/^[0-9a-f]{40}$/i.test(w)) failed(ERR.BAD_KEY, `batch fetch only takes raw oids, got: ${w}`);
+      if (!/^[0-9a-f]{40}$/i.test(w)) failed(GitError.BAD_KEY, `batch fetch only takes raw oids, got: ${w}`);
       return w.toLowerCase();
     });
   } else if (/^[0-9a-f]{40}$/i.test(want)) {
@@ -273,7 +273,7 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
     const full = want.startsWith("refs/") ? want : `refs/heads/${want}`;
     const hit = refs.find((r) => r.name === full) ?? refs.find((r) => r.name === want);
     if (!hit) {
-      failed(ERR.NO_REMOTE_REF, `remote ref not found: ${want} (have: ${refs.map((r) => r.name).join(", ")})`, {
+      failed(GitError.NO_REMOTE_REF, `remote ref not found: ${want} (have: ${refs.map((r) => r.name).join(", ")})`, {
         ref: want,
       });
     }
@@ -341,7 +341,7 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   for (const o of wantOids) {
     if (!store.get(o)) {
       failed(
-        ERR.NO_SUCH_OBJECT,
+        GitError.NO_SUCH_OBJECT,
         `fetched pack lacks wanted object ${o} (got ${stored} objects)`,
         { ref: o },
       );

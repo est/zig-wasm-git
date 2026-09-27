@@ -21,8 +21,9 @@ for (const f of ["utils.mjs", "sync.mjs", "portable.mjs"]) {
     throw new Error(`${f} must stay portable (no node: imports)`);
   }
 }
-const { RemoteGit, memoryStore } = await import("../src/host/portable.mjs");
+const { RemoteGit, memoryStore, GitError } = await import("../src/host/portable.mjs");
 if (typeof RemoteGit?.open !== "function") throw new Error("portable.mjs must export RemoteGit with static open()");
+if (typeof GitError?.is !== "function") throw new Error("portable.mjs must export GitError with static is()");
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -162,6 +163,58 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   }
   if (!threw) throw new Error("stale parent must throw CAS mismatch");
   console.log("[ok] list (+prefix) and CAS parent");
+}
+
+// ── 2b. the error surface: one export, variadic is(), cross-copy brand ──
+{
+  // 1. the shipped .d.mts and the runtime statics must list the same codes.
+  //    The declarations are hand-written, so nothing else keeps them honest: a
+  //    code added to the class and forgotten in the .d.mts would typecheck
+  //    (GitError.FOO is `any`-ish via the index) yet be a lie to every consumer.
+  const dts = readFileSync(join(ROOT, "src/host/portable.d.mts"), "utf8");
+  const declared = [...dts.matchAll(/static readonly ([A-Z0-9_]+): "([A-Z0-9_]+)";/g)]
+    .map((m) => [m[1], m[2]]);
+  const runtime = Object.entries(GitError).filter(([k]) => k !== "is" && k !== "length" && k !== "name");
+  if (!declared.length) throw new Error("no static codes found in portable.d.mts — has the format changed?");
+  const missing = declared.filter(([k, v]) => GitError[k] !== v);
+  if (missing.length) {
+    throw new Error(`codes declared in .d.mts but absent/different at runtime: ${missing.map(([k, v]) => `${k}!=${v}`).join(", ")}`);
+  }
+  const extra = runtime.filter(([k, v]) => !declared.some(([dk, dv]) => dk === k && dv === v));
+  if (extra.length) throw new Error(`codes on the class but not declared in .d.mts: ${extra.map(([k]) => k).join(", ")}`);
+
+  // 2. is() is variadic: 0 codes = any GitError, 1 = that code, n = the set
+  const cas = new GitError("CAS_MISMATCH", "m");
+  if (!GitError.is(cas)) throw new Error("is(e) with no codes must accept any GitError");
+  if (!GitError.is(cas, "CAS_MISMATCH")) throw new Error("is(e, code) must accept a match");
+  if (GitError.is(cas, "NETWORK")) throw new Error("is(e, code) must reject a non-match");
+  if (!GitError.is(cas, "NETWORK", "HTTP", "CAS_MISMATCH")) throw new Error("is(e, ...codes) must accept any member");
+  if (GitError.is(cas, "NETWORK", "HTTP")) throw new Error("is(e, ...codes) must reject a set without a member");
+  // it must not claim unrelated throwables
+  for (const other of [new Error("x"), null, undefined, 42, "NETWORK", { code: "NETWORK" }, { name: "GitError", code: "NETWORK" }]) {
+    if (GitError.is(other)) throw new Error(`is() must not claim a non-GitError: ${JSON.stringify(other)}`);
+  }
+  // every field the README promises survives
+  const rich = new GitError("HTTP", "http 503", { status: 503, ref: "refs/heads/main", key: "a.txt", cause: new Error("upstream") });
+  if (rich.status !== 503 || rich.ref !== "refs/heads/main" || rich.key !== "a.txt" || !rich.cause) {
+    throw new Error("GitError must carry status/ref/key/cause");
+  }
+  if (rich.name !== "GitError") throw new Error("name must be GitError, got: " + rich.name);
+
+  // 3. cross-copy recognition. The npm package and the single-file release
+  //    bundle are separate copies of this class, and an app can load both. A
+  //    query string forces a second evaluation of the module that *defines* the
+  //    class, standing in for that: `instanceof` sees two different classes, the
+  //    brand does not. (Re-importing portable.mjs would not do — it re-exports
+  //    utils.mjs, which Node would still share.)
+  const twin = await import(`../src/host/utils.mjs?copy=${Date.now()}`);
+  if (twin.GitError === GitError) throw new Error("expected a distinct module instance for the cross-copy check");
+  const foreign = new twin.GitError("NETWORK", "from the other copy");
+  if (foreign instanceof GitError) throw new Error("expected instanceof to fail across copies (test is not testing anything)");
+  if (!GitError.is(foreign)) throw new Error("GitError.is must recognize a GitError from another copy of the module");
+  if (!GitError.is(foreign, "NETWORK")) throw new Error("code matching must work across copies too");
+  if (GitError.is(foreign, "HTTP")) throw new Error("cross-copy code mismatch must still be rejected");
+  console.log("[ok] error surface: one export, variadic is(), .d.mts parity, cross-copy brand");
 }
 
 // ── 2c. fail loudly instead of silently (store contract / network / keys) ──
