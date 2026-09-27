@@ -24,7 +24,7 @@ underlying negotiation, delta handling and filters actually do.
 | Remote version probe | `ls-refs` filtered to one ref | Supported via `remoteVersion()` (no store writes; throws on network error) |
 | Optimistic concurrency | `putMany(..., { parent })` throws locally on tip mismatch | Supported (no extra RTT; `push` still rejects non-fast-forward as backstop) |
 | Shallow history | `shallow` / `deepen` / `deepen-since` / `deepen-not` | **Not supported** (client never sends `deepen`) |
-| Delete a key | tree-entry removal in `wasm_commit` | **Not supported** — `putMany` only upserts; full history retained |
+| Delete a key | tree-entry removal in `wasm_commit` (content-len `0xFFFFFFFF` marker) | Supported via `removeMany` (missing keys are a no-op, empty dirs pruned) |
 | Concurrent writers | merge / conflict resolution | **None** — last-writer-wins; `push` rejects non-fast-forward, caller re-pulls and rewrites |
 | Single huge blob | wasm 4MB arena per call, whole-pack `arrayBuffer` in JS | No chunked storage; blobs approaching MBs may hit `wasm_alloc` / Worker memory limits |
 | Tags / notes / LFS / submodules | `tag` objects traversable; `gitlink` entries skipped on push; no LFS/notes protocol | Tags readable by oid; LFS/notes unsupported |

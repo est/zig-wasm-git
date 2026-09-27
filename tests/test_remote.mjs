@@ -157,6 +157,32 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   console.log("[ok] list (+prefix) and CAS parent");
 }
 
+// ── 2b2. removeMany (local): delete keys, prune dirs, no-op on missing ──
+{
+  const git = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, ref: "main" });
+  const LC = { local: true };
+  await git.putMany({ "a.txt": "1", "docs/b.txt": "2", "docs/c.txt": "3" }, "init");
+  const tip = git.version();
+  const c2 = await git.removeMany(["docs/b.txt"], "drop b");
+  if (git.version() !== c2 || c2 === tip) throw new Error("removeMany should move tip");
+  if ((await git.get("docs/b.txt", LC)) !== null) throw new Error("removed key must read null");
+  if ((await git.get("docs/c.txt", { ...LC, as: "text" })) !== "3") throw new Error("sibling must survive");
+  // last file in a dir prunes the dir itself
+  await git.removeMany("docs/c.txt", "drop c");
+  if ((await git.list("", LC)).some((e) => e.path.startsWith("docs/"))) throw new Error("empty dir should be pruned");
+  // missing keys are a no-op for reads (but still one version)
+  await git.removeMany(["nope.txt"], "noop");
+  if ((await git.list("", LC)).map((e) => e.path).join() !== "a.txt") throw new Error("noop remove must not touch survivors");
+  // bad keys rejected, CAS honored
+  let ke = null;
+  try { await git.removeMany(["/bad"], "m"); } catch (e) { ke = e; }
+  if (!(ke instanceof TypeError)) throw new Error("bad remove key should be TypeError");
+  let ce = null;
+  try { await git.removeMany(["a.txt"], "m", { parent: tip }); } catch (e) { ce = e; }
+  if (!GitError.isProtocol(ce, "CAS_MISMATCH")) throw new Error("stale remove parent must be CAS_MISMATCH");
+  console.log("[ok] removeMany (delete + prune + noop + CAS)");
+}
+
 // ── 2b. the error surface: one GitError (io/protocol), usage is TypeError ──
 {
   // 1. the shipped .d.mts and the runtime agree on the protocol codes.
@@ -286,7 +312,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   await g.putMany({ "a.txt": "x".repeat(100_000) }, "m");
   if (!(g._wasm.memory.buffer.byteLength > 4 * 1024 * 1024)) throw new Error("expected a multi-MB wasm arena");
   // the store survives; a fresh instance can reuse it
-  const g2 = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, store: g._store });
+  const g2 = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, store: g.store });
   if (text(await g2.getMany(["a.txt"], { local: true }), "a.txt")?.length !== 100_000) {
     throw new Error("reopening on the same store should still read");
   }
@@ -315,15 +341,23 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   if ((await sh.getMany(["u.txt"], { local: true })).get("u.txt")?.length !== 2) throw new Error("Uint8Array content");
   if (!(await sh.getMany(["o.txt"], { local: true })).has("o.txt")) throw new Error("getMany should read");
   if (!(await sh.getMany(["s.txt"], { local: true })).get("s.txt") instanceof Uint8Array) {
-    throw new Error("getMany should stay bytes (decode with TextDecoder yourself)");
+    throw new Error("getMany should stay bytes by default");
   }
-  let singleErr = null;
+  // a bare string reads one key (no need to wrap a single read in an array)
+  if (text(await sh.getMany("o.txt", { local: true }), "o.txt") !== "1") throw new Error("getMany(single string) should read one key");
+  // { as: "text" } decodes; get() reads one key (null when absent)
+  if ((await sh.getMany(["s.txt"], { local: true, as: "text" })).get("s.txt") !== "str") throw new Error("getMany as:text");
+  if ((await sh.get("s.txt", { local: true, as: "text" })) !== "str") throw new Error("get as:text");
+  if ((await sh.get("missing.txt", { local: true })) !== null) throw new Error("get missing should be null");
+  if ((await sh.readAll("", { local: true, as: "text" })).size < 5) throw new Error("readAll should return everything");
+  // oversize values are usage errors (TypeError), not "report a bug" Errors
+  let bigErr = null;
   try {
-    await sh.getMany("o.txt", { local: true });
-  } catch (e) {
-    singleErr = e;
-  }
-  if (!(singleErr instanceof TypeError)) throw new Error("getMany(single string) should be TypeError, wrap it: [path]");
+    await sh.putMany({ "big.bin": new Uint8Array(5 * 1024 * 1024) }, "m");
+  } catch (e) { bigErr = e; }
+  if (!(bigErr instanceof TypeError)) throw new Error("oversize write should be TypeError, got " + bigErr?.constructor?.name);
+  // the store survives via the public getter; a fresh instance can reuse it
+  if (sh.store !== sh._store) throw new Error("store getter should expose the backing store");
   // a non-string, non-bytes value is refused instead of stored as "[object Object]"
   for (const bad of [{ "z.txt": {} }, { "z.txt": 42 }, "nope", 42, [["a", "b"]]]) {
     let be;

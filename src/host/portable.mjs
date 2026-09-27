@@ -68,11 +68,11 @@ function toU8(v) {
 const typeName = (v) =>
   v === null ? "null" : Array.isArray(v) ? "array" : typeof v === "object" ? v.constructor?.name ?? "object" : typeof v;
 
-/// Keys argument -> array. Callers pass an array; a bare string would
-/// iterate as chars, so reject it loudly instead of reading garbage.
+/// Keys argument -> array. A bare string wraps to one key (a string is the
+/// common single-read case; iterating it as chars would be the real bug).
 const keyList = (paths) => {
-  if (typeof paths === "string") throwUsage("getMany(paths) takes an array of keys, got a single string; wrap it: [path]");
-  if (paths == null || typeof paths[Symbol.iterator] !== "function") throwUsage("getMany(paths) takes an array of keys");
+  if (typeof paths === "string") return [paths];
+  if (paths == null || typeof paths[Symbol.iterator] !== "function") throwUsage("getMany(paths) takes a key or an array of keys");
   return [...paths];
 };
 
@@ -252,7 +252,7 @@ export class RemoteGit {
       const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
       if (!u8.length) return { ptr: 0, len: 0 };
       const ptr = w.wasm_alloc(u8.length);
-      if (!ptr) throw new Error("wasm_alloc failed: object too large for the 4MB arena");
+      if (!ptr) throwUsage("value too large for the 4MB wasm arena — split it into smaller writes");
       mem().set(u8, ptr);
       return { ptr, len: u8.length };
     };
@@ -294,10 +294,13 @@ export class RemoteGit {
     let n = 2;
     const ps = entries.map((e) => {
       const pb = enc.encode(e.path);
+      if (e.content == null) return { pb, cb: null }; // deletion marker
       const cb = e.content instanceof Uint8Array ? e.content : enc.encode(e.content);
       n += 2 + pb.length + 4 + cb.length;
       return { pb, cb };
     });
+    // account for deletion markers (no content bytes, len word only)
+    for (const { pb, cb } of ps) if (cb === null) n += 2 + pb.length + 4;
     const out = new Uint8Array(n);
     const dv = new DataView(out.buffer);
     dv.setUint16(0, entries.length, true);
@@ -307,6 +310,11 @@ export class RemoteGit {
       pos += 2;
       out.set(pb, pos);
       pos += pb.length;
+      if (cb === null) {
+        dv.setUint32(pos, 0xffffffff, true); // must match wasm_commit's marker
+        pos += 4;
+        continue;
+      }
       dv.setUint32(pos, cb.length, true);
       pos += 4;
       out.set(cb, pos);
@@ -337,10 +345,11 @@ export class RemoteGit {
       const msg = as(message);
       const entries = Object.entries(entriesObj).map(([path, content]) => ({
         path,
-        content: typeof content === "string" ? enc.encode(content) : content,
+        content: content == null ? null : typeof content === "string" ? enc.encode(content) : content,
       }));
       const ej = ab(this._encodeEntriesTlv(entries));
       const outHex = w.wasm_alloc(40);
+      if (!outHex) throwUsage("write too large for the 4MB wasm arena — split it into smaller commits");
       const rc = w.wasm_commit(pHex.ptr, pHex.len, msg.ptr, msg.len, ej.ptr, ej.len, outHex);
       if (rc !== 0) throw new Error(`wasm_commit rc=${rc}`);
       const sha = rs(outHex, 40);
@@ -414,18 +423,20 @@ export class RemoteGit {
     return fetchIntoStore(this._wasm, this._store, this.url, this.ref, { ...this._net(), ...opts });
   }
 
+  _allocInto(w, b) {
+    const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
+    if (u8.length === 0) return { ptr: 0, len: 0 };
+    const ptr = w.wasm_alloc(u8.length);
+    if (!ptr) throwUsage("value too large for the 4MB wasm arena — split it into smaller writes");
+    new Uint8Array(w.memory.buffer).set(u8, ptr);
+    return { ptr, len: u8.length };
+  }
+
   async _packObjects(objects) {
     const w = this._wasm;
     w.wasm_reset();
     this._takeEmit();
-    const allocBytes = (b) => {
-      const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
-      if (u8.length === 0) return { ptr: 0, len: 0 };
-      const ptr = w.wasm_alloc(u8.length);
-      if (!ptr) throw new Error("wasm_alloc failed: object too large for the 4MB arena");
-      new Uint8Array(w.memory.buffer).set(u8, ptr);
-      return { ptr, len: u8.length };
-    };
+    const allocBytes = (b) => this._allocInto(w, b);
     const devs = [];
     for (const o of objects) devs.push(await deflateZlib(o.body));
     if (w.wasm_pack_begin(objects.length) !== 0) throw new Error("wasm_pack_begin failed");
@@ -448,14 +459,7 @@ export class RemoteGit {
     const newOid = this._resolveRef(this.ref).toLowerCase();
     const discRes = await netFetch(fi, joinUrl(this.url, "/info/refs?service=git-receive-pack"), undefined, "discovery (receive-pack)");
     const advert = new Uint8Array(await discRes.arrayBuffer());
-    const allocBytes = (b) => {
-      const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
-      if (!u8.length) return { ptr: 0, len: 0 };
-      const ptr = w.wasm_alloc(u8.length);
-      if (!ptr) throw new Error("wasm_alloc failed: object too large for the 4MB arena");
-      new Uint8Array(w.memory.buffer).set(u8, ptr);
-      return { ptr, len: u8.length };
-    };
+    const allocBytes = (b) => this._allocInto(w, b);
     const allocStr = (s) => allocBytes(enc.encode(s));
     w.wasm_reset();
     this._takeEmit();
@@ -550,6 +554,12 @@ throwProtocol("UNPACK_FAILED", `unpack failed: ${status.unpackMsg}`, { ref: this
 
   // ── public: all async ──
 
+  /// The object store behind this instance (advanced use: share it across
+  /// instances, inspect refs). The store itself stays synchronous by contract.
+  get store() {
+    return this._store;
+  }
+
   version() {
     return this._resolveRefOrNull(this.ref);
   }
@@ -563,7 +573,28 @@ throwProtocol("UNPACK_FAILED", `unpack failed: ${status.unpackMsg}`, { ref: this
 
   async getMany(paths, opts = {}) {
     const list_ = keyList(paths);
-    return this._seq(() => this._getManyInner(list_, opts));
+    const map = await this._seq(() => this._getManyInner(list_, opts));
+    if (opts.as === "text") {
+      const out = new Map();
+      for (const [k, v] of map) out.set(k, dec.decode(v));
+      return out;
+    }
+    return map;
+  }
+
+  /// Single-key read: bytes (or string with `{ as: "text" }`), null when absent.
+  async get(path, opts = {}) {
+    if (typeof path !== "string") throwUsage("get(path) takes a single key string");
+    const map = await this.getMany([path], opts);
+    return map.get(path) ?? null;
+  }
+
+  /// Small-keyspace convenience: list + getMany in one call.
+  /// Prefix-filtered server-side by nothing — it pulls structure once, then
+  /// batches missing blobs in one roundtrip like getMany does.
+  async readAll(prefix = "", opts = {}) {
+    const keys = (await this.list(prefix, opts)).map((e) => e.path);
+    return this.getMany(keys, opts);
   }
 
   async putMany(entries, message = "update", parentOrOptions) {
@@ -579,6 +610,34 @@ throwProtocol("UNPACK_FAILED", `unpack failed: ${status.unpackMsg}`, { ref: this
           `CAS mismatch: tip ${(tip ?? "").slice(0, 7) || "(empty)"} != expected ${String(expected).slice(0, 7)}`,
           { ref: this.ref },
         );
+      }
+      return this._commitInner(expected ?? tip ?? "", message, flat);
+    });
+  }
+
+  /// Delete keys as one version (commit); returns the new sha.
+  /// Missing keys are a no-op (mirrors getMany skip semantics). Empty dirs are
+  /// pruned — git never stores them. Same CAS contract as putMany.
+  async removeMany(paths, message = "remove", parentOrOptions) {
+    const list_ = keyList(paths);
+    if (!list_.length) throwUsage("removeMany(paths) needs at least one key");
+    assertKeys(list_);
+    const expected = typeof parentOrOptions === "string" ? parentOrOptions : parentOrOptions?.parent;
+    const flat = Object.fromEntries(list_.map((p) => [p, null]));
+    return this._seq(async () => {
+      const tip = this._resolveRefOrNull(this.ref);
+      if (expected != null && (tip ?? "") !== expected) {
+        throwProtocol(
+          "CAS_MISMATCH",
+          `CAS mismatch: tip ${(tip ?? "").slice(0, 7) || "(empty)"} != expected ${String(expected).slice(0, 7)}`,
+          { ref: this.ref },
+        );
+      }
+      if (tip == null && expected == null) {
+        // deleting from an empty keyspace: still record one (empty) version so
+        // push/pull/log have something to point at? No — nothing to delete,
+        // return nothing to push. Matches list() == [] on empty.
+        return this._commitInner("", message, flat);
       }
       return this._commitInner(expected ?? tip ?? "", message, flat);
     });

@@ -5,6 +5,29 @@ Notable changes, written for people using the library. Follows
 
 ## [Unreleased]
 
+### Added
+
+- **`removeMany(paths, msg?, parent?)`** deletes keys as one version (commit).
+  Missing keys are a no-op (mirrors `getMany` skip semantics), empty dirs are
+  pruned, history is retained like any other version. Same CAS contract as
+  `putMany`. Wire marker is `content_len == 0xFFFFFFFF` in the `wasm_commit`
+  entries TLV — old readers just see a new commit.
+- **Single-key reads without ceremony.** `getMany` accepts a bare string,
+  `get(path, opts?)` returns `bytes | string | null` (`null` when absent), and
+  both plus `readAll(prefix?, opts?)` accept `{ as: "text" }` for UTF-8 decode.
+  `readAll` is `list` + batched `getMany` in one call for small keyspaces.
+- **`git.store` getter** exposes the backing store (share it across instances
+  without touching `git._store`).
+- **Oversize values throw `TypeError`.** Exceeding the 4MB wasm arena used to
+  throw a bare `Error` ("report a bug"); it now names the limit and the way
+  out (split the write).
+
+### Changed
+
+- **`push()` takes `{ fetchImpl }` only.** The old `Partial<PullOptions>` type
+  implied a `filter` that push never sent; the type now says what it does
+  (test/proxy injection).
+
 ### Breaking
 
 - **Errors are two kinds now: `io` vs `protocol`. Usage mistakes throw `TypeError`.**

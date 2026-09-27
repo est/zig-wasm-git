@@ -106,8 +106,11 @@ const git = await RemoteGit.open(url, {
 
 | method | returns | notes |
 | --- | --- | --- |
-| `getMany(paths, opts?)` | `Map(path -> bytes)` | `paths` is an array. Missing keys are **skipped**, not errors. May hit the network — see [Reads can touch the network](#reads-can-touch-the-network) |
-| `putMany(entries, msg?, parent?)` | commit sha | one version (a commit) on the current tip. Upsert only, no delete. `parent` oid (or `{ parent }`) for CAS |
+| `getMany(paths, opts?)` | `Map(path -> bytes)` | `paths` is a key or an array. Missing keys are **skipped**, not errors. `opts.as: "text"` decodes to strings. May hit the network — see [Reads can touch the network](#reads-can-touch-the-network) |
+| `get(path, opts?)` | `bytes \| string \| null` | single-key read; `null` when absent. Same `opts` as `getMany` |
+| `readAll(prefix?, opts?)` | `Map(path -> bytes)` | `list` + `getMany` in one call for small keyspaces |
+| `putMany(entries, msg?, parent?)` | commit sha | one version (a commit) on the current tip. Upsert only (see `removeMany`). `parent` oid (or `{ parent }`) for CAS |
+| `removeMany(paths, msg?, parent?)` | commit sha | delete keys as one version. Missing keys are a no-op; empty dirs are pruned. Same CAS contract as `putMany` |
 | `list(prefix?, opts?)` | `[{path, oid}]` | key enumeration. `""` (default) lists everything |
 | `log(limit = 10)` | `[{sha, tree, parents, author, message}]` | newest first, local only |
 | `version()` | `string \| null` | local tip oid; `null` when the keyspace is empty. Never hits the network |
@@ -118,8 +121,11 @@ const git = await RemoteGit.open(url, {
 ### Read and write
 
 ```js
-// Reads
+// Reads: a key or an array; missing keys are skipped, never errors.
+// { as: "text" } decodes UTF-8 so small text keyspaces skip TextDecoder.
 await git.getMany(["some/path/README.md"]);         // Map(path -> Uint8Array)
+await git.get("some/path/README.md", { as: "text" }); // string | null
+await git.readAll("some/path/", { as: "text" });      // Map(path -> string)
 await git.getMany(["config.json"], { local: true }); // cache-only, never any I/O
 
 // Writes. Keys are relative paths: no empty segment, no `.` / `..` / `.git`; a
@@ -127,6 +133,8 @@ await git.getMany(["config.json"], { local: true }); // cache-only, never any I/
 // string or Uint8Array/ArrayBuffer — anything else throws TypeError
 // rather than being stored as "[object Object]".
 await git.putMany({ "a.txt": "hi" }, "update greeting"); // -> commit sha
+await git.removeMany(["a.txt"], "drop it");              // -> commit sha
+await git.removeMany("a.txt", "drop one");               // single key works too
 ```
 
 A transport failure throws instead of returning a partial Map, so `map.size`
@@ -271,7 +279,7 @@ Programmer mistakes are **not** `GitError` on purpose — catching them as
 
 | thrown as | when |
 | --- | --- |
-| `TypeError` | bad key, bad arg, bad store (missing methods / async), unresolvable local ref, wasm path unreadable on this runtime |
+| `TypeError` | bad key, bad arg, oversize value (over the 4MB wasm arena), bad store (missing methods / async), unresolvable local ref, wasm path unreadable on this runtime |
 | `Error` | internal invariant (wasm failure, corrupt local store) — report a bug |
 
 A missing key stays a skip and a transport failure stays a throw — never
@@ -279,14 +287,12 @@ mistake one for the other.
 
 ## Limits
 
-- **No delete.** `putMany` upserts; there is no way to remove a key, and full history is retained.
 - **No merge.** `push` is fast-forward only. On `NON_FAST_FORWARD`, pull and rewrite — last writer
   wins, and nobody merges for you.
+- **Oversize values throw `TypeError`.** Blobs are held whole in memory — a 4MB wasm arena per call, one `arrayBuffer` per pack. Keys approaching megabytes should be split into smaller writes.
 - **A custom store must be synchronous**, so it cannot wrap IndexedDB / D1 / R2 directly
   ([Custom store](#custom-store)).
-- **The store is append-only** with no eviction, so a reused instance grows monotonically. Bounding the store is the job of a custom store.
-- **Blobs are held whole in memory** — a 4MB wasm arena per call, one `arrayBuffer` per pack. Keys
-  approaching megabytes may hit `WASM_ALLOC`.
+- **The store is append-only** with no eviction, so a reused instance grows monotonically. Bounding the store is the job of a custom store (see [Memory](#memory)).
 - **Pull sends no `have` lines** (protocol v2 `fetch` is `want`-only), so incremental bandwidth
   relies on server-side `delta` plus a cached-tip short-circuit. **Push sends full objects** — no
   `delta` encode; the server re-deltifies on `gc`.

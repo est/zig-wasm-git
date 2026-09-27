@@ -38,12 +38,11 @@ jobs:
           node --check zig-out/bin/zig_wasm_git.portable.mjs
           node --input-type=module -e '
             const wasm = "zig-out/bin/zig_wasm_git.wasm";
-            const fixed = { time: 1755859200, timezone: "+0000", author: "CI <ci@x>" };
             const shas = new Set();
             for (const p of ["./src/host/portable.mjs", "./zig-out/bin/zig_wasm_git.portable.mjs"]) {
               const mod = await import(p);
               const git = await mod.RemoteGit.open("https://example.invalid/r.git", { wasm });
-              const sha = await git.putMany({ "s.txt": "ok" }, "smoke", fixed);
+              const sha = await git.putMany({ "s.txt": "ok" }, "smoke");
               if (new TextDecoder().decode((await git.getMany(["s.txt"])).get("s.txt")) !== "ok") throw new Error("smoke get failed: " + p);
               shas.add(sha);
             }
@@ -74,17 +73,18 @@ jobs:
           // a read against an unreachable host must fail loudly, never come
           // back as an empty Map that reads like "no such key"
           const fresh = await RemoteGit.open("https://example.invalid/r.git");
-          let code = null, ours = false;
-          try { await fresh.getMany(["a"]); } catch (e) { code = e.code; ours = GitError.is(e); }
-          if (!ours || code !== GitError.NETWORK) {
-            throw new Error("expected a GitError with code NETWORK, got ours=" + ours + " code=" + code);
+          let code = null, ours = false, kind = null;
+          try { await fresh.getMany(["a"]); } catch (e) { code = e.code; kind = e.kind; ours = GitError.is(e); }
+          if (!ours || code !== "NETWORK" || kind !== "io") {
+            throw new Error("expected a GitError with kind io / code NETWORK, got ours=" + ours + " kind=" + kind + " code=" + code);
           }
-          // the error surface must survive packaging: one export, variadic is()
-          if (!GitError.is(new GitError("HTTP", "x", { status: 500 }), "HTTP", "NETWORK")) {
-            throw new Error("GitError.is did not match a code in the set");
+          // the error surface must survive packaging: kind first, code for detail
+          if (!GitError.isProtocol(new GitError("protocol", "HTTP", "x", { status: 500 }), "HTTP", "NETWORK")) {
+            throw new Error("GitError.isProtocol did not match a code in the set");
           }
-          await git.close();
-          if (!git.closed) throw new Error("close() did not take effect");
+          // delete roundtrip through the packaged bundle
+          await git.removeMany(["docs/a.md"], "drop");
+          if (await git.get("docs/a.md") !== null) throw new Error("removeMany failed in packaged bundle");
           console.log("npm tarball smoke ok:", sha.slice(0, 7));
           EOF
           node smoke.mjs

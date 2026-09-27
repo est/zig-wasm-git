@@ -57,6 +57,21 @@ try {
   if (log2.split("\n").length !== 2) throw new Error("server should have 2 commits");
   console.log("server log:\n  " + log2.split("\n").join("\n  "));
 
+  // ── delete push: removeMany -> push -> git-verified ──
+  const c3 = await local.removeMany(["src/a.txt"], "drop a");
+  const r3 = await local.push();
+  if (!r3.updated) throw new Error("delete push failed");
+  try {
+    execFileSync("git", ["--git-dir", SERVER_REPO, "cat-file", "-e", `${c3}:src/a.txt`]);
+    throw new Error("deleted blob still on server");
+  } catch (e) {
+    if (/deleted blob still/.test(e.message)) throw e; // real failure, not the expected non-zero exit
+  }
+  const readme3 = execFileSync("git", ["--git-dir", SERVER_REPO, "cat-file", "-p", `${c3}:README.md`]).toString();
+  if (readme3 !== "hello v2\n") throw new Error("survivor blob mismatch after delete push");
+  execFileSync("git", ["--git-dir", SERVER_REPO, "fsck", "--strict"]);
+  console.log("delete push ok + server fsck clean");
+
   console.log("ALL PUSH TESTS PASSED");
 } finally {
   server.kill();

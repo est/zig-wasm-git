@@ -313,7 +313,7 @@ function dv(wasm) {
 function allocBytes(wasm, b) {
   if (b.length === 0) return { ptr: 0, len: 0 };
   const ptr = wasm.wasm_alloc(b.length);
-  if (!ptr) throw new Error("wasm_alloc failed: object too large for the 4MB arena");
+  if (!ptr) throwUsage("value too large for the 4MB wasm arena — split it into smaller writes");
   new Uint8Array(wasm.memory.buffer).set(b, ptr);
   return { ptr, len: b.length };
 }

@@ -634,11 +634,63 @@ fn loadTreeEntries(alloc: std.mem.Allocator, tree_oid_hex: []const u8) !LoadedTr
     return list;
 }
 
-const Change = struct { path: []const u8, oid_bytes: [20]u8 };
+const Change = struct { path: []const u8, oid_bytes: [20]u8, remove: bool = false };
+
+fn removeFromTree(alloc: std.mem.Allocator, tree_oid_hex: []const u8, path: []const u8) !?[40]u8 {
+    var entries = try loadTreeEntries(alloc, tree_oid_hex);
+    const slash = std.mem.indexOfScalar(u8, path, '/');
+    if (slash == null) {
+        var idx: ?usize = null;
+        for (entries.items, 0..) |e, i| {
+            if (std.mem.eql(u8, e.name, path)) {
+                idx = i;
+                break;
+            }
+        }
+        // deleting a missing key is a no-op (mirrors getMany skip semantics)
+        if (idx == null) return null;
+        _ = entries.orderedRemove(idx.?);
+    } else {
+        const seg = path[0..slash.?];
+        const rest_path = path[slash.? + 1 ..];
+        var sub_idx: ?usize = null;
+        var sub_hex: [40]u8 = undefined;
+        for (entries.items, 0..) |e, i| {
+            if (std.mem.eql(u8, e.name, seg) and e.mode[0] == '4') {
+                sub_idx = i;
+                sub_hex = oidBytesToHex(e.oid_bytes);
+                break;
+            }
+        }
+        // missing intermediate dir: no-op
+        if (sub_idx == null) return null;
+        const new_sub = try removeFromTree(alloc, &sub_hex, rest_path);
+        if (new_sub == null) return null; // nothing removed below
+        const sub_entries = try loadTreeEntries(alloc, &new_sub.?);
+        if (sub_entries.items.len == 0) {
+            // prune empty dirs: git never stores them
+            _ = entries.orderedRemove(sub_idx.?);
+        } else {
+            entries.items[sub_idx.?].oid_bytes = try hexToOidBytes(&new_sub.?);
+        }
+    }
+    std.mem.sort(TreeEnt, entries.items, {}, lessThan);
+    return try writeTree(alloc, entries.items);
+}
 
 fn applyToTree(alloc: std.mem.Allocator, tree_oid_hex: []const u8, changes: []const Change) ![40]u8 {
-    var entries = try loadTreeEntries(alloc, tree_oid_hex);
+    var cur_hex: [40]u8 = undefined;
+    @memcpy(&cur_hex, tree_oid_hex[0..40]);
+    // removals first (order-independent vs upserts on distinct paths)
     for (changes) |ch| {
+        if (!ch.remove) continue;
+        if (try removeFromTree(alloc, &cur_hex, ch.path)) |next| {
+            cur_hex = next;
+        }
+    }
+    var entries = try loadTreeEntries(alloc, &cur_hex);
+    for (changes) |ch| {
+        if (ch.remove) continue;
         const slash = std.mem.indexOfScalar(u8, ch.path, '/');
         if (slash == null) {
             const name = ch.path;
@@ -685,6 +737,8 @@ fn applyToTree(alloc: std.mem.Allocator, tree_oid_hex: []const u8, changes: []co
 // wasm_commit(parent_hex_ptr, parent_hex_len(0|40), msg_ptr, msg_len,
 //             entries_ptr, entries_len, out_hex_ptr: [*]u8) -> rc
 // entries TLV: u16 n, then per entry: u16 path_len, path, u32 content_len, content
+// content_len == 0xFFFFFFFF is a deletion marker: no content bytes follow,
+// the path is removed (missing keys are a no-op), empty dirs are pruned.
 export fn wasm_commit(parent_hex_ptr: usize, parent_hex_len: usize, msg_ptr: usize, msg_len: usize, entries_ptr: usize, entries_len: usize, out_hex_ptr: [*]u8) i32 {
     const alloc = gpa();
     const parent_hex = sliceFromPtr(parent_hex_ptr, parent_hex_len);
@@ -706,6 +760,11 @@ export fn wasm_commit(parent_hex_ptr: usize, parent_hex_len: usize, msg_ptr: usi
         pos += plen;
         const clen = std.mem.readInt(u32, tlv[pos..][0..4], .little);
         pos += 4;
+        if (clen == 0xFFFFFFFF) {
+            // deletion marker: no content bytes
+            changes.append(alloc, .{ .path = path, .oid_bytes = undefined, .remove = true }) catch return -1;
+            continue;
+        }
         if (pos + clen > tlv.len) return -3;
         const content = tlv[pos .. pos + clen];
         pos += clen;

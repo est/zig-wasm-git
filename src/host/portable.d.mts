@@ -100,7 +100,12 @@ export interface PutOptions {
 export interface GetOptions {
   /** `true` reads strictly from the local store: no I/O. Default `false`. */
   local?: boolean;
+  /** `"text"` decodes each value as UTF-8, returning `Map<string, string>`. */
+  as?: "bytes" | "text";
 }
+
+/** Options for {@link RemoteGit.get}. Same as {@link GetOptions} but single-key. */
+export interface GetOneOptions extends GetOptions {}
 
 /** Options for {@link RemoteGit.list}. */
 export interface ListOptions {
@@ -112,6 +117,12 @@ export interface ListOptions {
 export interface PullOptions {
   /** Partial-clone filter, e.g. `"blob:none"`. Empty means a full pull. */
   filter?: string;
+}
+
+/** Options for {@link RemoteGit.push}. Only test/proxy injection — no filter. */
+export interface PushOptions {
+  /** Custom fetch implementation (proxies, instrumentation, tests). */
+  fetchImpl?: typeof fetch;
 }
 
 /** Result of {@link RemoteGit.list}. */
@@ -161,6 +172,8 @@ export class RemoteGit {
   static open(url: string, opts?: RemoteGitOptions): Promise<RemoteGit>;
   readonly url: string;
   readonly ref: string;
+  /** The object store behind this instance (share it across instances). */
+  readonly store: Store;
 
   /** Local tip oid, or null when the keyspace is empty. Never hits the network. */
   version(): string | null;
@@ -169,14 +182,35 @@ export class RemoteGit {
   remoteVersion(): Promise<string | null>;
 
   /** Read keys as bytes. Missing keys are skipped. May hit the network. */
-  getMany(paths: string[], opts?: GetOptions): Promise<Map<string, Uint8Array>>;
+  getMany(paths: string | string[] | Iterable<string>, opts?: GetOptions & { as?: "bytes" }): Promise<Map<string, Uint8Array>>;
+  /** Read keys as text. Missing keys are skipped. May hit the network. */
+  getMany(paths: string | string[] | Iterable<string>, opts: GetOptions & { as: "text" }): Promise<Map<string, string>>;
+
+  /** Single-key read: bytes (or string with `{ as: "text" }`), null when absent. */
+  get(path: string, opts?: GetOptions & { as?: "bytes" }): Promise<Uint8Array | null>;
+  get(path: string, opts: GetOptions & { as: "text" }): Promise<string | null>;
+
+  /** Small-keyspace convenience: list + getMany in one call. */
+  readAll(prefix?: string, opts?: GetOptions & { as?: "bytes" }): Promise<Map<string, Uint8Array>>;
+  readAll(prefix: string, opts: GetOptions & { as: "text" }): Promise<Map<string, string>>;
 
   /**
    * Write keys as one version (commit); returns the new sha.
-   * Upsert only. Pass a parent oid (or `{ parent }`) for compare-and-swap.
+   * Upsert only (see {@link RemoteGit.removeMany} for deletes).
+   * Pass a parent oid (or `{ parent }`) for compare-and-swap.
    */
   putMany(
     entries: Record<string, string | Uint8Array | ArrayBuffer | ArrayBufferView> | Map<string, string | Uint8Array | ArrayBuffer | ArrayBufferView>,
+    message?: string,
+    parentOrOptions?: string | PutOptions,
+  ): Promise<string>;
+
+  /**
+   * Delete keys as one version (commit); returns the new sha.
+   * Missing keys are a no-op. Empty dirs are pruned. Same CAS contract as putMany.
+   */
+  removeMany(
+    paths: string | string[] | Iterable<string>,
     message?: string,
     parentOrOptions?: string | PutOptions,
   ): Promise<string>;
@@ -191,5 +225,5 @@ export class RemoteGit {
   pull(opts?: PullOptions | string): Promise<PullResult>;
 
   /** Publish the local tip. Fast-forward only. */
-  push(opts?: Partial<PullOptions>): Promise<PushResult>;
+  push(opts?: PushOptions): Promise<PushResult>;
 }
