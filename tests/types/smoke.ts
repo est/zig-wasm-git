@@ -16,6 +16,8 @@ import type {
   RemoteGitOptions,
   PutOptions,
   GitErrorCode,
+  GitIOCode,
+  GitProtocolCode,
 } from "../../src/host/portable.mjs";
 
 export async function positive(): Promise<void> {
@@ -54,11 +56,13 @@ export async function positive(): Promise<void> {
   const synced: Map<string, Uint8Array> = await git.sync(["a.txt"], { pull: { filter: "blob:none" } });
 
   const problem: string | null = keyProblem("a/b.txt");
-  const code: GitErrorCode = GitError.NETWORK;
+  const ioCode: GitIOCode = "NETWORK";
+  const protoCode: GitProtocolCode = "NON_FAST_FORWARD";
+  const code: GitErrorCode = ioCode;
   const closed: boolean = git.closed;
   await git.close();
 
-  void [bytes, text, single, offline, fromSet, withOpts, prefixed, history, tip, remoteTip, pulled.cached, pushed.updated, synced, problem, code, closed];
+  void [bytes, text, single, offline, fromSet, withOpts, prefixed, history, tip, remoteTip, pulled.cached, pushed.updated, synced, problem, code, protoCode, closed];
 }
 
 export async function branching(): Promise<void> {
@@ -70,35 +74,30 @@ export async function branching(): Promise<void> {
     const tip = await git.version();
     if (tip) await git.putMany({ "a.txt": "v2" }, "cas", { parent: tip });
   } catch (e) {
-    // no codes: any GitError, code stays the full union
+    // any GitError: kind + code stay typed
     if (GitError.is(e)) {
       const anyCode: GitErrorCode = e.code;
-      void [anyCode, e.message, e.cause, e.status, e.ref, e.key];
+      void [anyCode, e.kind, e.message, e.cause, e.status, e.ref, e.key];
     }
-    // one code: narrows to that literal
-    if (GitError.is(e, "CAS_MISMATCH")) {
+    // io: retry later, status only makes sense here
+    if (GitError.isIO(e)) {
+      const narrowed: GitIOCode = e.code;
+      // @ts-expect-error io codes are NETWORK|HTTP, not a protocol refusal
+      const wrong: "CAS_MISMATCH" = e.code;
+      void [narrowed, wrong, e.status];
+    }
+    // protocol with a code: narrows to that literal
+    if (GitError.isProtocol(e, "CAS_MISMATCH")) {
       const narrowed: "CAS_MISMATCH" = e.code;
       // @ts-expect-error narrowed to the one code asked for, not the union
       const asHttp: "HTTP" = e.code;
       void [narrowed, asHttp];
     }
-    // several codes: narrows to their union, not to one of them
-    if (GitError.is(e, "NETWORK", "HTTP")) {
-      const narrowed: "NETWORK" | "HTTP" = e.code;
-      // @ts-expect-error neither of the codes asked for
-      const wrong: "CAS_MISMATCH" = e.code;
-      void [narrowed, wrong, e.status];
-    }
     // the generic is annotatable when a variable must hold one specific code
-    const typed: GitError<"NETWORK"> | null = GitError.is(e, "NETWORK") ? e : null;
+    const typed: GitError<"NETWORK"> | null = GitError.isIO(e) && e.code === "NETWORK" ? e : null;
     // @ts-expect-error the default instantiation is not a specific code
     const overNarrowed: GitError<"NETWORK"> = null as unknown as GitError;
     void [typed, overNarrowed];
-    // statics are the codes themselves, usable where a literal is expected
-    const fromStatic: "CAS_MISMATCH" = GitError.CAS_MISMATCH;
-    void fromStatic;
-    // @ts-expect-error a static is not callable — use GitError.is
-    void GitError.CAS_MISMATCH();
   }
   await git.close();
 }
@@ -127,15 +126,15 @@ export async function rejects(): Promise<void> {
   await git.getMany(["a.txt"], "text");
   // @ts-expect-error version() takes no arguments
   await git.version(1);
-  // @ts-expect-error not a GitErrorCode
-  GitError.is(new Error(), "NOPE");
+  // @ts-expect-error first arg must be unknown, codes must be protocol codes
+  GitError.isProtocol(new Error(), "NOPE");
   // @ts-expect-error keyProblem takes a string
   keyProblem(1);
   // @ts-expect-error list() takes a prefix, not a number
   await git.list(5);
   // @ts-expect-error unknown error code in the union
   const bad: GitErrorCode = "BAD_STORE_TYPO";
-  // @ts-expect-error GitError takes a code and a message
+  // @ts-expect-error GitError takes kind, code and message
   void new GitError();
   void bad;
 }

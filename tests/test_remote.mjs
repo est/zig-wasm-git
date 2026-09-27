@@ -86,17 +86,17 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   }
   if (!threw) throw new Error("omitted wasm should fail on the co-located file");
   // A runtime with no filesystem cannot load a path or the co-located default.
-  // That must be BAD_ARG, not NETWORK: "your connection is down" invites a
-  // retry that can never succeed (Node < 22.3 has no process.getBuiltinModule).
+  // That must be TypeError (usage), not GitError/io: "your connection is down"
+  // invites a retry that can never succeed (Node < 22.3 has no process.getBuiltinModule).
   const noFs = process.getBuiltinModule;
   delete process.getBuiltinModule;
   for (const [label, opts] of [["path", { wasm: WASM }], ["default", {}]]) {
-    let code = null, msg = "";
+    let err = null;
     try {
       await RemoteGit.open("https://example.invalid/r.git", opts);
-    } catch (e) { code = e.code; msg = e.message; }
-    if (code !== "BAD_ARG") throw new Error(`no-fs ${label} should be BAD_ARG, got ${code}: ${msg}`);
-    if (/network/i.test(msg)) throw new Error(`no-fs ${label} message implies a network fault: ${msg}`);
+    } catch (e) { err = e; }
+    if (!(err instanceof TypeError)) throw new Error(`no-fs ${label} should be TypeError, got ${err?.constructor?.name}: ${err?.message}`);
+    if (/network/i.test(err.message)) throw new Error(`no-fs ${label} message implies a network fault: ${err.message}`);
   }
   process.getBuiltinModule = noFs;
   console.log("[ok] wasm inputs (path string, Module, bytes, co-located default, no-fs BAD_ARG)");
@@ -165,39 +165,31 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   console.log("[ok] list (+prefix) and CAS parent");
 }
 
-// ── 2b. the error surface: one export, variadic is(), cross-copy brand ──
+// ── 2b. the error surface: one GitError (io/protocol), usage is TypeError ──
 {
-  // 1. the shipped .d.mts and the runtime statics must list the same codes.
-  //    The declarations are hand-written, so nothing else keeps them honest: a
-  //    code added to the class and forgotten in the .d.mts would typecheck
-  //    (GitError.FOO is `any`-ish via the index) yet be a lie to every consumer.
+  // 1. the shipped .d.mts and the runtime agree on the protocol codes.
   const dts = readFileSync(join(ROOT, "src/host/portable.d.mts"), "utf8");
-  const declared = [...dts.matchAll(/static readonly ([A-Z0-9_]+): "([A-Z0-9_]+)";/g)]
-    .map((m) => [m[1], m[2]]);
-  const runtime = Object.entries(GitError).filter(([k]) => k !== "is" && k !== "length" && k !== "name");
-  if (!declared.length) throw new Error("no static codes found in portable.d.mts — has the format changed?");
-  const missing = declared.filter(([k, v]) => GitError[k] !== v);
-  if (missing.length) {
-    throw new Error(`codes declared in .d.mts but absent/different at runtime: ${missing.map(([k, v]) => `${k}!=${v}`).join(", ")}`);
+  for (const code of ["CAS_MISMATCH", "NON_FAST_FORWARD", "PUSH_REJECTED", "UNPACK_FAILED", "NO_V2", "NO_REMOTE_REF", "NO_SUCH_OBJECT", "PROTOCOL_ERROR", "NETWORK", "HTTP"]) {
+    if (!dts.includes(`"${code}"`)) throw new Error(`.d.mts missing code ${code}`);
   }
-  const extra = runtime.filter(([k, v]) => !declared.some(([dk, dv]) => dk === k && dv === v));
-  if (extra.length) throw new Error(`codes on the class but not declared in .d.mts: ${extra.map(([k]) => k).join(", ")}`);
 
-  // 2. is() is variadic: 0 codes = any GitError, 1 = that code, n = the set
-  const cas = new GitError("CAS_MISMATCH", "m");
-  if (!GitError.is(cas)) throw new Error("is(e) with no codes must accept any GitError");
-  if (!GitError.is(cas, "CAS_MISMATCH")) throw new Error("is(e, code) must accept a match");
-  if (GitError.is(cas, "NETWORK")) throw new Error("is(e, code) must reject a non-match");
-  if (!GitError.is(cas, "NETWORK", "HTTP", "CAS_MISMATCH")) throw new Error("is(e, ...codes) must accept any member");
-  if (GitError.is(cas, "NETWORK", "HTTP")) throw new Error("is(e, ...codes) must reject a set without a member");
-  // it must not claim unrelated throwables
-  for (const other of [new Error("x"), null, undefined, 42, "NETWORK", { code: "NETWORK" }, { name: "GitError", code: "NETWORK" }]) {
+  // 2. branching: kind first, code for protocol detail.
+  const io = new GitError("io", "NETWORK", "down", { cause: new Error("x") });
+  const proto = new GitError("protocol", "CAS_MISMATCH", "m");
+  if (!GitError.is(io) || !GitError.is(proto)) throw new Error("is(e) must accept any GitError");
+  if (!GitError.isIO(io) || GitError.isIO(proto)) throw new Error("isIO must match kind");
+  if (!GitError.isProtocol(proto, "CAS_MISMATCH")) throw new Error("isProtocol(e, code) must accept a match");
+  if (GitError.isProtocol(proto, "HTTP")) throw new Error("isProtocol must reject a non-match");
+  if (!GitError.isProtocol(proto)) throw new Error("isProtocol(e) must accept any protocol error");
+  if (GitError.isProtocol(io)) throw new Error("isProtocol must reject io");
+  // usage mistakes are TypeError, never GitError — so a retry loop can't swallow a bug
+  for (const other of [new Error("x"), new TypeError("x"), null, undefined, 42, "NETWORK", { kind: "io", code: "NETWORK" }]) {
     if (GitError.is(other)) throw new Error(`is() must not claim a non-GitError: ${JSON.stringify(other)}`);
   }
   // every field the README promises survives
-  const rich = new GitError("HTTP", "http 503", { status: 503, ref: "refs/heads/main", key: "a.txt", cause: new Error("upstream") });
-  if (rich.status !== 503 || rich.ref !== "refs/heads/main" || rich.key !== "a.txt" || !rich.cause) {
-    throw new Error("GitError must carry status/ref/key/cause");
+  const rich = new GitError("io", "HTTP", "http 503", { status: 503, ref: "refs/heads/main", key: "a.txt", cause: new Error("upstream") });
+  if (rich.kind !== "io" || rich.status !== 503 || rich.ref !== "refs/heads/main" || rich.key !== "a.txt" || !rich.cause) {
+    throw new Error("GitError must carry kind/status/ref/key/cause");
   }
   if (rich.name !== "GitError") throw new Error("name must be GitError, got: " + rich.name);
 
@@ -209,12 +201,12 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   //    utils.mjs, which Node would still share.)
   const twin = await import(`../src/host/utils.mjs?copy=${Date.now()}`);
   if (twin.GitError === GitError) throw new Error("expected a distinct module instance for the cross-copy check");
-  const foreign = new twin.GitError("NETWORK", "from the other copy");
+  const foreign = new twin.GitError("io", "NETWORK", "from the other copy");
   if (foreign instanceof GitError) throw new Error("expected instanceof to fail across copies (test is not testing anything)");
   if (!GitError.is(foreign)) throw new Error("GitError.is must recognize a GitError from another copy of the module");
-  if (!GitError.is(foreign, "NETWORK")) throw new Error("code matching must work across copies too");
-  if (GitError.is(foreign, "HTTP")) throw new Error("cross-copy code mismatch must still be rejected");
-  console.log("[ok] error surface: one export, variadic is(), .d.mts parity, cross-copy brand");
+  if (!GitError.isIO(foreign)) throw new Error("kind matching must work across copies too");
+  if (GitError.isProtocol(foreign)) throw new Error("cross-copy kind mismatch must still be rejected");
+  console.log("[ok] error surface: GitError(io/protocol), TypeError for usage, cross-copy brand");
 }
 
 // ── 2c. fail loudly instead of silently (store contract / network / keys) ──
@@ -235,14 +227,14 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   } catch (e) {
     se = e;
   }
-  if (se?.code !== "BAD_STORE") throw new Error("async store must be rejected, got: " + se?.code);
+  if (!(se instanceof TypeError)) throw new Error("async store must be rejected with TypeError, got: " + se?.constructor?.name);
   let me;
   try {
     await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM, store: { get() {} } });
   } catch (e) {
     me = e;
   }
-  if (me?.code !== "BAD_STORE" || !/putRef/.test(me.message)) {
+  if (!(me instanceof TypeError) || !/putRef/.test(me.message)) {
     throw new Error("incomplete store must name the missing methods");
   }
 
@@ -255,7 +247,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
     } catch (e) {
       ne = e;
     }
-    if (ne?.code !== "NETWORK") throw new Error(`${name} on a dead remote must throw NETWORK, got ${ne?.code ?? "(no throw)"}`);
+    if (!GitError.isIO(ne) || ne.code !== "NETWORK") throw new Error(`${name} on a dead remote must throw io/NETWORK, got ${ne?.kind}/${ne?.code ?? "(no throw)"}`);
     if (ne.cause == null) throw new Error(`${name} should keep the original error in .cause`);
   }
   // ...while cache-only reads stay offline-safe and empty
@@ -277,7 +269,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   } catch (e) {
     he = e;
   }
-  if (he?.code !== "HTTP" || he.status !== 403) throw new Error("HTTP errors should carry .status");
+  if (!GitError.isIO(he) || he.code !== "HTTP" || he.status !== 403) throw new Error("HTTP errors should be io/HTTP with .status");
 
   // 3. keys that cannot round-trip are rejected (and the batch writes nothing)
   const kv = await RemoteGit.open("https://example.invalid/r.git", { wasm: WASM });
@@ -288,7 +280,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
     } catch (e) {
       ke = e;
     }
-    if (ke?.code !== "BAD_KEY") throw new Error(`key ${JSON.stringify(k)} should be BAD_KEY, got ${ke?.code ?? "(accepted)"}`);
+    if (!(ke instanceof TypeError)) throw new Error(`key ${JSON.stringify(k)} should be TypeError, got ${ke?.constructor?.name ?? "(accepted)"}`);
   }
   // every offender reported at once, and no partial commit
   let both;
@@ -297,7 +289,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   } catch (e) {
     both = e;
   }
-  if (both?.code !== "BAD_KEY" || !both.message.includes('"/a"') || !both.message.includes('""')) {
+  if (!(both instanceof TypeError) || !both.message.includes('"/a"') || !both.message.includes('""')) {
     throw new Error("all bad keys should be reported together: " + both?.message);
   }
   if ((await kv.list("", { local: true })).length !== 0) {
@@ -308,7 +300,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
   if ((await kv.getMany(["a/b.txt", ".github/w.yml", "üñî.md"], { local: true })).size !== 3) {
     throw new Error("valid keys must still round-trip");
   }
-  console.log("[ok] fail loudly: BAD_STORE / NETWORK+HTTP / BAD_KEY");
+  console.log("[ok] fail loudly: TypeError for usage, GitError/io for network");
 }
 
 // ── 2d. lifecycle: close(), unopened instances, argument shapes ──
@@ -331,7 +323,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
     } catch (e) {
       ce = e;
     }
-    if (ce?.code !== "CLOSED") throw new Error(`${name} after close should throw CLOSED, got ${ce?.code ?? "(no throw)"}`);
+    if (!(ce instanceof TypeError)) throw new Error(`${name} after close should throw TypeError, got ${ce?.constructor?.name ?? "(no throw)"}`);
   }
   await g.close(); // idempotent
   // the store survives; a fresh instance can reuse it
@@ -360,8 +352,8 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
     } catch (e) {
       ue = e;
     }
-    if (ue?.code !== "CLOSED" || !/RemoteGit\.open/.test(ue.message)) {
-      throw new Error(`${name} on an unopened instance should point at RemoteGit.open (${ue?.code}: ${ue?.message})`);
+    if (!(ue instanceof TypeError) || !/RemoteGit\.open/.test(ue.message)) {
+      throw new Error(`${name} on an unopened instance should point at RemoteGit.open (${ue?.constructor?.name}: ${ue?.message})`);
     }
   }
 
@@ -391,7 +383,7 @@ const text = (m, k) => { const b = m.get(k); return b == null ? null : dec.decod
     } catch (e) {
       be = e;
     }
-    if (be?.code !== "BAD_ARG") throw new Error(`putMany(${JSON.stringify(bad)}) should be BAD_ARG, got ${be?.code ?? "(accepted)"}`);
+    if (!(be instanceof TypeError)) throw new Error(`putMany(${JSON.stringify(bad)}) should be TypeError, got ${be?.constructor?.name ?? "(accepted)"}`);
   }
   await sh.close();
   console.log("[ok] lifecycle: close(), unopened guard, argument shapes");
@@ -486,7 +478,7 @@ try {
   } catch (e) {
     nff = e;
   }
-  if (nff?.code !== "NON_FAST_FORWARD") throw new Error("stale push should carry NON_FAST_FORWARD, got: " + nff?.code);
+  if (!GitError.isProtocol(nff, "NON_FAST_FORWARD")) throw new Error("stale push should be protocol/NON_FAST_FORWARD, got: " + nff?.kind + "/" + nff?.code);
   console.log("[ok] put/push/sync across clients + non-fast-forward reject");
 
   execFileSync("git", ["--git-dir", SERVER_REPO, "fsck", "--strict"]);

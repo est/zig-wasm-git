@@ -16,7 +16,7 @@ export type LooseBytes = Uint8Array;
 /**
  * Pluggable object storage. **Must be synchronous** — it is called from wasm
  * host callbacks that cannot await, so a Promise-returning store writes
- * commits it cannot read back. `RemoteGit.open` throws `BAD_STORE` if this
+ * commits it cannot read back. `RemoteGit.open` throws `TypeError` if this
  * contract is broken.
  */
 export interface Store {
@@ -37,47 +37,51 @@ export interface Store {
 /** In-memory store. Append-only: objects are never evicted. */
 export function memoryStore(): Store;
 
-/** One of the `GitError` codes. Also spelled `GitError["code"]`. */
-export type GitErrorCode =
-  | "BAD_STORE"
-  | "BAD_KEY"
-  | "BAD_REF"
+/** Transport failure codes (`kind === "io"`). Retry later. */
+export type GitIOCode = "NETWORK" | "HTTP";
+
+/** Server refusal codes (`kind === "protocol"`). Fix the request. */
+export type GitProtocolCode =
   | "CAS_MISMATCH"
   | "NON_FAST_FORWARD"
   | "PUSH_REJECTED"
   | "UNPACK_FAILED"
+  | "NO_V2"
   | "NO_REMOTE_REF"
   | "NO_SUCH_OBJECT"
-  | "NO_V2"
-  | "HTTP"
-  | "NETWORK"
-  | "WASM_ALLOC"
-  | "WASM_RC"
-  | "BAD_TREE_PATH"
-  | "BAD_ARG"
-  | "CLOSED";
+  | "PROTOCOL_ERROR";
+
+/** One of the `GitError` codes. Also spelled `GitError["code"]`. */
+export type GitErrorCode = GitIOCode | GitProtocolCode;
+
+/** Which half of the world failed: transport (`io`) or server (`protocol`). */
+export type GitErrorKind = "io" | "protocol";
 
 /**
- * Every failure raised by the client chain, and the namespace for its codes —
- * one export, so a caller needs a single import.
+ * The only operational error this library throws. Branch on `.kind`:
  *
  * ```ts
  * import { GitError } from "zig-wasm-git";
  *
- * if (GitError.is(e, "CAS_MISMATCH")) { ... }        // narrowed to that code
- * if (GitError.is(e, "NETWORK", "HTTP")) { ... }     // narrowed to the union
- * if (GitError.is(e)) { ... }                        // any GitError
+ * try { await git.push(); }
+ * catch (e) {
+ *   if (GitError.isIO(e)) retryLater(e.status);
+ *   else if (GitError.isProtocol(e, "NON_FAST_FORWARD")) await git.pull();
+ *   else throw e; // TypeError / Error: fix the code, don't retry
+ * }
  * ```
  *
- * The generic parameter is the narrowing mechanism and is normally inferred;
- * write `GitError<"HTTP">` only to annotate a variable that must hold one
- * specific code. Branch on `.code`, never on `.message`; the original error is
- * kept in `.cause`.
+ * Programmer mistakes (bad key, bad arg, bad store, use-after-close) throw
+ * `TypeError`, never `GitError` — don't catch them as retryable. Internal
+ * invariants throw plain `Error`. The generic parameter narrows `.code` and
+ * is normally inferred; write `GitError<"HTTP">` only to annotate a variable
+ * that must hold one specific code.
  */
 export class GitError<C extends GitErrorCode = GitErrorCode> extends Error {
   readonly name: "GitError";
+  readonly kind: GitErrorKind;
   readonly code: C;
-  /** Original error, when this one wraps something (`NETWORK`). */
+  /** Original error, when this one wraps something (`NETWORK`, `PROTOCOL_ERROR`). */
   readonly cause?: unknown;
   /** HTTP status, when `code === "HTTP"`. */
   readonly status?: number;
@@ -85,52 +89,34 @@ export class GitError<C extends GitErrorCode = GitErrorCode> extends Error {
   readonly ref?: string;
   readonly key?: string;
   constructor(
+    kind: GitErrorKind,
     code: C,
     message: string,
     extra?: { cause?: unknown; status?: number; key?: string; ref?: string },
   );
 
-  // ── codes ──
-  // Mirrors the statics in src/host/utils.mjs. A test asserts the two agree, so
-  // a code added on one side and forgotten on the other fails the suite.
-  static readonly BAD_STORE: "BAD_STORE";
-  static readonly BAD_KEY: "BAD_KEY";
-  static readonly BAD_REF: "BAD_REF";
-  static readonly CAS_MISMATCH: "CAS_MISMATCH";
-  static readonly NON_FAST_FORWARD: "NON_FAST_FORWARD";
-  static readonly PUSH_REJECTED: "PUSH_REJECTED";
-  static readonly UNPACK_FAILED: "UNPACK_FAILED";
-  static readonly NO_REMOTE_REF: "NO_REMOTE_REF";
-  static readonly NO_SUCH_OBJECT: "NO_SUCH_OBJECT";
-  static readonly NO_V2: "NO_V2";
-  static readonly HTTP: "HTTP";
-  static readonly NETWORK: "NETWORK";
-  static readonly WASM_ALLOC: "WASM_ALLOC";
-  static readonly WASM_RC: "WASM_RC";
-  static readonly BAD_TREE_PATH: "BAD_TREE_PATH";
-  static readonly BAD_ARG: "BAD_ARG";
-  static readonly CLOSED: "CLOSED";
-
   /**
-   * True when `e` is a GitError, optionally restricted to one or more codes.
-   *
-   * Variadic on purpose: no codes means "any GitError", one code narrows `e` to
-   * that literal, several narrow it to the union. That is why there is no
-   * separate `anyOf` — one name covers all three cases.
-   *
-   * Recognizes a GitError thrown by a *different copy* of this module (the npm
-   * package and the single-file release bundle), where `instanceof` would not.
+   * True when `e` is a GitError from any copy of this module (the npm package
+   * and the single-file release bundle are separate classes; `instanceof`
+   * fails across them, this brand check does not).
    */
-  static is<C2 extends GitErrorCode>(e: unknown, ...codes: C2[]): e is GitError<C2>;
   static is(e: unknown): e is GitError;
+  /** True for transport failures. Retry later. */
+  static isIO(e: unknown): e is GitError<GitIOCode>;
+  /**
+   * True for server refusals, optionally restricted to codes.
+   * `isProtocol(e, "NON_FAST_FORWARD")` narrows `e.code` to that literal.
+   */
+  static isProtocol<C2 extends GitProtocolCode>(e: unknown, ...codes: C2[]): e is GitError<C2>;
+  static isProtocol(e: unknown): e is GitError<GitProtocolCode>;
 }
 
 /**
  * Why `key` cannot be stored, or null when it is a well-formed key.
  *
  * A key is a relative, slash-separated path whose segments are non-empty and
- * are not `.`, `..` or `.git`. Malformed keys are rejected rather than
- * normalized, because the git tree layer turns an empty segment into an
+ * are not `.`, `..` or `.git`. Malformed keys throw `TypeError` rather than
+ * being normalized, because the git tree layer turns an empty segment into an
  * unnamed entry that can silently overwrite a sibling key.
  */
 export function keyProblem(key: string): string | null;
@@ -148,7 +134,7 @@ export interface RemoteGitOptions {
    * - `WebAssembly.Module` / bytes: passed straight to `instantiate`
    *
    * workerd has no filesystem, so pass its `CompiledWasm` explicitly. A
-   * filesystem path on a runtime without one throws `BAD_ARG`.
+   * filesystem path on a runtime without one throws `TypeError`.
    */
   wasm?: WasmInput;
   /** Branch to bind. A short name (`main`) or a full ref. Default `main`. */
@@ -275,17 +261,21 @@ export interface PushResult {
  *
  * Always construct with {@link RemoteGit.open}; instantiation is async. Every
  * method is async and shares one queue, so they have a single ordering.
+ *
+ * Operational failures throw `GitError` (`kind: "io"` → retry,
+ * `kind: "protocol"` → fix the request). Programmer mistakes (bad keys,
+ * bad args, bad store, use-after-close) throw `TypeError`.
  */
 export class RemoteGit {
   /**
-   * Boot the wasm engine and return a usable instance. Throws `BAD_STORE` if a
+   * Boot the wasm engine and return a usable instance. Throws `TypeError` if a
    * custom store breaks the synchronous contract.
    */
   static open(url: string, opts?: RemoteGitOptions): Promise<RemoteGit>;
 
   /**
    * Prefer {@link RemoteGit.open}. An instance built this way has no wasm, so
-   * every method throws `CLOSED`.
+   * every method throws `TypeError`.
    */
   constructor(url: string, opts?: RemoteGitOptions);
 
@@ -301,14 +291,14 @@ export class RemoteGit {
 
   /**
    * Remote tip oid without touching the store. Null when the ref does not
-   * exist remotely; throws `NETWORK` / `HTTP` / `NO_V2` on failure.
+   * exist remotely; throws `GitError` (`io` / `NO_V2`) on failure.
    */
   remoteVersion(): Promise<string | null>;
 
   /**
    * Read keys as bytes. Keys absent from the keyspace are skipped (no entry in
-   * the Map) — that is a real answer, not a failure. A network / HTTP /
-   * protocol failure is thrown, never reported as an empty Map.
+   * the Map) — that is a real answer, not a failure. A transport or protocol
+   * failure is thrown, never reported as an empty Map.
    *
    * May hit the network: a cold store bootstraps structure, and a key whose
    * blob is not cached costs one batched `want=[oids]` roundtrip. Pass
@@ -325,7 +315,7 @@ export class RemoteGit {
    * works); content is a `string` or `Uint8Array`/`ArrayBuffer`.
    *
    * Upsert only — there is no delete. Keys are validated up front and a
-   * malformed one throws `BAD_KEY` before anything is written. Pass
+   * malformed one throws `TypeError` before anything is written. Pass
    * `{ parent }` for compare-and-swap.
    */
   putMany(
@@ -348,7 +338,7 @@ export class RemoteGit {
 
   /**
    * Publish the local tip. Fast-forward only: a non-descendant push throws
-   * `NON_FAST_FORWARD` and you should pull and rewrite.
+   * `GitError` (`NON_FAST_FORWARD`) and you should pull and rewrite.
    */
   push(opts?: Partial<PullOptions>): Promise<PushResult>;
 
@@ -358,7 +348,7 @@ export class RemoteGit {
   /**
    * Release the wasm instance and its ~5MB arena. Waits for in-flight work
    * first; idempotent; does not clear the store. Methods after this throw
-   * `CLOSED`.
+   * `TypeError`.
    */
   close(): Promise<void>;
 }

@@ -7,29 +7,29 @@ Notable changes, written for people using the library. Follows
 
 ### Breaking
 
-- **The error surface is now one export.** `RemoteGitError` is `GitError`, the
-  `isGitError` function is `GitError.is`, and the `ERR` object is gone — its
-  codes are statics on the class.
+- **Errors are two kinds now: `io` vs `protocol`. Usage mistakes throw `TypeError`.**
+  `GitError` keeps one import but gains `.kind`: `GitError.isIO(e)` means
+  "retry later" (`NETWORK` / `HTTP`, with `.status` on HTTP);
+  `GitError.isProtocol(e, ...codes)` means "fix the request" (`CAS_MISMATCH`,
+  `NON_FAST_FORWARD`, `PUSH_REJECTED`, `UNPACK_FAILED`, `NO_V2`,
+  `NO_REMOTE_REF`, `NO_SUCH_OBJECT`, `PROTOCOL_ERROR`). Branch on `.kind`,
+  use `.code` only for protocol detail.
+  Bad keys, bad args, bad stores, use-after-`close` and never-`open`ed
+  instances throw `TypeError` instead of `GitError` — don't catch them as
+  retryable. Internal invariants (wasm failure, corrupt local store) throw
+  plain `Error`. Corrupt packs/sidebands from the server, previously bare
+  `Error`, now throw `GitError` (`protocol/PROTOCOL_ERROR`) so
+  `GitError.is(e)` is finally a real catch-all for operational failures.
 
   ```js
   // before
-  import { ERR, isGitError } from "zig-wasm-git";
-  if (isGitError(e, ERR.CAS_MISMATCH)) { ... }
-  if (isGitError(e, ERR.NETWORK) || isGitError(e, ERR.HTTP)) { ... }
-
-  // after
-  import { GitError } from "zig-wasm-git";
   if (GitError.is(e, "CAS_MISMATCH")) { ... }
   if (GitError.is(e, "NETWORK", "HTTP")) { ... }
+
+  // after
+  if (GitError.isProtocol(e, "CAS_MISMATCH")) { ... }
+  if (GitError.isIO(e)) { ... }
   ```
-
-  `GitError.is` is variadic, so one name covers "any GitError", one code and a
-  set of codes — there is no separate `anyOf`. Bare string literals work
-  everywhere the statics do, and TypeScript autocompletes them from the real
-  code list, so `ERR` no longer needs to be exported at all.
-
-  The error type is now generic in its code: `GitError<"HTTP">` is the old
-  `RemoteGitErrorOf<"HTTP">`, and `GitErrorCode` is the old `ErrCode`.
 
 ### Fixed
 

@@ -24,12 +24,12 @@
 // method has the same ordering guarantee.
 //
 // close() releases the wasm instance and its linear memory. Call it when done;
-// it waits for in-flight work first. After close(), methods throw CLOSED.
+// it waits for in-flight work first. After close(), methods throw TypeError.
 //
-// Failures: every throw is a GitError with a stable `.code` (see GitError in
-// utils.mjs) plus the original error in `.cause` where one exists.
+// Failures: operational failures throw GitError (kind io/protocol, see
+// utils.mjs); usage mistakes throw TypeError; invariants throw Error.
 
-import { memoryStore, deflateZlib, joinUrl, withBasicAuth, looseBody, enc, dec, hexOfBytes, concatU8, parseCommit, parseTreeEntries, commitParentsAndTree, netFetch, assertSyncStore, assertKeys, keyProblem, failed, GitError } from "./utils.mjs";
+import { memoryStore, deflateZlib, joinUrl, withBasicAuth, looseBody, enc, dec, hexOfBytes, concatU8, parseCommit, parseTreeEntries, commitParentsAndTree, netFetch, assertSyncStore, assertKeys, keyProblem, throwProtocol, throwUsage, GitError } from "./utils.mjs";
 import {
   fetchIntoStore, lsRemote,
   collectObjects, TYPE_NUM, ZERO_OID, decodeRefsTlv, decodeStatusTlv,
@@ -67,7 +67,7 @@ function toU8(v) {
   if (v instanceof Uint8Array) return v;
   if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
   if (v instanceof ArrayBuffer) return new Uint8Array(v);
-  failed(GitError.BAD_ARG, `blob content must be a string or Uint8Array/ArrayBuffer; got ${typeName(v)}`);
+  throwUsage(`blob content must be a string or Uint8Array/ArrayBuffer; got ${typeName(v)}`);
 }
 
 const typeName = (v) =>
@@ -84,7 +84,7 @@ function entryPairs(entries) {
   if (entries == null) return [];
   if (entries instanceof Map) return [...entries].map(([k, v]) => [k, toU8(v)]);
   if (typeof entries !== "object" || Array.isArray(entries)) {
-    failed(GitError.BAD_ARG, `putMany entries must be an object or Map; got ${typeName(entries)}`);
+    throwUsage(`putMany entries must be an object or Map; got ${typeName(entries)}`);
   }
   return Object.entries(entries).map(([k, v]) => [k, toU8(v)]);
 }
@@ -127,8 +127,7 @@ async function resolveWasmInput(wasmOpt) {
     // rejects file:// and bare paths outright). Falling through would surface a
     // NETWORK error, which reads as "your connection is down" and invites a
     // retry that can never succeed. Say what is actually missing.
-    failed(
-      GitError.BAD_ARG,
+    throwUsage(
       explicit
         ? `cannot read the wasm from a filesystem path on this runtime (no Node fs): ${href}. ` +
           `Pass the bytes, a WebAssembly.Module, or an http(s) url instead.`
@@ -247,14 +246,22 @@ export class RemoteGit {
   /// "Cannot read properties of null (reading 'wasm_reset')".
   _assertLive() {
     if (this._closed) {
-      failed(GitError.CLOSED, "RemoteGit is closed (close() released the wasm instance)");
+      throwUsage("RemoteGit is closed (close() released the wasm instance)");
     }
     if (!this._wasm) {
-      failed(
-        GitError.CLOSED,
+      throwUsage(
         "RemoteGit was never opened — use `await RemoteGit.open(url, opts)` " +
           "(instantiation is async, so the constructor cannot boot wasm)",
       );
+    }
+  }
+
+  _resolveRefOrNull(ref) {
+    try {
+      return this._resolveRef(ref);
+    } catch (e) {
+      if (e instanceof TypeError) return null;
+      throw e;
     }
   }
 
@@ -266,13 +273,13 @@ export class RemoteGit {
         const v = store.getRef(`refs/heads/${b}`);
         if (v) return v;
       }
-      failed(GitError.BAD_REF, "HEAD: no branch exists yet", { ref });
+      throwUsage("HEAD: no branch exists yet", { ref });
     }
     for (const p of [`refs/heads/${ref}`, `refs/tags/${ref}`, ref]) {
       const v = store.getRef(p);
       if (v) return v;
     }
-    failed(GitError.BAD_REF, `cannot resolve ref: ${ref}`, { ref });
+    throwUsage(`cannot resolve ref: ${ref}`, { ref });
   }
 
   _withStore(fn) {
@@ -283,7 +290,7 @@ export class RemoteGit {
       const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
       if (!u8.length) return { ptr: 0, len: 0 };
       const ptr = w.wasm_alloc(u8.length);
-      if (!ptr) failed(GitError.WASM_ALLOC, "wasm_alloc failed (heap full; call reset between ops)");
+      if (!ptr) throw new Error("wasm_alloc failed: object too large for the 4MB arena");
       mem().set(u8, ptr);
       return { ptr, len: u8.length };
     };
@@ -354,7 +361,7 @@ export class RemoteGit {
       const outPtrAddr = w.wasm_alloc(4);
       const outLenAddr = w.wasm_alloc(4);
       const rc = w.wasm_get(oidHex.ptr, oidHex.len, pj.ptr, pj.len, outPtrAddr, outLenAddr);
-      if (rc !== 0) failed(GitError.WASM_RC, `wasm_get rc=${rc}`);
+      if (rc !== 0) throw new Error(`wasm_get rc=${rc}`);
       const dv = new DataView(w.memory.buffer);
       const tlvPtr = dv.getUint32(outPtrAddr, true);
       const tlvLen = dv.getUint32(outLenAddr, true);
@@ -383,7 +390,7 @@ export class RemoteGit {
         : w.wasm_commit(pHex.ptr, pHex.len, msg.ptr, msg.len, ej.ptr, ej.len, outHex);
       if (rc !== 0) {
         // -14: wasm refused a path (defense in depth behind assertKeys).
-        failed(rc === -14 ? GitError.BAD_TREE_PATH : GitError.WASM_RC, `wasm_commit rc=${rc}`);
+        (() => { if (rc === -14) throwUsage(`wasm_commit refused a path (invalid key): rc=${rc}`); throw new Error(`wasm_commit rc=${rc}`); })();
       }
       const sha = rs(outHex, 40);
       if (this.ref) this._store.putRef(this.ref, sha);
@@ -393,11 +400,7 @@ export class RemoteGit {
 
   /// Local tip, or null when the keyspace is empty. Never touches the network.
   _localTip() {
-    try {
-      return this._resolveRef(this.ref);
-    } catch {
-      return null;
-    }
+    return this._resolveRefOrNull(this.ref);
   }
 
   /// Local tip, else structure-only bootstrap (blob:none; falls back to a
@@ -408,9 +411,8 @@ export class RemoteGit {
   /// commits" because the connection dropped would silently turn a transport
   /// error into "this key does not exist".
   async _tipInner() {
-    try {
-      return this._resolveRef(this.ref);
-    } catch { /* empty store: bootstrap below */ }
+    const cached = this._resolveRefOrNull(this.ref);
+    if (cached) return cached;
     let firstErr;
     try {
       await this._pullInner({ filter: "blob:none" });
@@ -420,15 +422,11 @@ export class RemoteGit {
       try {
         await this._pullInner({});
       } catch (e2) {
-        if (GitError.is(e2, GitError.NO_REMOTE_REF)) return null; // empty remote — a real answer
-        throw e2 instanceof GitError ? e2 : (firstErr ?? e2);
+        if (GitError.isProtocol(e2, "NO_REMOTE_REF")) return null; // empty remote — a real answer
+        throw GitError.is(e2) ? e2 : (firstErr ?? e2);
       }
     }
-    try {
-      return this._resolveRef(this.ref);
-    } catch {
-      return null;
-    }
+    return this._resolveRefOrNull(this.ref);
   }
 
   /// Batched read: memory hits first, then ONE `want=[oids]` roundtrip for
@@ -461,7 +459,7 @@ export class RemoteGit {
       } catch (e) {
         // Only a genuinely-absent object stays a miss; a transport failure is
         // rethrown so the caller never reads "network down" as "no such key".
-        if (!GitError.is(e, GitError.NO_SUCH_OBJECT) && !GitError.is(e, GitError.NO_REMOTE_REF)) throw e;
+        if (!GitError.isProtocol(e, "NO_SUCH_OBJECT", "NO_REMOTE_REF")) throw e;
       }
       for (const row of this._getInner(this.ref, missing)) {
         if (!row.error) out.set(row.path, row.content);
@@ -482,22 +480,22 @@ export class RemoteGit {
       const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
       if (u8.length === 0) return { ptr: 0, len: 0 };
       const ptr = w.wasm_alloc(u8.length);
-      if (!ptr) failed(GitError.WASM_ALLOC, "wasm_alloc failed (heap full; call reset between ops)");
+      if (!ptr) throw new Error("wasm_alloc failed: object too large for the 4MB arena");
       new Uint8Array(w.memory.buffer).set(u8, ptr);
       return { ptr, len: u8.length };
     };
     const devs = [];
     for (const o of objects) devs.push(await deflateZlib(o.body));
-    if (w.wasm_pack_begin(objects.length) !== 0) failed(GitError.WASM_RC, "wasm_pack_begin failed");
+    if (w.wasm_pack_begin(objects.length) !== 0) throw new Error("wasm_pack_begin failed");
     for (let i = 0; i < objects.length; i++) {
       const o = objects[i];
       const tn = TYPE_NUM[o.type];
-      if (!tn) failed(GitError.WASM_RC, `unknown type: ${o.type}`);
+      if (!tn) throw new Error(`unknown type: ${o.type}`);
       const d = allocBytes(devs[i]);
       const rc = w.wasm_pack_add(tn, o.body.length, d.ptr, d.len);
-      if (rc !== 0) failed(GitError.WASM_RC, `wasm_pack_add failed rc=${rc}`);
+      if (rc !== 0) throw new Error(`wasm_pack_add failed rc=${rc}`);
     }
-    if (w.wasm_pack_end() !== 0) failed(GitError.WASM_RC, "wasm_pack_end failed");
+    if (w.wasm_pack_end() !== 0) throw new Error("wasm_pack_end failed");
     return this._takeEmit();
   }
 
@@ -512,7 +510,7 @@ export class RemoteGit {
       const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
       if (!u8.length) return { ptr: 0, len: 0 };
       const ptr = w.wasm_alloc(u8.length);
-      if (!ptr) failed(GitError.WASM_ALLOC, "wasm_alloc failed (heap full; call reset between ops)");
+      if (!ptr) throw new Error("wasm_alloc failed: object too large for the 4MB arena");
       new Uint8Array(w.memory.buffer).set(u8, ptr);
       return { ptr, len: u8.length };
     };
@@ -523,7 +521,7 @@ export class RemoteGit {
     const lrPtrAddr = w.wasm_alloc(4);
     const lrLenAddr = w.wasm_alloc(4);
     if (w.wasm_list_refs(adv.ptr, adv.len, lrPtrAddr, lrLenAddr) !== 0) {
-      failed(GitError.WASM_RC, "wasm_list_refs failed");
+      throw new Error("wasm_list_refs failed");
     }
     const dv = new DataView(w.memory.buffer);
     const lrPtr = dv.getUint32(lrPtrAddr, true);
@@ -557,8 +555,8 @@ export class RemoteGit {
         }
       }
       if (!ff) {
-        failed(
-          GitError.NON_FAST_FORWARD,
+        throwProtocol(
+          "NON_FAST_FORWARD",
           `push rejected: non-fast-forward (remote ${old.slice(0, 7)} is not an ancestor of ${newOid.slice(0, 7)}; pull first)`,
           { ref: this.ref },
         );
@@ -574,7 +572,7 @@ export class RemoteGit {
     const rf = allocStr(this.ref);
     const caps = allocStr("report-status");
     if (w.wasm_build_ref_update(oHex.ptr, oHex.len, nHex.ptr, nHex.len, rf.ptr, rf.len, caps.ptr, caps.len) !== 0) {
-      failed(GitError.WASM_RC, "wasm_build_ref_update failed");
+      throw new Error("wasm_build_ref_update failed");
     }
     const head = this._takeEmit();
     const reqBody = new Uint8Array(head.length + packBuf.length);
@@ -595,12 +593,12 @@ export class RemoteGit {
     const soPtr = sdv.getUint32(soPtrAddr, true);
     const status = decodeStatusTlv(new Uint8Array(w.memory.buffer.slice(soPtr, soPtr + sdv.getUint32(soLenAddr, true))));
     if (rc === -2 || !status.unpackOk) {
-      failed(GitError.UNPACK_FAILED, `unpack failed: ${status.unpackMsg}`, { ref: this.ref });
+throwProtocol("UNPACK_FAILED", `unpack failed: ${status.unpackMsg}`, { ref: this.ref });
     }
     if (rc !== 0) {
       const row = status.refs.find((r) => r.ref === this.ref);
-      failed(
-        GitError.PUSH_REJECTED,
+      throwProtocol(
+        "PUSH_REJECTED",
         `push rejected: ${row ? `${row.ref}: ${row.msg}` : `rc=${rc}`}`,
         { ref: this.ref },
       );
@@ -612,13 +610,7 @@ export class RemoteGit {
 
   /// Local tip oid, or null when the keyspace is empty.
   async version() {
-    return this._seq(async () => {
-      try {
-        return this._resolveRef(this.ref);
-      } catch {
-        return null;
-      }
-    });
+    return this._seq(async () => this._resolveRefOrNull(this.ref));
   }
 
   /// Remote tip oid without touching the store. Null when the ref doesn't
@@ -671,18 +663,15 @@ export class RemoteGit {
   async putMany(entries, message = "update", options = {}) {
     const { parent: expected, ...rest } = options;
     // Normalize and validate before taking the serializer slot, so a bad
-    // argument throws BAD_ARG/BAD_KEY rather than queueing a doomed commit.
+    // argument throws TypeError rather than queueing a doomed commit.
     const pairs = entryPairs(entries);
     assertKeys(pairs.map(([p]) => p));
     const flat = Object.fromEntries(pairs);
     return this._seq(async () => {
-      let tip = null;
-      try {
-        tip = this._resolveRef(this.ref);
-      } catch { /* empty keyspace */ }
+      const tip = this._resolveRefOrNull(this.ref);
       if (expected != null && (tip ?? "") !== expected) {
-        failed(
-          GitError.CAS_MISMATCH,
+        throwProtocol(
+          "CAS_MISMATCH",
           `CAS mismatch: tip ${(tip ?? "").slice(0, 7) || "(empty)"} != expected ${String(expected).slice(0, 7)}`,
           { ref: this.ref },
         );
@@ -726,12 +715,8 @@ export class RemoteGit {
 
   async _logInner(limit) {
     const out = [];
-    let cur;
-    try {
-      cur = this._resolveRef(this.ref);
-    } catch {
-      return out;
-    }
+    let cur = this._resolveRefOrNull(this.ref);
+    if (!cur) return out;
     for (let i = 0; i < limit && cur; i++) {
       const loose = this._store.get(cur);
       if (!loose) break;

@@ -10,7 +10,7 @@
 import {
   buildLsRefsReq, buildFetchReq, listRefs, decodePackHeaderJS, inflateOne, deltaApply,
   decodeRefsTlv, looseBody, parseTreeEntries, commitParentsAndTree,
-  deflateZlib, hexOfBytes, joinUrl, enc, dec, netFetch, failed, GitError,
+  deflateZlib, hexOfBytes, joinUrl, enc, dec, netFetch, throwIO, throwProtocol, throwUsage, GitError,
 } from "./utils.mjs";
 
 export { decodeRefsTlv };
@@ -37,6 +37,7 @@ async function sha1Hex(subtle, bytes) {
 /// Demux a v2 fetch response (sideband-64k) into {pack, shallow, progress}.
 /// Accepts: [shallow lines + flush] + pkt("packfile\n") + band-1/2/3 chunks + flush.
 /// Also tolerates a bare "PACK..." body (no sideband) for leniency.
+/// Every failure here means the server spoke corrupt protocol: GitError/protocol.
 export function decodeSideband(body) {
   if (body.length >= 4 && dec.decode(body.subarray(0, 4)) === "PACK") return { pack: body.slice(), shallow: [], progress: [] };
   const shallow = [];
@@ -56,7 +57,7 @@ export function decodeSideband(body) {
       continue;
     }
     const len = parseInt(tag, 16);
-    if (!Number.isFinite(len) || len < 4 || pos + len > body.length) throw new Error("bad sideband pkt-line");
+    if (!Number.isFinite(len) || len < 4 || pos + len > body.length) throwProtocol("PROTOCOL_ERROR", "bad sideband pkt-line");
     const payload = body.subarray(pos + 4, pos + len);
     pos += len;
     if (!inPack) {
@@ -80,8 +81,8 @@ export function decodeSideband(body) {
     const band = payload[0];
     if (band === 1) packParts.push(payload.subarray(1));
     else if (band === 2) progress.push(dec.decode(payload.subarray(1)));
-    else if (band === 3) throw new Error(`remote error: ${dec.decode(payload.subarray(1))}`);
-    else throw new Error(`unknown sideband ${band}`);
+    else if (band === 3) throwProtocol("PROTOCOL_ERROR", `remote error: ${dec.decode(payload.subarray(1))}`);
+    else throwProtocol("PROTOCOL_ERROR", `unknown sideband ${band}`);
   }
   let n = 0;
   for (const p of packParts) n += p.length;
@@ -104,8 +105,8 @@ function readU32BE(buf, pos) {
 /// ref-delta needs base oid -> body, which requires SHA-1 (async subtle);
 /// callers resolve `pending` via resolveRefDeltas() after hashing.
 export function unpackPack(wasm, pack) {
-  if (pack.length < 32 || dec.decode(pack.subarray(0, 4)) !== "PACK") throw new Error("not a pack");
-  if (readU32BE(pack, 4) !== 2) throw new Error("unsupported pack version");
+  if (pack.length < 32 || dec.decode(pack.subarray(0, 4)) !== "PACK") throwProtocol("PROTOCOL_ERROR", "not a pack");
+  if (readU32BE(pack, 4) !== 2) throwProtocol("PROTOCOL_ERROR", "unsupported pack version");
   const n = readU32BE(pack, 8);
   const end = pack.length - 20;
   let pos = 12;
@@ -114,14 +115,14 @@ export function unpackPack(wasm, pack) {
   const ofsdeltas = [];
   const pending = [];
   for (let i = 0; i < n; i++) {
-    if (pos >= end) throw new Error("pack truncated");
+    if (pos >= end) throwProtocol("PROTOCOL_ERROR", "pack truncated");
     const h = decodePackHeaderJS(pack, pos);
     const objOffset = pos;
     pos = h.next;
     if (h.type <= 4) {
       const { body: inflated, consumed } = inflateOne(wasm, pack, pos);
       pos += consumed;
-      if (inflated.length !== h.size) throw new Error(`size mismatch at offset ${objOffset}: header ${h.size} vs inflated ${inflated.length}`);
+      if (inflated.length !== h.size) throwProtocol("PROTOCOL_ERROR", `size mismatch at offset ${objOffset}: header ${h.size} vs inflated ${inflated.length}`);
       const rec = { offset: objOffset, type: TYPE_NAME[h.type], body: inflated };
       objects.push(rec);
       byOffset.set(objOffset, rec);
@@ -131,19 +132,19 @@ export function unpackPack(wasm, pack) {
       pos = next;
       const { body: inflated, consumed } = inflateOne(wasm, pack, pos);
       pos += consumed;
-      if (inflated.length !== h.size) throw new Error(`delta size mismatch at offset ${objOffset}`);
+      if (inflated.length !== h.size) throwProtocol("PROTOCOL_ERROR", `delta size mismatch at offset ${objOffset}`);
       ofsdeltas.push({ offset: objOffset, baseAbs: objOffset - baseDistance, delta: inflated, expectSize: decodeDeltaResultSize(inflated) });
     } else if (h.type === 7) {
       // ref-delta: 裸 20B base oid + zlib(delta 指令)
-      if (pos + 20 > end) throw new Error("ref-delta base truncated");
+      if (pos + 20 > end) throwProtocol("PROTOCOL_ERROR", "ref-delta base truncated");
       const baseHex = hexOfBytes(pack.subarray(pos, pos + 20));
       pos += 20;
       const { body: inflated, consumed } = inflateOne(wasm, pack, pos);
       pos += consumed;
-      if (inflated.length !== h.size) throw new Error(`delta size mismatch at offset ${objOffset}`);
+      if (inflated.length !== h.size) throwProtocol("PROTOCOL_ERROR", `delta size mismatch at offset ${objOffset}`);
       pending.push({ baseHex, delta: inflated, expectSize: decodeDeltaResultSize(inflated), offset: objOffset });
     } else {
-      throw new Error(`unsupported pack type ${h.type} at offset ${objOffset}`);
+      throwProtocol("PROTOCOL_ERROR", `unsupported pack type ${h.type} at offset ${objOffset}`);
     }
   }
   // ofs-delta to fixpoint (bases always precede: backward offsets)
@@ -156,12 +157,12 @@ export function unpackPack(wasm, pack) {
       continue;
     }
     const out = deltaApply(wasm, base.body, p.delta);
-    if (out.length !== p.expectSize) throw new Error(`delta result size mismatch at offset ${p.offset}`);
+    if (out.length !== p.expectSize) throwProtocol("PROTOCOL_ERROR", `delta result size mismatch at offset ${p.offset}`);
     const rec = { offset: p.offset, type: base.type, body: out };
     objects.push(rec);
     byOffset.set(p.offset, rec);
   }
-  if (ofsdeltas.length) throw new Error(`unresolvable ofs-deltas: ${ofsdeltas.length} (missing base — thin pack?)`);
+  if (ofsdeltas.length) throwProtocol("PROTOCOL_ERROR", `unresolvable ofs-deltas: ${ofsdeltas.length} (missing base — thin pack?)`);
   return { objects, pending, count: n, trailerEnd: end };
 }
 
@@ -180,7 +181,7 @@ export function resolveRefDeltas(wasm, pending, known) {
       continue;
     }
     const body = deltaApply(wasm, base.body, p.delta);
-    if (body.length !== p.expectSize) throw new Error(`ref-delta result size mismatch (base ${p.baseHex.slice(0, 7)})`);
+    if (body.length !== p.expectSize) throwProtocol("PROTOCOL_ERROR", `ref-delta result size mismatch (base ${p.baseHex.slice(0, 7)})`);
     out.push({ type: base.type, body });
   }
   return out;
@@ -208,7 +209,7 @@ function decodeDeltaResultSize(delta) {
     let shift = 0;
     let v = 0;
     for (;;) {
-      if (pos >= delta.length) throw new Error("delta varint truncated");
+      if (pos >= delta.length) throwProtocol("PROTOCOL_ERROR", "delta varint truncated");
       const c = delta[pos++];
       v |= (c & 127) << shift;
       if (!(c & 128)) break;
@@ -220,11 +221,11 @@ function decodeDeltaResultSize(delta) {
 }
 
 export async function verifyPackTrailer(subtle, pack) {
-  if (pack.length < 20) throw new Error("pack too short");
+  if (pack.length < 20) throwProtocol("PROTOCOL_ERROR", "pack too short");
   const body = pack.subarray(0, pack.length - 20);
   const want = pack.subarray(pack.length - 20);
   const got = new Uint8Array(await subtle.digest("SHA-1", body));
-  for (let i = 0; i < 20; i++) if (got[i] !== want[i]) throw new Error("pack trailer sha1 mismatch");
+  for (let i = 0; i < 20; i++) if (got[i] !== want[i]) throwProtocol("PROTOCOL_ERROR", "pack trailer sha1 mismatch");
 }
 
 /// Full clone/fetch into store (portable).
@@ -244,7 +245,7 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   const discRes = await netFetch(fetchImpl, joinUrl(url, "/info/refs?service=git-upload-pack"), { headers }, "discovery");
   const disc = new Uint8Array(await discRes.arrayBuffer());
   if (!dec.decode(disc).includes("version 2")) {
-    failed(GitError.NO_V2, "server lacks protocol v2 (need version 2 advertisement)");
+    throwProtocol("NO_V2", "server lacks protocol v2 (need version 2 advertisement)");
   }
 
   // 2. ls-refs
@@ -255,15 +256,15 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
     body: lsBody,
   }, "ls-refs");
   const refs = listRefs(wasm, new Uint8Array(await lsRes.arrayBuffer()));
-  if (!refs.length) failed(GitError.NO_REMOTE_REF, "remote has no refs (empty repo — nothing to fetch)");
+  if (!refs.length) throwProtocol("NO_REMOTE_REF", "remote has no refs (empty repo — nothing to fetch)");
 
   // resolve want(s): full ref, short name, raw oid, or raw-oid array
   let wantOids;
   let wantRef = null;
   if (Array.isArray(want)) {
-    if (!want.length) failed(GitError.BAD_KEY, "empty want list");
+    if (!want.length) throwUsage("empty want list");
     wantOids = want.map((w) => {
-      if (!/^[0-9a-f]{40}$/i.test(w)) failed(GitError.BAD_KEY, `batch fetch only takes raw oids, got: ${w}`);
+      if (!/^[0-9a-f]{40}$/i.test(w)) throwUsage(`batch fetch only takes raw oids, got: ${w}`);
       return w.toLowerCase();
     });
   } else if (/^[0-9a-f]{40}$/i.test(want)) {
@@ -273,7 +274,7 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
     const full = want.startsWith("refs/") ? want : `refs/heads/${want}`;
     const hit = refs.find((r) => r.name === full) ?? refs.find((r) => r.name === want);
     if (!hit) {
-      failed(GitError.NO_REMOTE_REF, `remote ref not found: ${want} (have: ${refs.map((r) => r.name).join(", ")})`, {
+      throwProtocol("NO_REMOTE_REF", `remote ref not found: ${want} (have: ${refs.map((r) => r.name).join(", ")})`, {
         ref: want,
       });
     }
@@ -293,13 +294,26 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
     body: fetchBody,
   }, "fetch");
   const raw = new Uint8Array(await fRes.arrayBuffer());
-  const { pack, shallow, progress } = decodeSideband(raw);
+  let pack, shallow, progress;
+  try {
+    ({ pack, shallow, progress } = decodeSideband(raw));
+    if (pack.length < 32) throwProtocol("PROTOCOL_ERROR", `fetch response has no pack (${pack.length}B)`);
+    await verifyPackTrailer(subtle, pack);
+  } catch (e) {
+    if (GitError.is(e)) throw e;
+    throwProtocol("PROTOCOL_ERROR", `corrupt fetch reply: ${e?.message ?? e}`, { cause: e });
+  }
   if (opts.onProgress && progress.length) opts.onProgress(progress);
-  if (pack.length < 32) throw new Error(`fetch response has no pack (${pack.length}B, progress: ${progress.join("; ").slice(0, 200)})`);
-  await verifyPackTrailer(subtle, pack);
 
   // 4. unpack: pass 1 (sync, no hashing) -> hash -> resolve ref-deltas.
-  const { objects, pending } = unpackPack(wasm, pack);
+  // Pack bytes come from the server: any corruption here is protocol, not a bug.
+  let objects, pending;
+  try {
+    ({ objects, pending } = unpackPack(wasm, pack));
+  } catch (e) {
+    if (GitError.is(e)) throw e;
+    throwProtocol("PROTOCOL_ERROR", `corrupt pack: ${e?.message ?? e}`, { cause: e });
+  }
   const known = new Map(); // hex -> {type, body}
   for (const o of objects) {
     const hex = await sha1Hex(subtle, looseBytes(o.type, o.body));
@@ -317,14 +331,21 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
         }
       }
     }
-    const extra = resolveRefDeltas(wasm, pending, known);
+    const extra = (() => {
+      try {
+        return resolveRefDeltas(wasm, pending, known);
+      } catch (e) {
+        if (GitError.is(e)) throw e;
+        throwProtocol("PROTOCOL_ERROR", `corrupt ref-delta: ${e?.message ?? e}`, { cause: e });
+      }
+    })();
     for (const o of extra) {
       const hex = await sha1Hex(subtle, looseBytes(o.type, o.body));
       o.hex = hex;
       known.set(hex, o);
       objects.push(o);
     }
-    if (pending.length) throw new Error(`unresolvable ref-deltas: ${pending.length} (base ${pending[0].baseHex.slice(0, 7)} missing — thin pack or filter omission?)`);
+    if (pending.length) throwProtocol("PROTOCOL_ERROR", `unresolvable ref-deltas: ${pending.length} (base ${pending[0].baseHex.slice(0, 7)} missing — thin pack or filter omission?)`);
   }
   // 5. store as loose
   let stored = 0;
@@ -340,8 +361,8 @@ export async function fetchIntoStore(wasm, store, url, want, opts = {}) {
   // (gc'd / unadvertised blob); callers treat it as a miss, not a failure.
   for (const o of wantOids) {
     if (!store.get(o)) {
-      failed(
-        GitError.NO_SUCH_OBJECT,
+      throwProtocol(
+        "NO_SUCH_OBJECT",
         `fetched pack lacks wanted object ${o} (got ${stored} objects)`,
         { ref: o },
       );

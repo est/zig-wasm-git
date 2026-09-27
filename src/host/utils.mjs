@@ -29,49 +29,36 @@ export { enc, dec };
 // boundary where `instanceof` does not.
 const BRAND = Symbol.for("zig-wasm-git.GitError");
 
-/// The one error type this library throws, and the namespace for its codes —
-/// one export, so a caller needs a single import:
+/// The one operational error type this library throws.
 ///
-///   import { GitError } from "zig-wasm-git";
-///   if (GitError.is(e, "CAS_MISMATCH")) { ... }          // narrows to that code
-///   if (GitError.is(e, "NETWORK", "HTTP")) { ... }       // narrows to the union
-///   if (GitError.is(e)) { ... }                          // any GitError
+/// Only two kinds exist — branch on `.kind`, never on `.message`:
 ///
-/// The static codes below are the single source of truth for the vocabulary:
-/// the client chain throws via `failed()`, and the shipped `.d.mts` mirrors the
-/// list (a test asserts the two agree). Branch on `.code`, never on `.message`.
+///   - `io`: transport failed (`code` is `NETWORK` or `HTTP`). Retry later.
+///     HTTP carries `.status`.
+///   - `protocol`: the server answered but refused or confused us (`code`
+///     names the refusal: `CAS_MISMATCH`, `NON_FAST_FORWARD`,
+///     `PUSH_REJECTED`, `UNPACK_FAILED`, `NO_V2`, `NO_REMOTE_REF`,
+///     `NO_SUCH_OBJECT`, or `PROTOCOL_ERROR` for a corrupt pack/sideband).
+///     Fix the request, don't blind-retry.
+///
+/// Anything else is NOT a GitError and must not be caught as one:
+/// programmer mistakes (bad key, bad arg, bad store, use-after-close,
+/// unknown ref locally) throw `TypeError` and crash fast; internal
+/// invariants (wasm rc, corrupt local store) throw plain `Error`.
+/// ```js
+/// import { GitError } from "zig-wasm-git";
+/// try { await git.push(); }
+/// catch (e) {
+///   if (GitError.isIO(e)) retryLater(e.status);
+///   else if (GitError.isProtocol(e, "NON_FAST_FORWARD")) await git.pull();
+///   else throw e; // TypeError / Error: fix the code, don't retry
+/// }
+/// ```
 export class GitError extends Error {
-  // ── codes ──
-  static BAD_STORE = "BAD_STORE"; // store does not satisfy the synchronous interface
-  static BAD_KEY = "BAD_KEY"; // a write key cannot round-trip
-  static BAD_REF = "BAD_REF"; // ref unresolvable in the local store
-  static CAS_MISMATCH = "CAS_MISMATCH"; // putMany parent != current tip
-  static NON_FAST_FORWARD = "NON_FAST_FORWARD"; // push target is not a descendant of the remote tip
-  static PUSH_REJECTED = "PUSH_REJECTED"; // server refused the ref update
-  static UNPACK_FAILED = "UNPACK_FAILED"; // server could not unpack the pushed pack
-  static NO_REMOTE_REF = "NO_REMOTE_REF"; // ref/branch does not exist on the remote
-  static NO_SUCH_OBJECT = "NO_SUCH_OBJECT"; // server accepted the want but did not send the object
-  static NO_V2 = "NO_V2"; // server lacks protocol v2 (pull / ls-refs require it)
-  static HTTP = "HTTP"; // non-2xx response; see .status
-  static NETWORK = "NETWORK"; // fetch threw (offline, DNS, TLS, CORS); see .cause
-  static WASM_ALLOC = "WASM_ALLOC"; // wasm arena exhausted
-  static WASM_RC = "WASM_RC"; // a wasm export returned non-zero
-  static BAD_TREE_PATH = "BAD_TREE_PATH"; // wasm refused a path (defense in depth)
-  static BAD_ARG = "BAD_ARG"; // argument has the wrong shape/type, or cannot work here
-  static CLOSED = "CLOSED"; // method called on a closed instance
-
-  /// True when `e` is a GitError, optionally restricted to one or more codes.
-  /// Variadic on purpose: no codes means "any GitError", one code narrows the
-  /// type to that literal, several narrow it to the union — so callers get one
-  /// name instead of a separate `is` and `anyOf`.
-  static is(e, ...codes) {
-    if (e?.[BRAND] !== true) return false;
-    return codes.length === 0 || codes.includes(e.code);
-  }
-
-  constructor(code, message, extra = {}) {
+  constructor(kind, code, message, extra = {}) {
     super(message);
     this.name = "GitError";
+    this.kind = kind;
     this.code = code;
     this[BRAND] = true;
     if (extra.cause !== undefined) this.cause = extra.cause;
@@ -79,12 +66,46 @@ export class GitError extends Error {
     if (extra.key !== undefined) this.key = extra.key;
     if (extra.ref !== undefined) this.ref = extra.ref;
   }
+
+  /// True when `e` is any GitError from any copy of this module.
+  /// Kept brand-based (not `instanceof`) for the npm-vs-bundle dual copy.
+  static is(e) {
+    return e?.[BRAND] === true;
+  }
+
+  /// True for transport failures (`NETWORK` / `HTTP`). Retry later.
+  static isIO(e) {
+    return e?.[BRAND] === true && e.kind === "io";
+  }
+
+  /// True for server refusals. With codes, narrows to those refusals:
+  /// `isProtocol(e, "NON_FAST_FORWARD")`. Without codes, any protocol error.
+  static isProtocol(e, ...codes) {
+    if (e?.[BRAND] !== true || e.kind !== "protocol") return false;
+    return codes.length === 0 || codes.includes(e.code);
+  }
 }
 
-/// Throw a GitError. Exported so the client chain never writes a bare
-/// `new Error` for a condition a caller may need to branch on.
-export function failed(code, message, extra) {
-  throw new GitError(code, message, extra);
+/// Throw a transport failure. `code` is `NETWORK` (fetch threw, `.cause`
+/// keeps the original) or `HTTP` (non-2xx, `.status` keeps the status).
+export function throwIO(code, message, extra) {
+  throw new GitError("io", code, message, extra);
+}
+
+/// Throw a server refusal or corrupt-protocol reply. `code` is one of
+/// `CAS_MISMATCH`, `NON_FAST_FORWARD`, `PUSH_REJECTED`, `UNPACK_FAILED`,
+/// `NO_V2`, `NO_REMOTE_REF`, `NO_SUCH_OBJECT`, `PROTOCOL_ERROR`.
+export function throwProtocol(code, message, extra) {
+  throw new GitError("protocol", code, message, extra);
+}
+
+/// Throw a programmer mistake. Never a GitError on purpose: catching it as
+/// "retryable" would loop forever on a bug. Message names the fix.
+export function throwUsage(message, extra) {
+  const e = new TypeError(message);
+  if (extra?.key !== undefined) e.key = extra.key;
+  if (extra?.ref !== undefined) e.ref = extra.ref;
+  throw e;
 }
 
 // ── net ──
@@ -97,9 +118,9 @@ export async function netFetch(fetchImpl, url, init, what) {
   try {
     r = await fetchImpl(url, init);
   } catch (e) {
-    failed(GitError.NETWORK, `${what}: ${e?.message ?? e}`, { cause: e });
+    throwIO("NETWORK", `${what}: ${e?.message ?? e}`, { cause: e });
   }
-  if (!r?.ok) failed(GitError.HTTP, `${what} http ${r?.status ?? 0}`, { status: r?.status });
+  if (!r?.ok) throwIO("HTTP", `${what} http ${r?.status ?? 0}`, { status: r?.status });
   return r;
 }
 
@@ -129,7 +150,7 @@ export function keyProblem(key) {
   return null;
 }
 
-/// Throw BAD_KEY listing every bad key at once, so a batch is fixable in one pass.
+/// Throw TypeError listing every bad key at once, so a batch is fixable in one pass.
 export function assertKeys(keys) {
   const bad = [];
   for (const k of keys) {
@@ -137,8 +158,7 @@ export function assertKeys(keys) {
     if (why) bad.push(`${JSON.stringify(k)} (${why})`);
   }
   if (bad.length) {
-    failed(
-      GitError.BAD_KEY,
+    throwUsage(
       `invalid key(s): ${bad.join("; ")} — keys are relative paths like "docs/a.md"`,
     );
   }
@@ -154,7 +174,7 @@ export function assertKeys(keys) {
 /// host_put_object) and from ref resolution, neither of which can await, so a
 /// Promise-returning store does not fail loudly — wasm would read a
 /// zero-length object and the instance would write commits it cannot read back.
-/// RemoteGit.open probes the store and throws BAD_STORE instead.
+/// RemoteGit.open probes the store and throws TypeError instead.
 export function memoryStore() {
   const objs = new Map();
   const refs = new Map();
@@ -186,18 +206,17 @@ export function memoryStore() {
 const STORE_METHODS = ["get", "put", "getRef", "putRef", "heads"];
 
 /// Verify a custom store satisfies the synchronous interface above, so the
-/// failure is a clear BAD_STORE at open() instead of silently-empty reads
+/// failure is a clear TypeError at open() instead of silently-empty reads
 /// later. Read paths are probed with sentinel keys (no writes, so nothing is
 /// mutated); a probe that throws is not our business and is ignored — we only
 /// care that it did not hand back a thenable.
 export function assertSyncStore(store) {
   if (!store || typeof store !== "object") {
-    failed(GitError.BAD_STORE, `store must be an object with {${STORE_METHODS.join(", ")}}`);
+    throwUsage(`store must be an object with {${STORE_METHODS.join(", ")}}`);
   }
   const missing = STORE_METHODS.filter((k) => typeof store[k] !== "function");
   if (missing.length) {
-    failed(
-      GitError.BAD_STORE,
+    throwUsage(
       `store is missing ${missing.join(", ")} — it must implement {${STORE_METHODS.join(", ")}}`,
     );
   }
@@ -214,8 +233,7 @@ export function assertSyncStore(store) {
       continue;
     }
     if (v && typeof v.then === "function") {
-      failed(
-        GitError.BAD_STORE,
+      throwUsage(
         `store.${name}() returned a Promise — the store interface is synchronous ` +
           `(it is called from wasm host callbacks that cannot await). Buffer the ` +
           `value yourself, or use memoryStore().`,
@@ -363,7 +381,7 @@ function dv(wasm) {
 function allocBytes(wasm, b) {
   if (b.length === 0) return { ptr: 0, len: 0 };
   const ptr = wasm.wasm_alloc(b.length);
-  if (!ptr) failed(GitError.WASM_ALLOC, "wasm_alloc failed (heap full; call reset between ops)");
+  if (!ptr) throw new Error("wasm_alloc failed: object too large for the 4MB arena");
   new Uint8Array(wasm.memory.buffer).set(b, ptr);
   return { ptr, len: b.length };
 }

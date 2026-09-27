@@ -86,8 +86,9 @@ await git.close(); // release the ~5MB wasm arena
 - A **small async JS API** on top. `fetch`, `CompressionStream`,
   `crypto.subtle` and a pluggable store are the only platform dependencies, so
   the same JS runs in Node, browsers and Workers with no `node:` imports.
-- **Fails loudly.** Every throw is a `GitError` with a stable `.code`, and
-  a network or HTTP failure is never reported as "key not found"
+- **Fails loudly.** Operational failures throw `GitError` (`kind: "io"` for
+  transport, `"protocol"` for server refusals); programmer mistakes throw
+  `TypeError`. A network failure is never reported as "key not found"
   ([Errors](#errors)).
 
 ## API
@@ -117,7 +118,7 @@ const git = await RemoteGit.open(url, {
 | `pull(opts?)` | `PullResult` | refresh from the remote. `{ filter: "blob:none" }` for versions-without-bytes |
 | `push()` | `PushResult` | fast-forward only; rejects on non-fast-forward |
 | `sync(paths, opts?)` | `Map(path -> bytes)` | one-shot: pull latest, then read |
-| `close()` | — | releases the wasm instance. Idempotent. Methods after throw `CLOSED` |
+| `close()` | — | releases the wasm instance. Idempotent. Methods after throw `TypeError` |
 
 ### Read and write
 
@@ -129,9 +130,9 @@ await git.getMany(["a.txt"], { as: "text" });       // Map(path -> string)
 await git.getMany(["config.json"], { local: true }); // cache-only, never any I/O
 
 // Writes. Keys are relative paths: no empty segment, no `.` / `..` / `.git`; a
-// malformed key is rejected (BAD_KEY) rather than normalized. Content is a
-// string or Uint8Array/ArrayBuffer — anything else is rejected with BAD_ARG
-// rather than stored as "[object Object]".
+// malformed key throws TypeError rather than being normalized. Content is a
+// string or Uint8Array/ArrayBuffer — anything else throws TypeError
+// rather than being stored as "[object Object]".
 await git.putMany({ "a.txt": "hi" }, "update greeting"); // -> commit sha
 ```
 
@@ -189,7 +190,7 @@ const git = await RemoteGit.open(url, { store: myStore });
 **A custom store must be synchronous.** It is called from wasm host callbacks
 that cannot await, so a Promise-returning store would write commits it cannot
 read back — a silent data-loss failure, not an error. `open()` probes the store
-and throws `BAD_STORE` if the contract is broken.
+and throws `TypeError` if the contract is broken.
 
 That means you cannot wrap an inherently async backend (IndexedDB, D1, R2)
 directly. Buffer in memory and flush, or prehydrate before `open()`.
@@ -221,7 +222,7 @@ const git = await RemoteGit.open(url, { wasm: "zig-out/bin/zig_wasm_git.wasm" })
 
 On a runtime with no filesystem *and* no reachable default (Node before 22.3,
 workerd), the default location is unreachable and `open()` says so with
-`BAD_ARG` rather than a misleading `NETWORK` error.
+`TypeError` rather than a misleading `io/NETWORK` error.
 
 ## Reads can touch the network
 
@@ -261,7 +262,7 @@ try {
 
 `close()` is idempotent and does **not** clear the store — pass a throwaway
 `store` if you want those objects collected too. After `close()`, methods throw
-`CLOSED`.
+`TypeError`.
 
 **The store itself never shrinks.** It is append-only: every version you write
 and every object you pull stays resident, because git history is the point.
@@ -271,83 +272,38 @@ with `close()` rather than reusing one instance forever.
 
 ## Errors
 
-Every throw is a `GitError` with a stable `.code`. Branch on the code, never on
-the message text. One import covers the class and its codes:
+Two kinds, one import. Branch on `.kind`, never on the message text:
 
 ```js
 import { GitError } from "zig-wasm-git";
 
 try {
-  await git.putMany({ "a.txt": "v2" }, "cas write", { parent: tip });
+  await git.push();
 } catch (e) {
-  if (GitError.is(e, "CAS_MISMATCH")) { /* someone else wrote; re-read */ }
-  else if (GitError.is(e, "NON_FAST_FORWARD")) { /* pull, then rewrite */ }
-  else if (GitError.is(e, "NETWORK", "HTTP")) {
-    retryLater(e.status);          // .status is set for HTTP
-  } else throw e;
+  if (GitError.isIO(e)) retryLater(e.status); // NETWORK or HTTP; .status is set for HTTP
+  else if (GitError.isProtocol(e, "NON_FAST_FORWARD")) { /* pull, then rewrite */ }
+  else if (GitError.isProtocol(e, "CAS_MISMATCH")) { /* someone else wrote; re-read */ }
+  else throw e; // TypeError / Error: fix the code, don't retry
 }
 ```
 
-`GitError.is` is variadic, and that is the whole API — no separate `anyOf`:
-
-| you write | it means | `.code` narrows to |
-| --- | --- | --- |
-| `GitError.is(e)` | is this one of ours? | the full union |
-| `GitError.is(e, "NETWORK")` | that one code | `"NETWORK"` |
-| `GitError.is(e, "NETWORK", "HTTP")` | any of these | `"NETWORK" \| "HTTP"` |
-
-In TypeScript that narrowing is real, so `e.status` and `e.cause` stay typed
-and the code is checked against the real list:
-
-```ts
-if (GitError.is(e, "HTTP")) console.log(e.status);   // number | undefined
-if (GitError.is(e, "TYPO")) { }                      // compile error
-```
-
-Three ways to handle errors, in the order you are likely to need them:
-
-```js
-// 1. one known code — plain equality is fine
-if (e instanceof GitError && e.code === "CLOSED") reopen();
-
-// 2. a set of codes — GitError.is
-if (GitError.is(e, "NETWORK", "HTTP")) retryLater();
-
-// 3. every code — switch, with `never` so a new code fails the build
-if (e instanceof GitError) {
-  switch (e.code) {
-    case "CAS_MISMATCH": return reRead();
-    case "NON_FAST_FORWARD": return pullAndRewrite();
-    default: { const _exhaustive: never = e; throw e; }
-  }
-}
-```
-
-`GitError.is` also recognizes a `GitError` thrown by a *different copy* of this
-module — the npm package and the single-file release bundle are separate
-classes, and an app can load both. `instanceof` cannot do that, which is the
-one place the two differ.
-
-| code | raised when |
+| you write | it means |
 | --- | --- |
-| `NETWORK` | `fetch` threw (offline, DNS, TLS, CORS) |
-| `HTTP` | non-2xx response; see `.status` |
-| `NO_V2` | server lacks protocol v2 (blocks `pull` / `lsRemote`; `push` still works) |
-| `NO_REMOTE_REF` | ref/branch does not exist on the remote |
-| `NO_SUCH_OBJECT` | server accepted a `want` but did not send the object (e.g. gc'd) — treated as a miss, not a failure |
-| `BAD_STORE` | custom `store` is missing methods or returns Promises |
-| `BAD_KEY` | a write key is not a valid relative path |
-| `BAD_REF` | ref cannot be resolved in the local store |
-| `BAD_ARG` | an argument has the wrong shape (e.g. `getMany(42)`, non-string key) or cannot work on this runtime |
-| `CLOSED` | the instance was never `open()`ed, or `close()` already ran |
-| `CAS_MISMATCH` | `putMany` `parent` != current tip |
-| `NON_FAST_FORWARD` | push target is not a descendant of the remote tip |
-| `PUSH_REJECTED` / `UNPACK_FAILED` | server refused the update / could not unpack |
-| `WASM_ALLOC` / `WASM_RC` / `BAD_TREE_PATH` | 4MB arena exhausted / wasm error / wasm refused a path |
+| `GitError.isIO(e)` | transport failed (`NETWORK` / `HTTP`) — retry later |
+| `GitError.isProtocol(e)` | server refused (`CAS_MISMATCH`, `NON_FAST_FORWARD`, `PUSH_REJECTED`, `UNPACK_FAILED`, `NO_V2`, `NO_REMOTE_REF`, `NO_SUCH_OBJECT`, `PROTOCOL_ERROR`) — fix the request |
+| `GitError.is(e)` | either kind (also matches a `GitError` from a *different copy* of this module, where `instanceof` fails) |
+
+Programmer mistakes are **not** `GitError` on purpose — catching them as
+"retryable" would loop forever on a bug:
+
+| thrown as | when |
+| --- | --- |
+| `TypeError` | bad key, bad arg, bad store (missing methods / async), use-after-`close`, never-`open`ed, unresolvable local ref, wasm path unreadable on this runtime |
+| `Error` | internal invariant (wasm failure, corrupt local store) — report a bug |
 
 The distinction that matters most: **a missing key is a skip, a transport
 failure is a throw.** A key genuinely absent from the keyspace has no entry in
-the `Map`; a dropped connection raises `NETWORK` or `HTTP`. Only a key that is
+the `Map`; a dropped connection raises `GitError` (`io`). Only a key that is
 really not there reads as "not there".
 
 ## Limits
